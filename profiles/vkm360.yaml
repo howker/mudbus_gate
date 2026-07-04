@@ -25,10 +25,16 @@ codec:
 session:
   type: "modbus_byteorder_auth"
 
+instances:
+  pipe:
+    enumerate: "fixed_count"
+    count: 2
+
 points:
   - name: "Массовый расход"
     space: "IR"
-    addr: 2008
+    instance: "pipe"
+    addr_formula: "2000+(pipe-1)*100+8"
     type: "float"
     unit: "кг/с"
     access: "read"

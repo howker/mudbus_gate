@@ -2,12 +2,14 @@ package device
 
 import (
     "context"
+    "fmt"
     "log"
     "time"
 
     "mbgw/internal/archive"
     "mbgw/internal/client"
     "mbgw/internal/codec"
+    "mbgw/internal/pointresolver"
     "mbgw/internal/profile"
     "mbgw/internal/session"
     "mbgw/internal/storage"
@@ -67,32 +69,72 @@ func (d *Device) Start(ctx context.Context, pointInterval time.Duration, archive
 
 func (d *Device) poll(ctx context.Context) {
     for _, pt := range d.Profile.Points {
-        dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, pt.Addr, pt.Type)
-        if err != nil {
-            log.Printf("[%s] ошибка опроса %s: %v\n", d.ID, pt.Name, err)
+        if pt.Instance == "" {
+            d.pollOnePoint(ctx, pt, pt.Addr, "")
             continue
         }
 
-        val, err := d.decodePoint(pt, dataBytes)
-        if err != nil {
-            log.Printf("[%s] ошибка декодирования %s: %v\n", d.ID, pt.Name, err)
+        inst, ok := d.Profile.Instances[pt.Instance]
+        if !ok {
+            log.Printf("[%s] точка %s: instance %q не описан в профиле\n", d.ID, pt.Name, pt.Instance)
             continue
         }
 
-        reading := storage.ReadingCurrent{
-            DeviceID:      d.ID,
-            PointID:       pt.Name,
-            Instance:      "",
-            Value:         val,
-            Unit:          pt.Unit,
-            Quality:       "GOOD",
-            QualityReason: "",
-            Timestamp:     time.Now(),
-        }
-        if err := d.Repo.SaveReadingCurrent(ctx, reading); err != nil {
-            log.Printf("[%s] ошибка сохранения: %v\n", d.ID, err)
+        count := inst.Count
+        if inst.Enumerate != "fixed_count" {
+            log.Printf("[%s] точка %s: enumerate %q пока не поддерживается (только fixed_count) - см. backlog\n", d.ID, pt.Name, inst.Enumerate)
             continue
         }
+        if count <= 0 {
+            log.Printf("[%s] точка %s: instance %q имеет count<=0\n", d.ID, pt.Name, pt.Instance)
+            continue
+        }
+
+        for i := 1; i <= count; i++ {
+            addr, err := pointresolver.Resolve(pt.AddrFormula, pt.Instance, i)
+            if err != nil {
+                log.Printf("[%s] точка %s (instance %d): ошибка формулы адреса: %v\n", d.ID, pt.Name, i, err)
+                continue
+            }
+            d.pollOnePoint(ctx, pt, addr, fmt.Sprintf("%d", i))
+        }
+    }
+}
+
+// pollOnePoint reads, decodes, and saves a single point at a resolved
+// address, optionally tagged with an instance identifier (empty string
+// for non-parametric points).
+func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, instance string) {
+    dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, addr, pt.Type)
+    if err != nil {
+        log.Printf("[%s] ошибка опроса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+        return
+    }
+
+    val, err := d.decodePoint(pt, dataBytes)
+    if err != nil {
+        log.Printf("[%s] ошибка декодирования %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+        return
+    }
+
+    reading := storage.ReadingCurrent{
+        DeviceID:      d.ID,
+        PointID:       pt.Name,
+        Instance:      instance,
+        Value:         val,
+        Unit:          pt.Unit,
+        Quality:       "GOOD",
+        QualityReason: "",
+        Timestamp:     time.Now(),
+    }
+    if err := d.Repo.SaveReadingCurrent(ctx, reading); err != nil {
+        log.Printf("[%s] ошибка сохранения: %v\n", d.ID, err)
+        return
+    }
+
+    if instance != "" {
+        log.Printf("[%s] [SAVE] %s[%s] = %v %s\n", d.ID, pt.Name, instance, val, pt.Unit)
+    } else {
         log.Printf("[%s] [SAVE] %s = %v %s\n", d.ID, pt.Name, val, pt.Unit)
     }
 }
