@@ -228,6 +228,68 @@ return true, pdu[1]
 return false, 0
 }
 
+// FuncCodeReportSlaveID is the standard Modbus function 17 (0x11), used by
+// VZLET devices (IVK-TER and others) to report device identification info
+// including firmware version, needed to select the correct
+// firmware_variant for archive record decoding (CONTRACTS.md section 2.3).
+const FuncCodeReportSlaveID = 0x11
+
+// BuildReportSlaveIDPDU builds a function 17 request PDU. This function
+// takes no parameters beyond the function code itself.
+func BuildReportSlaveIDPDU() []byte {
+    return []byte{FuncCodeReportSlaveID}
+}
+
+// ReportSlaveIDResponse holds the raw device identification payload
+// returned by function 17. The exact byte layout of RawData is vendor and
+// model specific; VZLET's own firmware-version encoding within RawData is
+// not fully documented here, so callers must interpret RawData themselves
+// (e.g. against a known offset for their specific device family) - see
+// backlog. RunStatus follows the standard Modbus convention: 0xFF = ON,
+// 0x00 = OFF.
+type ReportSlaveIDResponse struct {
+    ByteCount int
+    RunStatus byte
+    RawData   []byte
+}
+
+// ParseReportSlaveIDResponse parses a function 17 response PDU:
+// [funcCode][byteCount][slaveID...][runStatus][additional data...].
+func ParseReportSlaveIDResponse(pdu []byte) (ReportSlaveIDResponse, error) {
+    if len(pdu) < 2 {
+        return ReportSlaveIDResponse{}, fmt.Errorf("report slave id response too short")
+    }
+    if isExc, code := IsException(pdu); isExc {
+        return ReportSlaveIDResponse{}, &ExceptionError{Code: code}
+    }
+    if pdu[0] != FuncCodeReportSlaveID {
+        return ReportSlaveIDResponse{}, fmt.Errorf("unexpected function code in report slave id response: 0x%02X", pdu[0])
+    }
+
+    byteCount := int(pdu[1])
+    if len(pdu) < 2+byteCount {
+        return ReportSlaveIDResponse{}, fmt.Errorf("report slave id response truncated: want %d bytes, got %d", byteCount, len(pdu)-2)
+    }
+
+    data := pdu[2 : 2+byteCount]
+    if len(data) == 0 {
+        return ReportSlaveIDResponse{}, fmt.Errorf("report slave id response has empty payload")
+    }
+
+    runStatus := data[0]
+    rawData := data
+    if len(data) > 1 {
+        rawData = data[1:]
+    } else {
+        rawData = nil
+    }
+
+    return ReportSlaveIDResponse{
+        ByteCount: byteCount,
+        RunStatus: runStatus,
+        RawData:   rawData,
+    }, nil
+}
 // FuncCodeArchive65 is the VZLET-specific function code (0x41) used by
 // TSRV-024 to read archive records by index or by time (CONTRACTS.md §2.3).
 const FuncCodeArchive65 = 0x41

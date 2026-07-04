@@ -11,6 +11,7 @@ import (
     "mbgw/internal/codec"
     "mbgw/internal/pointresolver"
     "mbgw/internal/profile"
+    "mbgw/internal/protocol/modbus"
     "mbgw/internal/session"
     "mbgw/internal/storage"
 )
@@ -52,6 +53,7 @@ func (d *Device) Start(ctx context.Context, pointInterval time.Duration, archive
 
     log.Printf("[%s] запуск цикла опроса (текущие: %v, архивы: %v)...\n", d.ID, pointInterval, archiveInterval)
 
+    d.detectFirmwareVariant(ctx)
     d.poll(ctx)
 
     for {
@@ -67,6 +69,29 @@ func (d *Device) Start(ctx context.Context, pointInterval time.Duration, archive
     }
 }
 
+// detectFirmwareVariant queries function 17 (Report Slave ID) once at
+// startup, mainly to log firmware version info for diagnostics. Devices
+// that do not support function 17 (e.g. it is not part of their protocol,
+// or the emulator/real device returns an error) simply log a warning and
+// continue - this is not fatal to polling. Using firmware_variant to
+// actually branch archive decoding logic is a follow-up once a device
+// profile needs more than one record layout variant (see backlog).
+func (d *Device) detectFirmwareVariant(ctx context.Context) {
+    req := modbus.BuildReportSlaveIDPDU()
+    respPDU, err := d.Client.Transact(ctx, req)
+    if err != nil {
+        log.Printf("[%s] функция 17 (report slave id) недоступна: %v\n", d.ID, err)
+        return
+    }
+
+    resp, err := modbus.ParseReportSlaveIDResponse(respPDU)
+    if err != nil {
+        log.Printf("[%s] ошибка разбора ответа функции 17: %v\n", d.ID, err)
+        return
+    }
+
+    log.Printf("[%s] диагностика (func17): run_status=0x%02X raw_data=%q\n", d.ID, resp.RunStatus, string(resp.RawData))
+}
 func (d *Device) poll(ctx context.Context) {
     statusValues := d.collectStatusValues(ctx)
 

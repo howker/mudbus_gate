@@ -51,9 +51,14 @@ func handleIVKTERConn(conn net.Conn) {
             log.Printf("[sim ivk-ter] bad frame: %v\n", err)
             continue
         }
-        if len(pdu) < 5 {
+        if len(pdu) < 1 {
             continue
         }
+        // Note: function 17 (Report Slave ID) requests are just 1 byte
+        // (function code only), shorter than the 5-byte minimum needed
+        // for functions 03/04/06/16 - that length check now lives inside
+        // buildIVKTERResponse for those specific functions instead of
+        // gating all requests here.
 
         respPDU := buildIVKTERResponse(pdu)
         if respPDU == nil {
@@ -67,9 +72,22 @@ func handleIVKTERConn(conn net.Conn) {
     }
 }
 
+// ivkterFirmwareVersion is a fake firmware version string returned by
+// function 17 (Report Slave ID), for testing the diagnostics path.
+var ivkterFirmwareVersion = []byte("76.63.00.08")
+
 func buildIVKTERResponse(pdu []byte) []byte {
     funcCode := pdu[0]
+
+    if funcCode == modbus.FuncCodeReportSlaveID {
+        data := append([]byte{0xFF}, ivkterFirmwareVersion...) // runStatus=ON + version bytes
+        return append([]byte{funcCode, byte(len(data))}, data...)
+    }
+
     if funcCode != 0x03 && funcCode != 0x04 {
+        return nil
+    }
+    if len(pdu) < 5 {
         return nil
     }
 
