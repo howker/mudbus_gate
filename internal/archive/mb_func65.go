@@ -21,7 +21,7 @@ func NewMBFunc65() *MBFunc65 { return &MBFunc65{} }
 
 func (r *MBFunc65) Strategy() string { return "mb_func65" }
 
-func (r *MBFunc65) Read(ctx context.Context, tx Transactor, q ArchiveQuery) ([]ArchiveRecord, error) {
+func (r *MBFunc65) Read(ctx context.Context, sess ArchiveSession, tx Transactor, q ArchiveQuery) ([]ArchiveRecord, error) {
     mode := byte(modbus.ArchiveModeByIndex)
     var value uint32
     if !q.From.IsZero() {

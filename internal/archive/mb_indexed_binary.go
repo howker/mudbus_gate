@@ -23,7 +23,7 @@ func NewMBIndexedBinary() *MBIndexedBinary { return &MBIndexedBinary{} }
 
 func (r *MBIndexedBinary) Strategy() string { return "mb_indexed_binary" }
 
-func (r *MBIndexedBinary) Read(ctx context.Context, tx Transactor, q ArchiveQuery) ([]ArchiveRecord, error) {
+func (r *MBIndexedBinary) Read(ctx context.Context, sess ArchiveSession, tx Transactor, q ArchiveQuery) ([]ArchiveRecord, error) {
     addr := ivkArchiveBaseAddr + q.FromIndex*ivkArchiveRecordRegs
 
     req, err := modbus.BuildReadPDUWithQty("IR", addr, uint16(ivkArchiveRecordRegs))

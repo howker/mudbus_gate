@@ -55,10 +55,23 @@ type Transactor interface {
     Transact(ctx context.Context, req []byte) (resp []byte, err error)
 }
 
+// ArchiveSession is a minimal, locally-declared interface (not imported
+// from internal/session, to keep archive's dependency direction correct
+// per LLD.md - archive must not depend on session) that lets an archive
+// strategy check session readiness before a multi-step exchange. This
+// matters for protocols like Merkuriy, where long-response reads should
+// only be attempted while the channel session is ready; sess may be nil
+// for devices with session type "none" (e.g. TSRV-024), and strategies
+// that don't need it (e.g. mb_indexed_binary, mb_func65) simply ignore it.
+type ArchiveSession interface {
+    State() string
+}
+
 // ArchiveReader - стратегия чтения архива прибора.
 // Read сам проводит транзакцию (может быть многошаговой - см. mb_request_poll_string)
-// и возвращает уже декодированные записи.
+// и возвращает уже декодированные записи. sess предоставляет доступ к
+// состоянию сессии устройства (см. ArchiveSession); может быть nil.
 type ArchiveReader interface {
     Strategy() string
-    Read(ctx context.Context, tx Transactor, q ArchiveQuery) ([]ArchiveRecord, error)
+    Read(ctx context.Context, sess ArchiveSession, tx Transactor, q ArchiveQuery) ([]ArchiveRecord, error)
 }

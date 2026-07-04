@@ -47,7 +47,7 @@ func TestMBIndexedBinaryReadShort(t *testing.T) {
     r := NewMBIndexedBinary()
     // Full PDU: funcCode + byteCount + 3 bytes of data (too short after stripping header).
     tx := &fakeTransactor{resp: []byte{0x04, 3, 1, 2, 3}}
-    if _, err := r.Read(context.Background(), tx, ArchiveQuery{}); err == nil {
+    if _, err := r.Read(context.Background(), nil, tx, ArchiveQuery{}); err == nil {
         t.Fatal("expected error for short raw")
     }
 }
@@ -83,7 +83,7 @@ func TestMBIndexedBinaryRead(t *testing.T) {
     r := NewMBIndexedBinary()
     // Full PDU: funcCode(0x04) + byteCount(8) + 8 bytes of record data.
     tx := &fakeTransactor{resp: []byte{0x04, 8, 0x7F, 2, 3, 4, 0, 0, 0, 42}}
-    recs, err := r.Read(context.Background(), tx, ArchiveQuery{})
+    recs, err := r.Read(context.Background(), nil, tx, ArchiveQuery{})
     if err != nil {
         t.Fatalf("unexpected error: %v", err)
     }

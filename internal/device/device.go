@@ -21,6 +21,29 @@ type PointClient interface {
     ReadRaw(ctx context.Context, space string, addr int, dataType string) ([]byte, error)
     Transact(ctx context.Context, req []byte) ([]byte, error)
 }
+// sessionAdapter adapts session.Session to archive.ArchiveSession (which
+// expects State() string), since session.Session.State() returns the
+// package-local session.State int-enum instead. This keeps
+// internal/archive from importing internal/session directly (see
+// archive.ArchiveSession's doc comment on the layering rule).
+type sessionAdapter struct {
+    sess session.Session
+}
+
+func (a sessionAdapter) State() string {
+    switch a.sess.State() {
+    case session.StateClosed:
+        return "closed"
+    case session.StateInitializing:
+        return "initializing"
+    case session.StateReady:
+        return "ready"
+    case session.StateError:
+        return "error"
+    default:
+        return "unknown"
+    }
+}
 type Device struct {
     ID      string
     Profile *profile.Profile
@@ -249,7 +272,7 @@ func (d *Device) pollArchives(ctx context.Context) {
             WordOrder64:  d.Profile.Codec.WordOrder64,
         }
 
-        records, err := reader.Read(ctx, d.Client, q)
+        records, err := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, q)
         if err != nil {
             log.Printf("[%s] архив %s: ошибка чтения: %v\n", d.ID, a.ID, err)
             continue

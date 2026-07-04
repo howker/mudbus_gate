@@ -50,7 +50,7 @@ func NewMBRequestPollString() *MBRequestPollString { return &MBRequestPollString
 
 func (r *MBRequestPollString) Strategy() string { return "mb_request_poll_string" }
 
-func (r *MBRequestPollString) Read(ctx context.Context, tx Transactor, q ArchiveQuery) ([]ArchiveRecord, error) {
+func (r *MBRequestPollString) Read(ctx context.Context, sess ArchiveSession, tx Transactor, q ArchiveQuery) ([]ArchiveRecord, error) {
     if err := r.startRequest(ctx, tx, q); err != nil {
         return nil, err
     }

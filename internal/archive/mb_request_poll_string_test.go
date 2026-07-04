@@ -85,7 +85,7 @@ func TestMBRequestPollString_HappyPath(t *testing.T) {
         To:        time.Date(2026, 7, 4, 0, 0, 0, 0, time.UTC),
     }
 
-    recs, err := r.Read(context.Background(), tx, q)
+    recs, err := r.Read(context.Background(), nil, tx, q)
     if err != nil {
         t.Fatalf("unexpected error: %v", err)
     }
@@ -136,7 +136,7 @@ func TestMBRequestPollString_BusyThenSucceeds(t *testing.T) {
     r := NewMBRequestPollString()
     q := ArchiveQuery{Instance: 1, From: time.Now(), To: time.Now()}
 
-    recs, err := r.Read(context.Background(), tx, q)
+    recs, err := r.Read(context.Background(), nil, tx, q)
     if err != nil {
         t.Fatalf("unexpected error: %v", err)
     }
@@ -160,7 +160,7 @@ func TestMBRequestPollString_NoRecords(t *testing.T) {
     r := NewMBRequestPollString()
     q := ArchiveQuery{Instance: 1, From: time.Now(), To: time.Now()}
 
-    _, err := r.Read(context.Background(), tx, q)
+    _, err := r.Read(context.Background(), nil, tx, q)
     if err == nil {
         t.Fatal("expected error for no_records status, got nil")
     }

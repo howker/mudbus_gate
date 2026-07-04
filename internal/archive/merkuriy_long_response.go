@@ -19,7 +19,7 @@ func (r *MerkuriyLongResponseReader) Strategy() string {
     return "merkuriy_long_response"
 }
 
-func (r *MerkuriyLongResponseReader) Read(ctx context.Context, tx Transactor, q ArchiveQuery) ([]ArchiveRecord, error) {
+func (r *MerkuriyLongResponseReader) Read(ctx context.Context, sess ArchiveSession, tx Transactor, q ArchiveQuery) ([]ArchiveRecord, error) {
     return nil, fmt.Errorf("merkuriy_long_response not implemented")
 }
 
