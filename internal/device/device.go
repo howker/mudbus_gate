@@ -68,9 +68,11 @@ func (d *Device) Start(ctx context.Context, pointInterval time.Duration, archive
 }
 
 func (d *Device) poll(ctx context.Context) {
+    statusValues := d.collectStatusValues(ctx)
+
     for _, pt := range d.Profile.Points {
         if pt.Instance == "" {
-            d.pollOnePoint(ctx, pt, pt.Addr, "")
+            d.pollOnePoint(ctx, pt, pt.Addr, "", statusValues)
             continue
         }
 
@@ -96,7 +98,7 @@ func (d *Device) poll(ctx context.Context) {
                 log.Printf("[%s] точка %s (instance %d): ошибка формулы адреса: %v\n", d.ID, pt.Name, i, err)
                 continue
             }
-            d.pollOnePoint(ctx, pt, addr, fmt.Sprintf("%d", i))
+            d.pollOnePoint(ctx, pt, addr, fmt.Sprintf("%d", i), statusValues)
         }
     }
 }
@@ -104,7 +106,48 @@ func (d *Device) poll(ctx context.Context) {
 // pollOnePoint reads, decodes, and saves a single point at a resolved
 // address, optionally tagged with an instance identifier (empty string
 // for non-parametric points).
-func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, instance string) {
+// collectStatusValues reads and decodes every point referenced as a
+// quality_map "source" (typically a status/bitfield word), returning a
+// map of point name -> decoded integer value. Called once per poll cycle,
+// before evaluating quality for the rest of the device's points. Points
+// with a parametric instance are not supported as quality sources in this
+// vertical slice (status words are assumed device-wide, not per-instance).
+func (d *Device) collectStatusValues(ctx context.Context) map[string]int64 {
+    result := make(map[string]int64)
+
+    sourceNames := make(map[string]bool)
+    for _, rule := range d.Profile.QualityMap {
+        sourceNames[rule.Source] = true
+    }
+    if len(sourceNames) == 0 {
+        return result
+    }
+
+    for _, pt := range d.Profile.Points {
+        if !sourceNames[pt.Name] || pt.Instance != "" {
+            continue
+        }
+        dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, pt.Addr, pt.Type)
+        if err != nil {
+            log.Printf("[%s] ошибка чтения статуса %s: %v\n", d.ID, pt.Name, err)
+            continue
+        }
+        val, err := d.decodePoint(pt, dataBytes)
+        if err != nil {
+            log.Printf("[%s] ошибка декодирования статуса %s: %v\n", d.ID, pt.Name, err)
+            continue
+        }
+        intVal, ok := val.(int64)
+        if !ok {
+            log.Printf("[%s] статус %s имеет нечисловой тип %T, пропускаю\n", d.ID, pt.Name, val)
+            continue
+        }
+        result[pt.Name] = intVal
+    }
+
+    return result
+}
+func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, instance string, statusValues map[string]int64) {
     dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, addr, pt.Type)
     if err != nil {
         log.Printf("[%s] ошибка опроса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
@@ -117,14 +160,16 @@ func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, i
         return
     }
 
+    quality, reason := evaluateQuality(pt.Name, d.Profile.QualityMap, statusValues)
+
     reading := storage.ReadingCurrent{
         DeviceID:      d.ID,
         PointID:       pt.Name,
         Instance:      instance,
         Value:         val,
         Unit:          pt.Unit,
-        Quality:       "GOOD",
-        QualityReason: "",
+        Quality:       quality,
+        QualityReason: reason,
         Timestamp:     time.Now(),
     }
     if err := d.Repo.SaveReadingCurrent(ctx, reading); err != nil {
