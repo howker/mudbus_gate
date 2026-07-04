@@ -4,6 +4,7 @@ import (
     "context"
     "testing"
 
+    "mbgw/internal/lease"
     "mbgw/internal/profile"
     "mbgw/internal/session"
     "mbgw/internal/storage/sqlite"
@@ -32,6 +33,7 @@ func TestDevicePoll(t *testing.T) {
     cli := &mockClient{}
     sess := &session.NoopSession{}
     repo, _ := sqlite.New("test_worker.json")
-    dev := New("vkm_test", p, cli, sess, repo)
+    leaseMgr := lease.New()
+    dev := New("vkm_test", p, cli, sess, repo, leaseMgr)
     dev.poll(context.Background())
 }

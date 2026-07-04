@@ -7,6 +7,7 @@ import (
     "time"
 
     "mbgw/internal/archive"
+    "mbgw/internal/lease"
     "mbgw/internal/codec"
     "mbgw/internal/pointresolver"
     "mbgw/internal/profile"
@@ -50,15 +51,17 @@ type Device struct {
     Client  PointClient
     Sess    session.Session
     Repo    storage.Repo
+    Lease   *lease.LocalLease
 }
 
-func New(id string, p *profile.Profile, cli PointClient, sess session.Session, repo storage.Repo) *Device {
+func New(id string, p *profile.Profile, cli PointClient, sess session.Session, repo storage.Repo, l *lease.LocalLease) *Device {
     return &Device{
         ID:      id,
         Profile: p,
         Client:  cli,
         Sess:    sess,
         Repo:    repo,
+        Lease:   l,
     }
 }
 
@@ -272,7 +275,14 @@ func (d *Device) pollArchives(ctx context.Context) {
             WordOrder64:  d.Profile.Codec.WordOrder64,
         }
 
+        release, leaseErr := d.Lease.Acquire(ctx, d.ID, a.ID, 30*time.Second)
+        if leaseErr != nil {
+            log.Printf("[%s] архив %s: не удалось занять lease: %v\n", d.ID, a.ID, leaseErr)
+            continue
+        }
+
         records, err := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, q)
+        release()
         if err != nil {
             log.Printf("[%s] архив %s: ошибка чтения: %v\n", d.ID, a.ID, err)
             continue

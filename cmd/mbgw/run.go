@@ -9,6 +9,7 @@ import (
     "syscall"
     "time"
 
+    "mbgw/internal/lease"
     "mbgw/internal/pollcore"
     "mbgw/internal/config"
     "mbgw/internal/device"
@@ -53,6 +54,8 @@ func run() {
     webServer := web.NewServer(repo, port)
     go webServer.Start(ctx)
 
+    leaseMgr := lease.New()
+
     for _, devCfg := range cfg.Devices {
         p, err := profile.Parse(devCfg.Profile)
         if err != nil {
@@ -89,7 +92,7 @@ func run() {
 
         isTCP := devCfg.Transport.Kind == "modbus_tcp"
         reader := pollcore.New(tr, isTCP, 1)
-        dev := device.New(devCfg.ID, p, reader, sess, repo)
+        dev := device.New(devCfg.ID, p, reader, sess, repo, leaseMgr)
         go dev.Start(ctx, 3*time.Second, 1*time.Hour)
     }
 
