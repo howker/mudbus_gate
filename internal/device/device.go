@@ -288,6 +288,8 @@ func (d *Device) decodePoint(pt profile.Point, data []byte) (any, error) {
         return codec.DecodeU32Float(data, order32)
     case "long+float":
         return codec.DecodeLongFloat(data, order32)
+    case "string", "asciiz":
+        return codec.DecodeString(data), nil
     default:
         return "", nil
     }

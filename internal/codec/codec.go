@@ -178,6 +178,17 @@ func DecodeFloat64(data []byte, order string) (float64, error) {
 
 // EncodeUint16 is currently used for simple write requests.
 // More encode helpers will be added as write/session/archive support grows.
+// DecodeString decodes a fixed-length ASCII/ANSI string from raw bytes,
+// trimming trailing NUL bytes and spaces (common padding in Modbus string
+// registers). Works for both plain "string" and "asciiz" record_layout
+// types - asciiz's terminator is naturally handled by the NUL trim.
+func DecodeString(data []byte) string {
+    trimmed := data
+    for len(trimmed) > 0 && (trimmed[len(trimmed)-1] == 0x00 || trimmed[len(trimmed)-1] == ' ') {
+        trimmed = trimmed[:len(trimmed)-1]
+    }
+    return string(trimmed)
+}
 func EncodeUint16(val uint16) []byte {
 	b := make([]byte, 2)
 	binary.BigEndian.PutUint16(b, val)

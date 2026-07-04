@@ -52,6 +52,33 @@ func TestMBIndexedBinaryReadShort(t *testing.T) {
     }
 }
 
+func TestDecodeByLayout_StInfoEvent(t *testing.T) {
+    // Golden vectors: occurrence of NS#5 = 0x05, clearing of NS#5 = 0x85.
+    layout := []RecordLayoutField{
+        {Offset: 0, Name: "event", Type: "stInfoEvent"},
+    }
+
+    got := decodeByLayout([]byte{0x05}, layout, "0123", "01234567")
+    ev, ok := got["event"].(map[string]any)
+    if !ok {
+        t.Fatalf("expected event field to be a map, got %T", got["event"])
+    }
+    if ev["is_clear"] != false {
+        t.Fatalf("expected is_clear=false for 0x05, got %v", ev["is_clear"])
+    }
+    if ev["event_num"] != byte(5) {
+        t.Fatalf("expected event_num=5 for 0x05, got %v", ev["event_num"])
+    }
+
+    got2 := decodeByLayout([]byte{0x85}, layout, "0123", "01234567")
+    ev2 := got2["event"].(map[string]any)
+    if ev2["is_clear"] != true {
+        t.Fatalf("expected is_clear=true for 0x85, got %v", ev2["is_clear"])
+    }
+    if ev2["event_num"] != byte(5) {
+        t.Fatalf("expected event_num=5 for 0x85, got %v", ev2["event_num"])
+    }
+}
 func TestMBIndexedBinaryRead(t *testing.T) {
     r := NewMBIndexedBinary()
     // Full PDU: funcCode(0x04) + byteCount(8) + 8 bytes of record data.
