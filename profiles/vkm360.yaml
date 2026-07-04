@@ -1,0 +1,90 @@
+meta:
+  vendor: "Элемер"
+  model: "ВКМ-360"
+  profile_version: "1.1.0"
+  protocol: "modbus"
+  firmware_compat: ["*"]
+  description: "ВКМ-360, трубопровод №1: текущие параметры + архив (mb_request_poll_string)."
+
+transport:
+  supported: ["tcp", "rtu", "tcp-serial"]
+  defaults:
+    tcp_port: 502
+    baudrate: 9600
+    parity: "none"
+    stopbits: 1
+    response_timeout_ms: 1000
+    interframe_delay_ms: 10
+    retries: 3
+
+codec:
+  word_order_32: "0123"
+  word_order_64: "01234567"
+  string_encoding: "ansi"
+
+session:
+  type: "modbus_byteorder_auth"
+
+points:
+  - name: "Массовый расход"
+    space: "IR"
+    addr: 2008
+    type: "float"
+    unit: "кг/с"
+    access: "read"
+    group: "current"
+
+  - name: "Избыточное давление"
+    space: "IR"
+    addr: 2000
+    type: "float"
+    unit: "Па"
+    access: "read"
+    group: "current"
+
+  - name: "Температура"
+    space: "IR"
+    addr: 2004
+    type: "float"
+    unit: "°C"
+    access: "read"
+    group: "current"
+
+  - name: "Слово статуса лог.входа"
+    space: "IR"
+    addr: 4002
+    type: "bitfield"
+    access: "read"
+    group: "status"
+    bits:
+      "6": "sensor_break"
+      "7": "sensor_short"
+      "9": "no_modbus_link"
+
+archives:
+  - id: "main"
+    strategy: "mb_request_poll_string"
+    time_access: true
+    note: "Минутные архивы за период; результат - строка тег{шапка}=значение ед.изм;"
+    params:
+      id_reg: 7900
+      pipe_reg: 7901
+      start_time_regs: [7902, 7903, 7904, 7905, 7906, 7907]
+      end_time_regs: [7908, 7909, 7910, 7911, 7912, 7913]
+      options_reg: 7914
+      status_reg: 8000
+      len_reg: 8002
+      data_start: 8003
+      data_end: 9999
+      result_retention_s: 300
+      collect_timeout_s: 15
+
+quality_map:
+  - source: "Слово статуса лог.входа"
+    bit: 6
+    meaning: "Обрыв датчика"
+    quality: "INVALID"
+  - source: "Слово статуса лог.входа"
+    bit: 9
+    meaning: "Нет связи с датчиком"
+    quality: "NO_DATA"

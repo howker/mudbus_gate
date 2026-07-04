@@ -1,0 +1,10 @@
+meta:
+  vendor: "Меркурий"
+  model: "M"
+  profile_version: "1.0.0"
+  protocol: "merkuriy"
+transport:
+  supported: ["tcp"]
+session:
+  type: "merkuriy_channel"
+archives: []

@@ -1,0 +1,65 @@
+﻿{
+  "mb_read_ir_2000_qty2_req": {
+    "pdu": "01 04 07 D0 00 02",
+    "crc_le": "71 46",
+    "frame": "01 04 07 D0 00 02 71 46"
+  },
+  "mb_read_ir_resp_float_123_4567": {
+    "pdu": "01 04 04 42 F6 E9 D5",
+    "crc_le": "81 C1",
+    "frame": "01 04 04 42 F6 E9 D5 81 C1"
+  },
+  "mb_exception_06_busy": {
+    "pdu": "01 84 06",
+    "frame": "01 84 06 C3 02"
+  },
+  "mb_write_single_reg200_val1": {
+    "frame": "01 06 00 C8 00 01 C9 F4"
+  },
+  "float_123.4567_ieee754": {
+    "natural_be_ABCD": "42 F6 E9 D5",
+    "byte_orders": {
+      "0123_ABCD": "42 F6 E9 D5",
+      "3210_DCBA": "D5 E9 F6 42",
+      "1032_BADC": "F6 42 D5 E9",
+      "2301_CDAB": "E9 D5 42 F6"
+    }
+  },
+  "int32_1234567890": {
+    "natural_be_ABCD": "49 96 02 D2",
+    "hex": "0x499602D2",
+    "byte_orders": {
+      "0123_ABCD": "49 96 02 D2",
+      "3210_DCBA": "D2 02 96 49",
+      "1032_BADC": "96 49 D2 02",
+      "2301_CDAB": "02 D2 49 96"
+    }
+  },
+  "double_123.4567890123456_ieee754": {
+    "natural_be": "40 5E DD 3C 07 FB 4C 93"
+  },
+  "scaled_int_2537_0.01_=_25.37": {
+    "uint16_be": "09 E9"
+  },
+  "composite_u32+float_12345_0.6789": {
+    "u32_be": "00 00 30 39",
+    "float_be": "3F 2D CC 64",
+    "value": 12345.6789
+  },
+  "composite_long+float_4200_0.5": {
+    "i32_be": "00 00 10 68",
+    "float_be": "3F 00 00 00",
+    "value": 4200.5
+  },
+  "stInfoEvent": {
+    "occur_ns5": "0x05",
+    "clear_ns5": "0x85",
+    "note": "bit7=тип(0 возникновение/1 снятие), биты0-4=номер события"
+  },
+  "merkuriy_test_link_addr1": {
+    "frame": "01 00 00 20"
+  },
+  "merkuriy_open_channel_addr1_lvl1_pwd010101010101": {
+    "frame": "01 01 01 01 01 01 01 01 01 7A 11"
+  }
+}

@@ -1,0 +1,55 @@
+meta:
+  vendor: "VZLET"
+  model: "TSRV-024"
+  profile_version: "1.0.0"
+  protocol: "modbus"
+  firmware_compat: ["*"]
+  description: "TSRV-024: basic current values (vertical slice, no func65 archive yet)."
+
+transport:
+  supported: ["tcp", "rtu", "tcp-serial"]
+  defaults:
+    tcp_port: 502
+    baudrate: 9600
+    parity: "none"
+    stopbits: 1
+    response_timeout_ms: 1500
+    interframe_delay_ms: 10
+    retries: 3
+
+codec:
+  word_order_32: "0123"
+  word_order_64: "01234567"
+  string_encoding: "ansi"
+
+session:
+  type: "none"
+
+points:
+  - name: "Current heat power"
+    space: "IR"
+    addr: 100
+    type: "float"
+    unit: "Gcal/h"
+    access: "read"
+    group: "current"
+
+  - name: "Outdoor temperature"
+    space: "IR"
+    addr: 104
+    type: "scaled_int"
+    scale: 0.01
+    unit: "C"
+    access: "read"
+    group: "current"
+
+archives:
+  - id: "main"
+    strategy: "mb_func65"
+    time_access: true
+    index_access: true
+    dst_aware: false
+    note: "TSRV-024 hourly archive via function 65, CRC-checked (vertical slice)."
+    record_layout:
+      - { offset: 0, name: "record_time", type: "uint32", epoch: "1970-01-01" }
+      - { offset: 4, name: "heat_value", type: "scaled_int", scale: 0.01, unit: "Gcal" }

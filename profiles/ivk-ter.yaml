@@ -1,0 +1,51 @@
+meta:
+  vendor: "VZLET"
+  model: "IVK-TER"
+  profile_version: "1.0.0"
+  protocol: "modbus"
+  firmware_compat: ["*"]
+  description: "IVK-TER: basic current values (vertical slice, no composite types yet)."
+
+transport:
+  supported: ["tcp", "rtu", "tcp-serial"]
+  defaults:
+    tcp_port: 502
+    baudrate: 9600
+    parity: "none"
+    stopbits: 1
+    response_timeout_ms: 1000
+    interframe_delay_ms: 10
+    retries: 3
+
+codec:
+  word_order_32: "0123"
+  word_order_64: "01234567"
+  string_encoding: "ansi"
+
+session:
+  type: "none"
+
+points:
+  - name: "Current flow rate"
+    space: "IR"
+    addr: 100
+    type: "float"
+    unit: "m3/h"
+    access: "read"
+    group: "current"
+
+  - name: "Temperature"
+    space: "IR"
+    addr: 102
+    type: "float"
+    unit: "C"
+    access: "read"
+    group: "current"
+
+archives:
+  - id: "main"
+    strategy: "mb_indexed_binary"
+    index_access: true
+    note: "IVK-TER ring buffer archive, indexed access (vertical slice)."
+    record_layout:
+      - { offset: 0, name: "V_plus", type: "u32+float", unit: "m3" }

@@ -1,0 +1,25 @@
+app:
+  storage_path: "storage.json"
+  web_port: 8100
+devices:
+  - id: "vkm_1"
+    profile: "profiles/vkm360.yaml"
+    transport:
+      kind: "modbus_tcp"
+      host: "127.0.0.1"
+      port: 502
+      timeout_ms: 1000
+  - id: "ivk_1"
+    profile: "profiles/ivk-ter.yaml"
+    transport:
+      kind: "modbus_tcp"
+      host: "127.0.0.1"
+      port: 503
+      timeout_ms: 1000
+  - id: "tsrv_1"
+    profile: "profiles/tsrv024.yaml"
+    transport:
+      kind: "modbus_tcp"
+      host: "127.0.0.1"
+      port: 504
+      timeout_ms: 1500
