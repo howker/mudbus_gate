@@ -1,132 +1,167 @@
 package transport
 
 import (
-"context"
-"fmt"
-"io"
-"net"
-"sync"
-"time"
+    "context"
+    "fmt"
+    "io"
+    "net"
+    "sync"
+    "time"
+
+    "mbgw/internal/errs"
 )
 
+// tcpTransport implements Transport for Modbus TCP, per CONTRACTS.md
+// section 1: Open is idempotent, Send/Receive are separate operations
+// (allowing Protocol.Transact to control retries between them), and
+// Receive frames by the MBAP length field.
 type tcpTransport struct {
-mu              sync.Mutex
-addr            string
-conn            net.Conn
-responseTimeout time.Duration
-interframeDelay time.Duration
-lastInteraction time.Time
+    mu              sync.Mutex
+    params          Params
+    addr            string
+    conn            net.Conn
+    interframeDelay time.Duration
+    lastInteraction time.Time
+    closed          bool
 }
 
 func newTCP(p Params) (Transport, error) {
-if p.Host == "" || p.Port == 0 {
-return nil, fmt.Errorf("invalid tcp address: %s:%d", p.Host, p.Port)
-}
-addr := fmt.Sprintf("%s:%d", p.Host, p.Port)
-
-t := &tcpTransport{
-addr:            addr,
-responseTimeout: p.ResponseTimeout,
-interframeDelay: p.InterframeDelay,
-}
-
-// ля MVP подключаемся сразу при создании (fail-fast)
-if err := t.connect(context.Background()); err != nil {
-return nil, err
+    if p.Host == "" || p.Port == 0 {
+        return nil, fmt.Errorf("invalid tcp address: %s:%d", p.Host, p.Port)
+    }
+    return &tcpTransport{
+        params:          p,
+        addr:            fmt.Sprintf("%s:%d", p.Host, p.Port),
+        interframeDelay: p.InterframeDelay,
+    }, nil
 }
 
-return t, nil
+// Open is idempotent: calling it again while already connected is a no-op.
+func (t *tcpTransport) Open(ctx context.Context) error {
+    t.mu.Lock()
+    defer t.mu.Unlock()
+
+    if t.closed {
+        return fmt.Errorf("tcp transport: %w", errs.ErrClosed)
+    }
+    if t.conn != nil {
+        return nil // already open, idempotent per contract
+    }
+
+    var d net.Dialer
+    conn, err := d.DialContext(ctx, "tcp", t.addr)
+    if err != nil {
+        return fmt.Errorf("dial tcp %s: %w", t.addr, err)
+    }
+    t.conn = conn
+    return nil
 }
 
-func (t *tcpTransport) connect(ctx context.Context) error {
-if t.conn != nil {
-t.conn.Close()
-t.conn = nil
+// Send transmits a fully-built frame. Does not wait for or read a
+// response - that is Receive's job, allowing the protocol layer to control
+// timing/retries between the two independently.
+func (t *tcpTransport) Send(ctx context.Context, frame []byte) error {
+    t.mu.Lock()
+    defer t.mu.Unlock()
+
+    if t.closed {
+        return fmt.Errorf("tcp transport: %w", errs.ErrClosed)
+    }
+    if t.conn == nil {
+        return fmt.Errorf("tcp transport: not open (call Open first)")
+    }
+
+    elapsed := time.Since(t.lastInteraction)
+    if elapsed < t.interframeDelay {
+        time.Sleep(t.interframeDelay - elapsed)
+    }
+
+    deadline, ok := ctx.Deadline()
+    if !ok {
+        deadline = time.Now().Add(t.params.ResponseTimeout)
+    }
+    if err := t.conn.SetWriteDeadline(deadline); err != nil {
+        return fmt.Errorf("set write deadline: %w", err)
+    }
+
+    if _, err := t.conn.Write(frame); err != nil {
+        t.conn.Close()
+        t.conn = nil
+        return fmt.Errorf("tcp write: %w", errs.ErrTransport)
+    }
+    return nil
 }
 
-var d net.Dialer
-conn, err := d.DialContext(ctx, "tcp", t.addr)
-if err != nil {
-return fmt.Errorf("dial tcp %s: %w", t.addr, err)
-}
+// Receive reads one Modbus TCP frame, using the MBAP header's length field
+// to know how many bytes to read (per CONTRACTS.md section 1: "for TCP, by
+// length from MBAP").
+func (t *tcpTransport) Receive(ctx context.Context, timeout time.Duration) ([]byte, error) {
+    t.mu.Lock()
+    defer t.mu.Unlock()
 
-t.conn = conn
-return nil
-}
+    if t.closed {
+        return nil, fmt.Errorf("tcp transport: %w", errs.ErrClosed)
+    }
+    if t.conn == nil {
+        return nil, fmt.Errorf("tcp transport: not open (call Open first)")
+    }
 
-func (t *tcpTransport) Read(ctx context.Context, req []byte) ([]byte, error) {
-t.mu.Lock()
-defer t.mu.Unlock()
+    deadline, ok := ctx.Deadline()
+    if !ok {
+        deadline = time.Now().Add(timeout)
+    }
+    if err := t.conn.SetReadDeadline(deadline); err != nil {
+        return nil, fmt.Errorf("set read deadline: %w", err)
+    }
 
-// 1. Соблюдение Interframe Delay (пауза между запросами)
-elapsed := time.Since(t.lastInteraction)
-if elapsed < t.interframeDelay {
-time.Sleep(t.interframeDelay - elapsed)
-}
+    header := make([]byte, 7)
+    if _, err := io.ReadFull(t.conn, header); err != nil {
+        if netErr, ok2 := err.(net.Error); ok2 && netErr.Timeout() {
+            // A read timeout does not necessarily mean the connection is
+            // broken (e.g. the device simply does not support this
+            // function and never replies) - keep the connection open for
+            // the next attempt instead of forcing a costly reconnect.
+            return nil, fmt.Errorf("read header: %w", errs.ErrTimeout)
+        }
+        t.conn.Close()
+        t.conn = nil
+        return nil, fmt.Errorf("read header: %w", errs.ErrTransport)
+    }
 
-// 2. еконнект, если соединение отпало
-if t.conn == nil {
-if err := t.connect(ctx); err != nil {
-return nil, err
-}
-}
+    length := int(header[4])<<8 | int(header[5])
+    if length <= 0 || length > 260 {
+        t.conn.Close()
+        t.conn = nil
+        return nil, fmt.Errorf("invalid modbus tcp payload length %d: %w", length, errs.ErrFrame)
+    }
 
-// 3. станавливаем таймаут на запись
-deadline, ok := ctx.Deadline()
-if !ok {
-deadline = time.Now().Add(t.responseTimeout)
-}
-t.conn.SetWriteDeadline(deadline)
+    payload := make([]byte, length-1)
+    if _, err := io.ReadFull(t.conn, payload); err != nil {
+        if netErr, ok2 := err.(net.Error); ok2 && netErr.Timeout() {
+            return nil, fmt.Errorf("read payload: %w", errs.ErrTimeout)
+        }
+        t.conn.Close()
+        t.conn = nil
+        return nil, fmt.Errorf("read payload: %w", errs.ErrTransport)
+    }
 
-// 4. тправка запроса
-if _, err := t.conn.Write(req); err != nil {
-t.conn.Close()
-t.conn = nil
-return nil, fmt.Errorf("write error: %w", err)
-}
-
-// 5. станавливаем таймаут на чтение
-t.conn.SetReadDeadline(deadline)
-
-// 6. тение заголовка MBAP (Modbus Application Protocol) - 7 байт
-header := make([]byte, 7)
-if _, err := io.ReadFull(t.conn, header); err != nil {
-t.conn.Close()
-t.conn = nil
-return nil, fmt.Errorf("read header error: %w", err)
-}
-
-// 7. пределение длины оставшейся части пакета
-// айты 4 и 5 в MBAP содержат длину (UnitID + PDU)
-length := int(header[4])<<8 | int(header[5])
-if length <= 0 || length > 260 {
-t.conn.Close()
-t.conn = nil
-return nil, fmt.Errorf("invalid modbus tcp payload length: %d", length)
-}
-
-// 8. тение оставшейся части (length - 1, т.к. UnitID уже находится в header[6])
-payload := make([]byte, length-1)
-if _, err := io.ReadFull(t.conn, payload); err != nil {
-t.conn.Close()
-t.conn = nil
-return nil, fmt.Errorf("read payload error: %w", err)
-}
-
-t.lastInteraction = time.Now()
-
-// 9. Сборка полного ответа (аголовок + PDU)
-return append(header, payload...), nil
+    t.lastInteraction = time.Now()
+    return append(header, payload...), nil
 }
 
 func (t *tcpTransport) Close() error {
-t.mu.Lock()
-defer t.mu.Unlock()
+    t.mu.Lock()
+    defer t.mu.Unlock()
 
-if t.conn != nil {
-err := t.conn.Close()
-t.conn = nil
-return err
+    t.closed = true
+    if t.conn != nil {
+        err := t.conn.Close()
+        t.conn = nil
+        return err
+    }
+    return nil
 }
-return nil
+
+func (t *tcpTransport) Info() Params {
+    return t.params
 }

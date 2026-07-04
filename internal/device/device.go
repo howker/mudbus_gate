@@ -7,7 +7,6 @@ import (
     "time"
 
     "mbgw/internal/archive"
-    "mbgw/internal/client"
     "mbgw/internal/codec"
     "mbgw/internal/pointresolver"
     "mbgw/internal/profile"
@@ -16,15 +15,21 @@ import (
     "mbgw/internal/storage"
 )
 
+// PointClient is the minimal interface Device needs to read logical points
+// and send raw transactions to a device. *pollcore.Reader implements this.
+type PointClient interface {
+    ReadRaw(ctx context.Context, space string, addr int, dataType string) ([]byte, error)
+    Transact(ctx context.Context, req []byte) ([]byte, error)
+}
 type Device struct {
     ID      string
     Profile *profile.Profile
-    Client  client.Client
+    Client  PointClient
     Sess    session.Session
     Repo    storage.Repo
 }
 
-func New(id string, p *profile.Profile, cli client.Client, sess session.Session, repo storage.Repo) *Device {
+func New(id string, p *profile.Profile, cli PointClient, sess session.Session, repo storage.Repo) *Device {
     return &Device{
         ID:      id,
         Profile: p,

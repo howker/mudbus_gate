@@ -9,7 +9,7 @@ import (
     "syscall"
     "time"
 
-    "mbgw/internal/client"
+    "mbgw/internal/pollcore"
     "mbgw/internal/config"
     "mbgw/internal/device"
     "mbgw/internal/profile"
@@ -19,15 +19,6 @@ import (
     "mbgw/internal/web"
 )
 
-type loopbackSimulator struct{}
-
-func (l *loopbackSimulator) Read(ctx context.Context, req []byte) ([]byte, error) {
-    time.Sleep(50 * time.Millisecond)
-    txIDHi, txIDLo := req[0], req[1]
-    return []byte{txIDHi, txIDLo, 0x00, 0x00, 0x00, 0x07, 0x01, 0x04, 0x04, 0x42, 0xF6, 0xE9, 0xD5}, nil
-}
-
-func (l *loopbackSimulator) Close() error { return nil }
 
 func run() {
     logFile, _ := os.OpenFile("mbgw.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -83,8 +74,12 @@ func run() {
         }
         tr, err := transport.New(trParams)
         if err != nil {
-            log.Printf("[WARN] прибор %s недоступен. Симулятор.\n", devCfg.ID)
-            tr = &loopbackSimulator{}
+            log.Printf("[ERROR] прибор %s: не удалось создать транспорт: %v\n", devCfg.ID, err)
+            continue
+        }
+        if err := tr.Open(ctx); err != nil {
+            log.Printf("[ERROR] прибор %s: не удалось открыть транспорт: %v\n", devCfg.ID, err)
+            continue
         }
 
         if err := sess.Open(ctx, tr); err != nil {
@@ -93,8 +88,8 @@ func run() {
         }
 
         isTCP := devCfg.Transport.Kind == "modbus_tcp"
-        modbusClient := client.NewModbus(tr, isTCP, 1)
-        dev := device.New(devCfg.ID, p, modbusClient, sess, repo)
+        reader := pollcore.New(tr, isTCP, 1)
+        dev := device.New(devCfg.ID, p, reader, sess, repo)
         go dev.Start(ctx, 3*time.Second, 1*time.Hour)
     }
 

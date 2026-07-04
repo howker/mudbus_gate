@@ -3,7 +3,9 @@ package modbus
 import (
 "context"
 "encoding/binary"
+"errors"
 "fmt"
+"time"
 
 "mbgw/internal/codec"
 "mbgw/internal/transport"
@@ -151,46 +153,136 @@ copy(pdu, frame[7:])
 return txID, unitID, pdu, nil
 }
 
-// TransactTCP sends one Modbus TCP request through transport and returns response PDU.
-//
-// This helper centralizes the protocol-layer contract between session logic
-// and raw transport bytes:
-// - build MBAP-wrapped request
-// - parse MBAP response
-// - verify tx id and unit id consistency
-// - surface Modbus exception responses as errors
-func TransactTCP(ctx context.Context, tr transport.Transport, txID uint16, unitID uint8, reqPDU []byte) ([]byte, error) {
-if tr == nil {
-return nil, fmt.Errorf("nil transport")
-}
-if len(reqPDU) == 0 {
-return nil, fmt.Errorf("empty request PDU")
+// backoffSchedule matches CONTRACTS.md section 2: retries with 200/400/800ms
+// backoff between attempts.
+var backoffSchedule = []time.Duration{200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond}
+
+// Transact sends one Modbus request through the given transport (already
+// Open'd by the caller) and returns the response PDU, retrying per
+// transport.Params.Retries with backoffSchedule between attempts. Frame
+// building/parsing is chosen by isTCP (TCP: MBAP + tx/unit id verification;
+// RTU: address byte + CRC16).
+// txIDCounter provides simple monotonically-increasing transaction IDs for
+// TCP requests built via ReadPoint/WritePoint below. Not used for RTU.
+var txIDCounter uint16
+
+func nextTxID() uint16 {
+    txIDCounter++
+    return txIDCounter
 }
 
-reqFrame := BuildTCPFrame(txID, unitID, reqPDU)
-
-respFrame, err := tr.Read(ctx, reqFrame)
-if err != nil {
-return nil, err
+// NextTxID exposes the internal tx id counter for callers outside this
+// package that need to build their own requests via Transact directly
+// (e.g. internal/pollcore).
+func NextTxID() uint16 {
+    return nextTxID()
 }
 
-respTxID, respUnitID, respPDU, err := ParseTCPFrame(respFrame)
-if err != nil {
-return nil, err
+// ReadPoint builds a read request for a logical point (space/addr/dataType),
+// transacts it through tr, and returns the raw data bytes (function code and
+// byte count stripped). This is the Protocol-layer replacement for the old
+// internal/client package's ReadRaw method.
+func ReadPoint(ctx context.Context, tr transport.Transport, isTCP bool, unitID uint8, space string, addr int, dataType string) ([]byte, error) {
+    pduReq, err := BuildReadPDU(space, addr, dataType)
+    if err != nil {
+        return nil, fmt.Errorf("build pdu: %w", err)
+    }
+
+    respPDU, err := Transact(ctx, tr, isTCP, nextTxID(), unitID, pduReq)
+    if err != nil {
+        return nil, err
+    }
+    if len(respPDU) < 2 {
+        return nil, fmt.Errorf("pdu response too short")
+    }
+    return respPDU[2:], nil
+}
+func Transact(ctx context.Context, tr transport.Transport, isTCP bool, txID uint16, unitID uint8, reqPDU []byte) ([]byte, error) {
+    if tr == nil {
+        return nil, fmt.Errorf("nil transport")
+    }
+    if len(reqPDU) == 0 {
+        return nil, fmt.Errorf("empty request PDU")
+    }
+
+    params := tr.Info()
+    maxAttempts := params.Retries
+    if maxAttempts <= 0 {
+        maxAttempts = 1
+    }
+
+    var lastErr error
+    for attempt := 0; attempt < maxAttempts; attempt++ {
+        if attempt > 0 {
+            idx := attempt - 1
+            if idx >= len(backoffSchedule) {
+                idx = len(backoffSchedule) - 1
+            }
+            select {
+            case <-ctx.Done():
+                return nil, ctx.Err()
+            case <-time.After(backoffSchedule[idx]):
+            }
+        }
+
+        respPDU, err := transactOnce(ctx, tr, isTCP, txID, unitID, reqPDU, params.ResponseTimeout)
+        if err == nil {
+            return respPDU, nil
+        }
+        lastErr = err
+
+        var exc *ExceptionError
+        if errors.As(err, &exc) && exc.Code == 0x06 {
+            continue // BUSY: retry per CONTRACTS.md section 2
+        }
+    }
+
+    return nil, lastErr
 }
 
-if respTxID != txID {
-return nil, fmt.Errorf("transaction id mismatch: want 0x%04X, got 0x%04X", txID, respTxID)
-}
-if respUnitID != unitID {
-return nil, fmt.Errorf("unit id mismatch: want %d, got %d", unitID, respUnitID)
-}
+func transactOnce(ctx context.Context, tr transport.Transport, isTCP bool, txID uint16, unitID uint8, reqPDU []byte, timeout time.Duration) ([]byte, error) {
+    var reqFrame []byte
+    if isTCP {
+        reqFrame = BuildTCPFrame(txID, unitID, reqPDU)
+    } else {
+        reqFrame = BuildRTUFrame(unitID, reqPDU)
+    }
 
-if isExc, code := IsException(respPDU); isExc {
-return nil, &ExceptionError{Code: code}
-}
+    if err := tr.Send(ctx, reqFrame); err != nil {
+        return nil, err
+    }
 
-return respPDU, nil
+    respFrame, err := tr.Receive(ctx, timeout)
+    if err != nil {
+        return nil, err
+    }
+
+    var respPDU []byte
+    if isTCP {
+        var respTxID uint16
+        var respUnitID uint8
+        respTxID, respUnitID, respPDU, err = ParseTCPFrame(respFrame)
+        if err != nil {
+            return nil, err
+        }
+        if respTxID != txID {
+            return nil, fmt.Errorf("transaction id mismatch: want 0x%04X, got 0x%04X", txID, respTxID)
+        }
+        if respUnitID != unitID {
+            return nil, fmt.Errorf("unit id mismatch: want %d, got %d", unitID, respUnitID)
+        }
+    } else {
+        _, respPDU, err = ParseRTUFrame(respFrame)
+        if err != nil {
+            return nil, err
+        }
+    }
+
+    if isExc, code := IsException(respPDU); isExc {
+        return nil, &ExceptionError{Code: code}
+    }
+
+    return respPDU, nil
 }
 
 // BuildRTUFrame builds a serial RTU frame.

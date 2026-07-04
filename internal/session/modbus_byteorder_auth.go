@@ -151,7 +151,7 @@ func (s *ModbusByteOrderAuth) readInputRegisters(ctx context.Context, addr int, 
 		return nil, err
 	}
 
-	respPDU, err := modbus.TransactTCP(ctx, s.tr, s.nextTxID(), s.unitID, reqPDU)
+	respPDU, err := modbus.Transact(ctx, s.tr, true, s.nextTxID(), s.unitID, reqPDU)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +182,7 @@ func (s *ModbusByteOrderAuth) writeSingleHoldingRegister(ctx context.Context, ad
 
 	reqPDU := modbus.BuildWriteSingleRegisterPDU(addr, value)
 
-	respPDU, err := modbus.TransactTCP(ctx, s.tr, s.nextTxID(), s.unitID, reqPDU)
+	respPDU, err := modbus.Transact(ctx, s.tr, true, s.nextTxID(), s.unitID, reqPDU)
 	if err != nil {
 		return err
 	}
@@ -220,7 +220,7 @@ func (s *ModbusByteOrderAuth) writeHoldingRegisters(ctx context.Context, addr in
 		return err
 	}
 
-	respPDU, err := modbus.TransactTCP(ctx, s.tr, s.nextTxID(), s.unitID, reqPDU)
+	respPDU, err := modbus.Transact(ctx, s.tr, true, s.nextTxID(), s.unitID, reqPDU)
 	if err != nil {
 		return err
 	}

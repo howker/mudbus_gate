@@ -1,37 +1,46 @@
 package session
 
 import (
-	"bytes"
-	"context"
-	"testing"
+    "bytes"
+    "context"
+    "testing"
+    "time"
 
-	"mbgw/internal/protocol/modbus"
+    "mbgw/internal/protocol/modbus"
+    "mbgw/internal/transport"
 )
 
 type stubTransport struct {
-	responses [][]byte
-	requests  [][]byte
-	readErr   error
+    responses [][]byte
+    requests  [][]byte
+    readErr   error
 }
 
-func (s *stubTransport) Read(ctx context.Context, req []byte) ([]byte, error) {
-	_ = ctx
-	s.requests = append(s.requests, append([]byte(nil), req...))
+func (s *stubTransport) Open(ctx context.Context) error { return nil }
 
-	if s.readErr != nil {
-		return nil, s.readErr
-	}
-	if len(s.responses) == 0 {
-		return nil, context.DeadlineExceeded
-	}
+func (s *stubTransport) Send(ctx context.Context, frame []byte) error {
+    s.requests = append(s.requests, append([]byte(nil), frame...))
+    return nil
+}
 
-	resp := s.responses[0]
-	s.responses = s.responses[1:]
-	return append([]byte(nil), resp...), nil
+func (s *stubTransport) Receive(ctx context.Context, timeout time.Duration) ([]byte, error) {
+    if s.readErr != nil {
+        return nil, s.readErr
+    }
+    if len(s.responses) == 0 {
+        return nil, context.DeadlineExceeded
+    }
+    resp := s.responses[0]
+    s.responses = s.responses[1:]
+    return append([]byte(nil), resp...), nil
 }
 
 func (s *stubTransport) Close() error {
-	return nil
+    return nil
+}
+
+func (s *stubTransport) Info() transport.Params {
+    return transport.Params{Retries: 1}
 }
 
 func newVKMTransportForOrder(order string) *stubTransport {

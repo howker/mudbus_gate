@@ -1,30 +1,50 @@
 package session
 import (
-"context"
-"testing"
-"mbgw/internal/protocol/merkuriy"
+    "context"
+    "testing"
+    "time"
+
+    "mbgw/internal/protocol/merkuriy"
+    "mbgw/internal/transport"
 )
 type fakeMerkuriyTransport struct {
-responses map[byte][]byte // keyed by request command code
-closed    bool
+    responses  map[byte][]byte // keyed by request command code
+    closed     bool
+    lastAddr   byte
+    lastCode   byte
 }
+
 func newFakeMerkuriyTransport() *fakeMerkuriyTransport {
-return &fakeMerkuriyTransport{responses: map[byte][]byte{}}
+    return &fakeMerkuriyTransport{responses: map[byte][]byte{}}
 }
-func (f *fakeMerkuriyTransport) Read(ctx context.Context, req []byte) ([]byte, error) {
-addr, code, _, err := merkuriy.ParseFrame(req)
-if err != nil {
-return nil, err
+
+func (f *fakeMerkuriyTransport) Open(ctx context.Context) error { return nil }
+
+func (f *fakeMerkuriyTransport) Send(ctx context.Context, frame []byte) error {
+    addr, code, _, err := merkuriy.ParseFrame(frame)
+    if err != nil {
+        return err
+    }
+    f.lastAddr = addr
+    f.lastCode = code
+    return nil
 }
-if resp, ok := f.responses[code]; ok {
-return resp, nil
+
+func (f *fakeMerkuriyTransport) Receive(ctx context.Context, timeout time.Duration) ([]byte, error) {
+    if resp, ok := f.responses[f.lastCode]; ok {
+        return resp, nil
+    }
+    // Default: success response (status X0).
+    return merkuriy.BuildFrame(f.lastAddr, 0x00, nil), nil
 }
-// Default: success response (status X0).
-return merkuriy.BuildFrame(addr, 0x00, nil), nil
-}
+
 func (f *fakeMerkuriyTransport) Close() error {
-f.closed = true
-return nil
+    f.closed = true
+    return nil
+}
+
+func (f *fakeMerkuriyTransport) Info() transport.Params {
+    return transport.Params{Retries: 1}
 }
 func TestMerkuriySessionOpenSuccess(t *testing.T) {
 tr := newFakeMerkuriyTransport()

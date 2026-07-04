@@ -43,6 +43,10 @@ return fmt.Errorf("transport is not initialized")
 }
 s.state = StateInitializing
 s.tr = tr
+if err := tr.Open(ctx); err != nil {
+s.state = StateError
+return fmt.Errorf("merkuriy transport open failed: %w", err)
+}
 if err := s.testLink(ctx); err != nil {
 s.state = StateError
 return fmt.Errorf("merkuriy test-link failed: %w", err)
@@ -57,7 +61,7 @@ return nil
 }
 func (s *MerkuriySession) testLink(ctx context.Context) error {
 frame := merkuriy.BuildTestLink(s.addr)
-resp, err := s.tr.Read(ctx, frame)
+resp, err := merkuriy.Transact(ctx, s.tr, frame)
 if err != nil {
 return err
 }
@@ -72,7 +76,7 @@ return nil
 }
 func (s *MerkuriySession) openChannel(ctx context.Context) error {
 frame := merkuriy.BuildOpenChannel(s.addr, s.level, s.password)
-resp, err := s.tr.Read(ctx, frame)
+resp, err := merkuriy.Transact(ctx, s.tr, frame)
 if err != nil {
 return err
 }
@@ -112,7 +116,7 @@ s.mu.Lock()
 defer s.mu.Unlock()
 if s.tr != nil && s.state == StateReady {
 frame := merkuriy.BuildCloseChannel(s.addr)
-_, _ = s.tr.Read(context.Background(), frame)
+_, _ = merkuriy.Transact(context.Background(), s.tr, frame)
 }
 s.state = StateClosed
 return nil

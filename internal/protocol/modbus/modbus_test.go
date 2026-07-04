@@ -1,11 +1,14 @@
 package modbus
 
 import (
-	"bytes"
-	"context"
-	"encoding/hex"
-	"strings"
-	"testing"
+    "bytes"
+    "context"
+    "encoding/hex"
+    "strings"
+    "testing"
+    "time"
+
+    "mbgw/internal/transport"
 )
 
 // parseHex removes spaces from golden vector literals.
@@ -21,17 +24,26 @@ type stubTransport struct {
 	lastReq []byte
 }
 
-func (s *stubTransport) Read(ctx context.Context, req []byte) ([]byte, error) {
-	_ = ctx
-	s.lastReq = append([]byte(nil), req...)
-	if s.err != nil {
-		return nil, s.err
-	}
-	return append([]byte(nil), s.resp...), nil
+func (s *stubTransport) Open(ctx context.Context) error { return nil }
+
+func (s *stubTransport) Send(ctx context.Context, frame []byte) error {
+        s.lastReq = append([]byte(nil), frame...)
+        return nil
+}
+
+func (s *stubTransport) Receive(ctx context.Context, timeout time.Duration) ([]byte, error) {
+        if s.err != nil {
+                return nil, s.err
+        }
+        return append([]byte(nil), s.resp...), nil
 }
 
 func (s *stubTransport) Close() error {
-	return nil
+        return nil
+}
+
+func (s *stubTransport) Info() transport.Params {
+        return transport.Params{Retries: 1}
 }
 
 func TestCRC16_Golden(t *testing.T) {
@@ -105,7 +117,7 @@ func TestTransactTCP(t *testing.T) {
 			resp: BuildTCPFrame(0x1234, 0x01, respPDU),
 		}
 
-		got, err := TransactTCP(context.Background(), st, 0x1234, 0x01, reqPDU)
+		got, err := Transact(context.Background(), st, true, 0x1234, 0x01, reqPDU)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -124,7 +136,7 @@ func TestTransactTCP(t *testing.T) {
 			resp: BuildTCPFrame(0x9999, 0x01, respPDU),
 		}
 
-		_, err := TransactTCP(context.Background(), st, 0x1234, 0x01, reqPDU)
+		_, err := Transact(context.Background(), st, true, 0x1234, 0x01, reqPDU)
 		if err == nil {
 			t.Fatal("expected txID mismatch error, got nil")
 		}
@@ -135,7 +147,7 @@ func TestTransactTCP(t *testing.T) {
 			resp: BuildTCPFrame(0x1234, 0x02, respPDU),
 		}
 
-		_, err := TransactTCP(context.Background(), st, 0x1234, 0x01, reqPDU)
+		_, err := Transact(context.Background(), st, true, 0x1234, 0x01, reqPDU)
 		if err == nil {
 			t.Fatal("expected unitID mismatch error, got nil")
 		}
@@ -146,7 +158,7 @@ func TestTransactTCP(t *testing.T) {
 			resp: BuildTCPFrame(0x1234, 0x01, parseHex("84 06")),
 		}
 
-		_, err := TransactTCP(context.Background(), st, 0x1234, 0x01, reqPDU)
+		_, err := Transact(context.Background(), st, true, 0x1234, 0x01, reqPDU)
 		if err == nil {
 			t.Fatal("expected modbus exception error, got nil")
 		}
@@ -168,7 +180,7 @@ func TestTransactTCP(t *testing.T) {
 			resp: BuildTCPFrame(0x1234, 0x01, parseHex("84 02")),
 		}
 
-		_, err := TransactTCP(context.Background(), st, 0x1234, 0x01, reqPDU)
+		_, err := Transact(context.Background(), st, true, 0x1234, 0x01, reqPDU)
 		if err == nil {
 			t.Fatal("expected modbus exception error, got nil")
 		}
