@@ -58,7 +58,7 @@ t.Fatalf("expected StateReady, got %v", s.State())
 }
 func TestMerkuriySessionOpenTestLinkFails(t *testing.T) {
 tr := newFakeMerkuriyTransport()
-tr.responses[0x00] = merkuriy.BuildFrame(1, 0x03, nil) // X3 channel busy
+tr.responses[0x00] = merkuriy.BuildFrame(1, 0x03, nil) // X3 insufficient access level
 s := NewMerkuriySession(1, 1, [6]byte{1, 1, 1, 1, 1, 1})
 if err := s.Open(context.Background(), tr); err == nil {
 t.Fatal("expected error on test-link failure")
@@ -69,7 +69,7 @@ t.Fatalf("expected StateError, got %v", s.State())
 }
 func TestMerkuriySessionOpenChannelFails(t *testing.T) {
 tr := newFakeMerkuriyTransport()
-tr.responses[0x01] = merkuriy.BuildFrame(1, 0x01, nil) // X1 no access
+tr.responses[0x01] = merkuriy.BuildFrame(1, 0x01, nil) // X1 invalid command/parameter
 s := NewMerkuriySession(1, 1, [6]byte{1, 1, 1, 1, 1, 1})
 if err := s.Open(context.Background(), tr); err == nil {
 t.Fatal("expected error on open-channel failure")
@@ -77,6 +77,18 @@ t.Fatal("expected error on open-channel failure")
 if s.State() != StateError {
 t.Fatalf("expected StateError, got %v", s.State())
 }
+}
+func TestMerkuriySessionOpenChannelNotOpenStatus(t *testing.T) {
+    tr := newFakeMerkuriyTransport()
+    tr.responses[0x01] = merkuriy.BuildFrame(1, 0x05, nil) // X5 channel not open
+
+    s := NewMerkuriySession(1, 1, [6]byte{1, 1, 1, 1, 1, 1})
+    if err := s.Open(context.Background(), tr); err == nil {
+        t.Fatal("expected error on X5 channel-not-open status")
+    }
+    if s.State() != StateError {
+        t.Fatalf("expected StateError, got %v", s.State())
+    }
 }
 func TestMerkuriySessionKeepAliveNoopWithinInterval(t *testing.T) {
 tr := newFakeMerkuriyTransport()
