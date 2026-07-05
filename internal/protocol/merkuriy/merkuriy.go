@@ -61,3 +61,49 @@ return BuildFrame(addr, 0x01, payload)
 func BuildCloseChannel(addr byte) []byte {
 return BuildFrame(addr, 0x02, nil)
 }
+
+// BuildReadRelative builds a command 0x16 "relative addressing mode" read
+// request: reads a ring-buffer array (power profile, event log, etc.) by
+// memory number, starting OFFSET records back from the most recently
+// formed record (0 = the last record), for up to `count` records
+// (documented as "писание системы команд приборов учета еркурий",
+// section 4.6, covering еркурий 230 among other models - distinct from
+// the unrelated еркурий-200/206 CAN protocol, which uses a completely
+// different 4-byte-address frame and is NOT what this package implements).
+//
+// Wire format: [addr 1B][code=0x16][memNumber 1B][offset 2B big-endian]
+// [count 1B][CRC16-modbus 2B]. Golden vector (section 4.6 worked example,
+// device addr 0x80, memory #3, offset 1, 1 record):
+//   80 16 03 00 01 01 96 0C
+func BuildReadRelative(addr byte, memNumber byte, offset uint16, count byte) []byte {
+    payload := make([]byte, 0, 4)
+    payload = append(payload, memNumber, byte(offset>>8), byte(offset&0xFF), count)
+    return BuildFrame(addr, 0x16, payload)
+}
+
+// ParseResponse validates CRC and returns addr and the full data field of
+// a standard Merkuriy response frame: [addr 1B][data 1..255B][CRC 2B]
+// (section 1.5.4.1's figure 1.2, and figure 1.3 for the long-response
+// variant used by relative-addressing/profile/log reads - both share the
+// same three-field shape, only the data field's maximum length differs).
+//
+// Unlike ParseFrame, this does NOT assume the first data byte is a
+// separate "response code" - that assumption only happens to hold for
+// test-link/open-channel/close-channel, whose 1-byte status response
+// makes data[0] look like a code. For any response carrying real
+// multi-byte data (profile records, logs, energy registers), treating
+// data[0] as a throwaway "code" would silently misalign every decoded
+// field by one byte. Use ParseResponse for those; ParseFrame remains as-is
+// for the three channel-control commands it already correctly serves.
+func ParseResponse(frame []byte) (addr byte, data []byte, err error) {
+    if len(frame) < 3 {
+        return 0, nil, fmt.Errorf("merkuriy response too short")
+    }
+    body := frame[:len(frame)-2]
+    calcCRC := modbus.CRC16(body)
+    frameCRC := uint16(frame[len(frame)-2]) | (uint16(frame[len(frame)-1]) << 8)
+    if calcCRC != frameCRC {
+        return 0, nil, fmt.Errorf("invalid CRC")
+    }
+    return frame[0], frame[1 : len(frame)-2], nil
+}
