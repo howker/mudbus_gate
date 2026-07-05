@@ -255,3 +255,27 @@ func TestBuildWriteMultipleRegistersPDU(t *testing.T) {
 		t.Fatalf("unexpected PDU: want %x, got %x", want, pdu)
 	}
 }
+
+func TestBuildArchive65IndexPDU_Golden(t *testing.T) {
+    // prtkl_Modbus_pril_1.pdf, Приложение А: запрос по индексу 6 записей
+    // массива 1, начиная со 100-й, устройство 17.
+    // Full frame incl. device addr+CRC: 11 41 00 01 00 06 00 00 64
+    // (addr/CRC are framing, not part of the PDU) - PDU is: 41 00 01 00 06 00 00 64
+    got := BuildArchive65IndexPDU(1, 6, 100)
+    want := []byte{0x41, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x64}
+    if !bytes.Equal(got, want) {
+        t.Fatalf("got % X, want % X", got, want)
+    }
+}
+
+func TestBuildArchive65TimePDU_Golden(t *testing.T) {
+    // prtkl_Modbus_pril_1.pdf: запрос по времени 6 записей массива 1 с
+    // 10-12-1998 13:12:00, устройство 17.
+    // PDU: 41 00 01 00 06 01 00 0C 0D 0A 0C 62
+    tm := time.Date(1998, time.December, 10, 13, 12, 0, 0, time.UTC)
+    got := BuildArchive65TimePDU(1, 6, tm)
+    want := []byte{0x41, 0x00, 0x01, 0x00, 0x06, 0x01, 0x00, 0x0C, 0x0D, 0x0A, 0x0C, 0x62}
+    if !bytes.Equal(got, want) {
+        t.Fatalf("got % X, want % X", got, want)
+    }
+}

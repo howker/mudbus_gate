@@ -9,14 +9,22 @@ import (
 )
 
 // ivkterRegisters holds static current-value registers for the IVK-TER
-// vertical-slice emulator (no session, no archive protocol yet - see
-// backlog for u32+float composite and function 65 archive support).
+// vertical-slice emulator.
 var ivkterRegisters = map[int][]byte{
     100: {0x42, 0xC8, 0x00, 0x00}, // float 100.0 (flow rate)
     102: {0x41, 0xA0, 0x00, 0x00}, // float 20.0 (temperature)
-    // Archive record #0 at base address 200 (4 registers / 8 bytes):
-    // u32 int part = 12345, float frac part = 0.6789 -> 12345.6789 composite.
-    200: {0x00, 0x00, 0x30, 0x39, 0x3F, 0x2D, 0xCC, 0x64},
+}
+
+// ivkterHourlyRecord is a fixed test hourly-archive record (30 bytes,
+// str_arh_ivk_ter.pdf table 3): archive_time=1700000000 (not the
+// nonexistent-record marker), v_plus=12345.6, v_minus=100.25, q_avg=55.5,
+// resistance=1200.0, errors=0, comm_fail_time=0, flowmeter_type=1,
+// downtime=0, power_loss_time=0. No CRC (IVK-TER archive records have
+// none - unlike TSRV-024's).
+var ivkterHourlyRecord = []byte{
+    0x65, 0x53, 0xF1, 0x00, 0x46, 0x40, 0xE6, 0x66, 0x42, 0xC8, 0x80, 0x00,
+    0x42, 0x5E, 0x00, 0x00, 0x44, 0x96, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
 }
 
 func RunIVKTER(addr string) error {
@@ -54,11 +62,6 @@ func handleIVKTERConn(conn net.Conn) {
         if len(pdu) < 1 {
             continue
         }
-        // Note: function 17 (Report Slave ID) requests are just 1 byte
-        // (function code only), shorter than the 5-byte minimum needed
-        // for functions 03/04/06/16 - that length check now lives inside
-        // buildIVKTERResponse for those specific functions instead of
-        // gating all requests here.
 
         respPDU := buildIVKTERResponse(pdu)
         if respPDU == nil {
@@ -84,9 +87,24 @@ func buildIVKTERResponse(pdu []byte) []byte {
         return append([]byte{funcCode, byte(len(data))}, data...)
     }
 
+    if funcCode == modbus.FuncCodeArchive65 {
+        // Request format (see prtkl_Modbus_pril_1.pdf, matched by
+        // BuildArchive65IndexPDU/BuildArchive65TimePDU):
+        //   func(1) | arrayNumber(2) | recordCount(2) | mode(1) | data(2 or 6)
+        // The simulator does not distinguish array/mode/index/time for
+        // this vertical slice - it always returns the same fixed hourly
+        // record, regardless of which archive_type/index/time was asked
+        // for (see backlog for a fuller emulator).
+        if len(pdu) < 6 {
+            return nil
+        }
+        return append([]byte{funcCode, byte(len(ivkterHourlyRecord))}, ivkterHourlyRecord...)
+    }
+
     if funcCode != 0x03 && funcCode != 0x04 {
         return nil
     }
+
     if len(pdu) < 5 {
         return nil
     }

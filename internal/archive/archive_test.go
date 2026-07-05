@@ -123,9 +123,13 @@ func TestMBFunc65_Read(t *testing.T) {
     // funcCode(0x41) + byteCount(8) + record: time=1 (not the nonexistent
     // marker), data=42 (uint16 0x002A), CRC16-modbus over first 6 bytes
     // (0x04D0, little-endian on wire: D0 04) - same fixture the tsrv024
-    // simulator uses.
+    // simulator uses. record_layout declares a crc:true field, so this
+    // strategy for this profile is treated as CRC-checked (TSRV-024 style).
     tx := &fakeTransactor{resp: []byte{0x41, 8, 0, 0, 0, 1, 0, 42, 0xD0, 0x04}}
-    q := ArchiveQuery{Params: map[string]any{"archive_type": 1}}
+    q := ArchiveQuery{
+        Params:       map[string]any{"archive_type": 1},
+        RecordLayout: []RecordLayoutField{{Offset: 6, Name: "crc", Type: "uint16", CRC: true}},
+    }
     recs, err := r.Read(context.Background(), nil, tx, q)
     if err != nil {
         t.Fatalf("unexpected error: %v", err)
@@ -156,7 +160,10 @@ func TestMBFunc65_BadCRCIsFlagged(t *testing.T) {
     r := NewMBFunc65()
     // Same record as TestMBFunc65_Read but with a corrupted CRC byte.
     tx := &fakeTransactor{resp: []byte{0x41, 8, 0, 0, 0, 1, 0, 42, 0x00, 0x00}}
-    q := ArchiveQuery{Params: map[string]any{"archive_type": 1}}
+    q := ArchiveQuery{
+        Params:       map[string]any{"archive_type": 1},
+        RecordLayout: []RecordLayoutField{{Offset: 6, Name: "crc", Type: "uint16", CRC: true}},
+    }
     recs, err := r.Read(context.Background(), nil, tx, q)
     if err != nil {
         t.Fatalf("unexpected error: %v", err)
@@ -166,5 +173,22 @@ func TestMBFunc65_BadCRCIsFlagged(t *testing.T) {
     }
     if recs[0].CRCOK {
         t.Fatal("expected CRCOK=false for a corrupted CRC")
+    }
+}
+
+func TestMBFunc65_NoCRCFieldSkipsCheck(t *testing.T) {
+    // A device profile whose record_layout has no crc:true field (e.g.
+    // IVK-TER) must not have its records flagged CRCOK=false just because
+    // the last two bytes happen not to match a CRC16 that was never
+    // supposed to be there.
+    r := NewMBFunc65()
+    tx := &fakeTransactor{resp: []byte{0x41, 8, 0, 0, 0, 1, 0, 42, 0x00, 0x00}}
+    q := ArchiveQuery{Params: map[string]any{"archive_type": 0}}
+    recs, err := r.Read(context.Background(), nil, tx, q)
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    if !recs[0].CRCOK {
+        t.Fatal("expected CRCOK=true (no CRC check) when record_layout has no crc:true field")
     }
 }

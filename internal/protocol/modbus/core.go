@@ -392,41 +392,70 @@ func ParseReportSlaveIDResponse(pdu []byte) (ReportSlaveIDResponse, error) {
     }, nil
 }
 // FuncCodeArchive65 is the VZLET-specific function code (0x41) used by
-// TSRV-024 to read archive records by index or by time (CONTRACTS.md §2.3).
+// IVK-TER and TSRV-024 to read archive records by index or by time
+// (CONTRACTS.md §2.3; prtkl_Modbus_pril_1.pdf, Приложение А, "Функция 65").
 const FuncCodeArchive65 = 0x41
 
 const (
-ArchiveModeByIndex = 0
-ArchiveModeByTime  = 1
+    ArchiveModeByIndex = 0
+    ArchiveModeByTime  = 1
 )
 
-// BuildArchive65PDU builds a request for the VZLET function 65 (0x41) archive
-// read: archive type index, access mode (by index or by time), and a 4-byte
-// value (either a record index or a Unix timestamp, per mode).
-func BuildArchive65PDU(archiveType byte, mode byte, value uint32) []byte {
-pdu := make([]byte, 7)
-pdu[0] = FuncCodeArchive65
-pdu[1] = archiveType
-pdu[2] = mode
-binary.BigEndian.PutUint32(pdu[3:7], value)
-return pdu
+// BuildArchive65IndexPDU builds a VZLET function 65 request reading
+// recordCount records starting at the given 0-based record index within
+// array (archive) number arrayNumber. Wire format confirmed against
+// prtkl_Modbus_pril_1.pdf's golden example (6 records of array 1 starting
+// at index 100, device 17): 41 00 01 00 06 00 00 64
+//   func(1) | arrayNumber(2) | recordCount(2) | mode=0(1) | index(2)
+func BuildArchive65IndexPDU(arrayNumber uint16, recordCount uint16, index uint16) []byte {
+    pdu := make([]byte, 8)
+    pdu[0] = FuncCodeArchive65
+    binary.BigEndian.PutUint16(pdu[1:3], arrayNumber)
+    binary.BigEndian.PutUint16(pdu[3:5], recordCount)
+    pdu[5] = ArchiveModeByIndex
+    binary.BigEndian.PutUint16(pdu[6:8], index)
+    return pdu
+}
+
+// BuildArchive65TimePDU builds a VZLET function 65 request reading
+// recordCount records starting at the given archiving time within array
+// (archive) number arrayNumber. Wire format confirmed against
+// prtkl_Modbus_pril_1.pdf's golden example (6 records of array 1 from
+// 1998-12-10 13:12:00, device 17): 41 00 01 00 06 01 00 0C 0D 0A 0C 62
+//   func(1) | arrayNumber(2) | recordCount(2) | mode=1(1) | сс мм чч дд мм гг (6 bytes)
+// Year is encoded as the last two digits (сс/мм/чч/дд/мм/гг order per the
+// document); values 70-99 mean 1970-1999, otherwise 2000+yy - this mirrors
+// the device-side convention, not a Y2K bug in our code.
+func BuildArchive65TimePDU(arrayNumber uint16, recordCount uint16, t time.Time) []byte {
+    pdu := make([]byte, 12)
+    pdu[0] = FuncCodeArchive65
+    binary.BigEndian.PutUint16(pdu[1:3], arrayNumber)
+    binary.BigEndian.PutUint16(pdu[3:5], recordCount)
+    pdu[5] = ArchiveModeByTime
+    pdu[6] = byte(t.Second())
+    pdu[7] = byte(t.Minute())
+    pdu[8] = byte(t.Hour())
+    pdu[9] = byte(t.Day())
+    pdu[10] = byte(t.Month())
+    pdu[11] = byte(t.Year() % 100)
+    return pdu
 }
 
 // ParseArchive65Response extracts the raw archive record bytes from a
-// function 65 response PDU: [funcCode][recordLen][record bytes...].
+// function 65 response PDU: [funcCode][byteCount][record bytes...].
 func ParseArchive65Response(pdu []byte) ([]byte, error) {
-if len(pdu) < 2 {
-return nil, fmt.Errorf("archive65 response too short")
-}
-if isExc, code := IsException(pdu); isExc {
-return nil, &ExceptionError{Code: code}
-}
-if pdu[0] != FuncCodeArchive65 {
-return nil, fmt.Errorf("unexpected function code in archive65 response: 0x%02X", pdu[0])
-}
-recordLen := int(pdu[1])
-if len(pdu) < 2+recordLen {
-return nil, fmt.Errorf("archive65 response record truncated: want %d bytes, got %d", recordLen, len(pdu)-2)
-}
-return pdu[2 : 2+recordLen], nil
+    if len(pdu) < 2 {
+        return nil, fmt.Errorf("archive65 response too short")
+    }
+    if isExc, code := IsException(pdu); isExc {
+        return nil, &ExceptionError{Code: code}
+    }
+    if pdu[0] != FuncCodeArchive65 {
+        return nil, fmt.Errorf("unexpected function code in archive65 response: 0x%02X", pdu[0])
+    }
+    byteCount := int(pdu[1])
+    if len(pdu) < 2+byteCount {
+        return nil, fmt.Errorf("archive65 response record truncated: want %d bytes, got %d", byteCount, len(pdu)-2)
+    }
+    return pdu[2 : 2+byteCount], nil
 }

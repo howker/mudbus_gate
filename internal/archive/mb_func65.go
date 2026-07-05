@@ -8,57 +8,62 @@ import (
     "mbgw/internal/protocol/modbus"
 )
 // MBFunc65 is the archive-read strategy using Modbus function 65 (0x41),
-// specific to VZLET TSRV-024 (CONTRACTS.md §6.3): request by index or by
-// time (period rounding is the caller's/profile's responsibility), a
-// nonexistent-record marker of 0x00000000 or 0xFFFFFFFF in the first 4
-// bytes (record time), and a CRC16-modbus checksum in the last 2 bytes.
-// archive_type comes from the profile's archive.params (see
-// archiveTypeParam below) instead of being aliased onto q.Instance, which
-// per CONTRACTS.md's ArchiveQuery doc comment means "pipe/heat system",
-// not "archive type" - conflating the two was a placeholder from an
-// earlier vertical-slice pass (see backlog). Full record_layout-driven
-// field decoding is still a separate task; decodeRecord remains a
-// placeholder for individual fields.
+// the generic VZLET "read record array" mechanism (prtkl_Modbus_pril_1.pdf,
+// Приложение А) shared by every VZLET device (IVK-TER, TSRV-024, and any
+// future VZLET model) - not TSRV-specific despite the historical name.
+// archive_type (the array/archive number) comes from the profile's
+// archive.params, since it differs per device and per archive within a
+// device (CONTRACTS.md §6.2/§6.3). Nonexistent-record marker: time
+// 0x00000000/0xFFFFFFFF in the first 4 bytes. CRC (§5.4) is checked only
+// when the profile's record_layout marks a field crc:true - some VZLET
+// devices' archive records have no CRC at all (e.g. IVK-TER's 30-byte
+// hourly record, str_arh_ivk_ter.pdf table 3), so a blanket "last 2 bytes
+// are CRC" is wrong in general.
 type MBFunc65 struct{}
 func NewMBFunc65() *MBFunc65 { return &MBFunc65{} }
 func (r *MBFunc65) Strategy() string { return "mb_func65" }
-// archiveTypeParam extracts the required "archive_type" param. There is no
-// TSRV-024 register-map document in this project (only VKM/IVK-TER PDFs),
-// so the exact device-side type_index values are not verifiable here -
-// the profile must supply whatever value matches the real device, no
-// hardcoded default is guessed.
-func archiveTypeParam(params map[string]any) (byte, error) {
+// archiveTypeParam extracts the required "archive_type" param (the VZLET
+// array/archive number, 0-based per prtkl_Modbus_pril_1.pdf).
+func archiveTypeParam(params map[string]any) (uint16, error) {
     raw, ok := params["archive_type"]
     if !ok {
         return 0, fmt.Errorf("mb_func65: missing required archive param %q in profile", "archive_type")
     }
     switch v := raw.(type) {
     case int:
-        return byte(v), nil
+        return uint16(v), nil
     case int64:
-        return byte(v), nil
+        return uint16(v), nil
     case float64:
-        return byte(v), nil
+        return uint16(v), nil
     default:
         return 0, fmt.Errorf("mb_func65: archive param %q has unsupported type %T", "archive_type", raw)
     }
 }
+// layoutHasCRC reports whether the profile's record_layout declares a
+// crc:true field - meaning this device's archive records are followed by
+// a CRC16-modbus checksum (CONTRACTS.md §5.4). Devices whose records have
+// no CRC at all (e.g. IVK-TER) simply don't set this on any field.
+func layoutHasCRC(layout []RecordLayoutField) bool {
+    for _, f := range layout {
+        if f.CRC {
+            return true
+        }
+    }
+    return false
+}
 func (r *MBFunc65) Read(ctx context.Context, sess ArchiveSession, tx Transactor, q ArchiveQuery) ([]ArchiveRecord, error) {
-    archiveType, err := archiveTypeParam(q.Params)
+    arrayNumber, err := archiveTypeParam(q.Params)
     if err != nil {
         return nil, err
     }
 
-    mode := byte(modbus.ArchiveModeByIndex)
-    var value uint32
+    var req []byte
     if !q.From.IsZero() {
-        mode = modbus.ArchiveModeByTime
-        value = uint32(q.From.Unix())
+        req = modbus.BuildArchive65TimePDU(arrayNumber, 1, q.From)
     } else {
-        value = uint32(q.FromIndex)
+        req = modbus.BuildArchive65IndexPDU(arrayNumber, 1, uint16(q.FromIndex))
     }
-
-    req := modbus.BuildArchive65PDU(archiveType, mode, value)
 
     respPDU, err := tx.Transact(ctx, req)
     if err != nil {
@@ -81,10 +86,11 @@ func (r *MBFunc65) Read(ctx context.Context, sess ArchiveSession, tx Transactor,
         }
     }
 
-    // Record CRC check (last 2 bytes), per CONTRACTS.md §5.4: CRC16-modbus
-    // over the whole record except the last 2 bytes, little-endian on wire.
+    // Record CRC check (last 2 bytes), per CONTRACTS.md §5.4, only for
+    // devices whose record_layout declares a crc:true field. Devices with
+    // no CRC in their record format (e.g. IVK-TER) are trusted as-is.
     crcOK := true
-    if len(raw) >= 2 {
+    if layoutHasCRC(q.RecordLayout) && len(raw) >= 2 {
         recordBody := raw[:len(raw)-2]
         wantCRC := uint16(raw[len(raw)-2]) | (uint16(raw[len(raw)-1]) << 8)
         gotCRC := modbus.CRC16(recordBody)

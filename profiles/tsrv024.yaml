@@ -42,16 +42,82 @@ points:
     unit: "C"
     access: "read"
     group: "current"
-
 archives:
-  - id: "main"
+  - id: "hourly"
     strategy: "mb_func65"
     time_access: true
     index_access: true
-    dst_aware: false
+    dst_aware: true
     params:
-      archive_type: 1
-    note: "TSRV-024 hourly archive via function 65, CRC-checked. archive_type=1 is a placeholder - no TSRV-024 register-map document exists in this project to verify the real device-side type_index; must be confirmed against actual hardware before production use."
+      archive_type: 0
+    note: "TSRV-024 hourly heat-system (TS) archive (index 0), 172-byte record per str_arh_tsrv024.pdf table 1, CRC16-modbus checked (last 2 bytes). Read via VZLET function 65, same generic mechanism as IVK-TER. Known limitation: avg_temp_pipe_N is signed (can be negative in winter) but decodeByLayout's scaled_int type only supports unsigned uint16, so these fields are int16 WITHOUT the *0.01 scale applied (raw hundredths of a degree) - see backlog for a signed-scaled codec type."
     record_layout:
-      - { offset: 0, name: "record_time", type: "uint32", epoch: "1970-01-01" }
-      - { offset: 4, name: "heat_value", type: "scaled_int", scale: 0.01, unit: "Gcal" }
+      - { offset: 0, name: "archive_time", type: "uint32", epoch: "1970-01-01" }
+      - { offset: 4, name: "clean_work_time", type: "uint16", unit: "min" }
+      - { offset: 6, name: "power_loss_downtime", type: "uint16", unit: "min" }
+      - { offset: 8, name: "sensor_fail_downtime", type: "uint16", unit: "min" }
+      - { offset: 10, name: "ns_total_downtime", type: "uint16", unit: "min" }
+      - { offset: 12, name: "nonwork_mode_downtime", type: "uint16", unit: "min" }
+      - { offset: 14, name: "ns_counter_1", type: "uint16", unit: "min" }
+      - { offset: 16, name: "ns_counter_2", type: "uint16", unit: "min" }
+      - { offset: 18, name: "ns_counter_3", type: "uint16", unit: "min" }
+      - { offset: 20, name: "ns_counter_4", type: "uint16", unit: "min" }
+      - { offset: 22, name: "ns_counter_5", type: "uint16", unit: "min" }
+      - { offset: 24, name: "ns_counter_6", type: "uint16", unit: "min" }
+      - { offset: 26, name: "ns_counter_7", type: "uint16", unit: "min" }
+      - { offset: 28, name: "ns_counter_8", type: "uint16", unit: "min" }
+      - { offset: 30, name: "ns_counter_9", type: "uint16", unit: "min" }
+      - { offset: 32, name: "ns_counter_10", type: "uint16", unit: "min" }
+      - { offset: 34, name: "ns_counter_11", type: "uint16", unit: "min" }
+      - { offset: 36, name: "ns_counter_12", type: "uint16", unit: "min" }
+      - { offset: 38, name: "ns_counter_13", type: "uint16", unit: "min" }
+      - { offset: 40, name: "ns_counter_14", type: "uint16", unit: "min" }
+      - { offset: 42, name: "ns_counter_15", type: "uint16", unit: "min" }
+      - { offset: 44, name: "ns_counter_16", type: "uint16", unit: "min" }
+      - { offset: 46, name: "ns_counter_17", type: "uint16", unit: "min" }
+      - { offset: 48, name: "ns_counter_18", type: "uint16", unit: "min" }
+      - { offset: 50, name: "ns_counter_19", type: "uint16", unit: "min" }
+      - { offset: 52, name: "ns_counter_20", type: "uint16", unit: "min" }
+      - { offset: 54, name: "ns_counter_21", type: "uint16", unit: "min" }
+      - { offset: 56, name: "ns_counter_22", type: "uint16", unit: "min" }
+      - { offset: 58, name: "ns_counter_23", type: "uint16", unit: "min" }
+      - { offset: 60, name: "ns_counter_24", type: "uint16", unit: "min" }
+      - { offset: 62, name: "ns_counter_25", type: "uint16", unit: "min" }
+      - { offset: 64, name: "ns_counter_26", type: "uint16", unit: "min" }
+      - { offset: 66, name: "ns_counter_27", type: "uint16", unit: "min" }
+      - { offset: 68, name: "ns_counter_28", type: "uint16", unit: "min" }
+      - { offset: 70, name: "ns_counter_29", type: "uint16", unit: "min" }
+      - { offset: 72, name: "ns_counter_30", type: "uint16", unit: "min" }
+      - { offset: 74, name: "ns_counter_31", type: "uint16", unit: "min" }
+      - { offset: 76, name: "ns_counter_32", type: "uint16", unit: "min" }
+      - { offset: 78, name: "current_algorithm", type: "uint16" }
+      - { offset: 80, name: "ns_flags", type: "uint32" }
+      - { offset: 84, name: "total_heat", type: "float", unit: "Gcal" }
+      - { offset: 88, name: "heat_water_draw", type: "float", unit: "Gcal" }
+      - { offset: 92, name: "total_mass", type: "float", unit: "t" }
+      - { offset: 96, name: "heat_pipe_1", type: "float", unit: "Gcal" }
+      - { offset: 100, name: "heat_pipe_2", type: "float", unit: "Gcal" }
+      - { offset: 104, name: "heat_pipe_3", type: "float", unit: "Gcal" }
+      - { offset: 108, name: "heat_pipe_4", type: "float", unit: "Gcal" }
+      - { offset: 112, name: "mass_pipe_1", type: "float", unit: "t" }
+      - { offset: 116, name: "mass_pipe_2", type: "float", unit: "t" }
+      - { offset: 120, name: "mass_pipe_3", type: "float", unit: "t" }
+      - { offset: 124, name: "mass_pipe_4", type: "float", unit: "t" }
+      - { offset: 128, name: "volume_pipe_1", type: "float", unit: "m3" }
+      - { offset: 132, name: "volume_pipe_2", type: "float", unit: "m3" }
+      - { offset: 136, name: "volume_pipe_3", type: "float", unit: "m3" }
+      - { offset: 140, name: "volume_pipe_4", type: "float", unit: "m3" }
+      - { offset: 144, name: "weighted_temp_pipe_1", type: "scaled_int", unit: "C", scale: 0.01 }
+      - { offset: 146, name: "weighted_temp_pipe_2", type: "scaled_int", unit: "C", scale: 0.01 }
+      - { offset: 148, name: "weighted_temp_pipe_3", type: "scaled_int", unit: "C", scale: 0.01 }
+      - { offset: 150, name: "weighted_temp_pipe_4", type: "scaled_int", unit: "C", scale: 0.01 }
+      - { offset: 152, name: "avg_temp_pipe_1", type: "int16", unit: "C" }
+      - { offset: 154, name: "avg_temp_pipe_2", type: "int16", unit: "C" }
+      - { offset: 156, name: "avg_temp_pipe_3", type: "int16", unit: "C" }
+      - { offset: 158, name: "avg_temp_pipe_4", type: "int16", unit: "C" }
+      - { offset: 160, name: "avg_pressure_pipe_1", type: "scaled_int", unit: "MPa", scale: 0.001 }
+      - { offset: 162, name: "avg_pressure_pipe_2", type: "scaled_int", unit: "MPa", scale: 0.001 }
+      - { offset: 164, name: "avg_pressure_pipe_3", type: "scaled_int", unit: "MPa", scale: 0.001 }
+      - { offset: 166, name: "avg_pressure_pipe_4", type: "scaled_int", unit: "MPa", scale: 0.001 }
+      - { offset: 168, name: "cold_water_temp", type: "scaled_int", unit: "C", scale: 0.01 }
+      - { offset: 170, name: "crc", type: "uint16", crc: true }
