@@ -12,6 +12,7 @@ import (
     "mbgw/internal/pointresolver"
     "mbgw/internal/profile"
     "mbgw/internal/protocol/modbus"
+    "mbgw/internal/quality"
     "mbgw/internal/session"
     "mbgw/internal/storage"
 )
@@ -168,8 +169,8 @@ func (d *Device) poll(ctx context.Context) {
 // before evaluating quality for the rest of the device's points. Points
 // with a parametric instance are not supported as quality sources in this
 // vertical slice (status words are assumed device-wide, not per-instance).
-func (d *Device) collectStatusValues(ctx context.Context) map[string]int64 {
-    result := make(map[string]int64)
+func (d *Device) collectStatusValues(ctx context.Context) quality.StatusValues {
+    result := make(quality.StatusValues)
 
     sourceNames := make(map[string]bool)
     for _, rule := range d.Profile.QualityMap {
@@ -179,31 +180,56 @@ func (d *Device) collectStatusValues(ctx context.Context) map[string]int64 {
         return result
     }
 
-    for _, pt := range d.Profile.Points {
-        if !sourceNames[pt.Name] || pt.Instance != "" {
-            continue
-        }
-        dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, pt.Addr, pt.Type)
+    readOne := func(pt profile.Point, addr int, instance string) {
+        dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, addr, pt.Type)
         if err != nil {
-            log.Printf("[%s] ошибка чтения статуса %s: %v\n", d.ID, pt.Name, err)
-            continue
+            log.Printf("[%s] ошибка чтения статуса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+            return
         }
         val, err := d.decodePoint(pt, dataBytes)
         if err != nil {
-            log.Printf("[%s] ошибка декодирования статуса %s: %v\n", d.ID, pt.Name, err)
-            continue
+            log.Printf("[%s] ошибка декодирования статуса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+            return
         }
         intVal, ok := val.(int64)
         if !ok {
             log.Printf("[%s] статус %s имеет нечисловой тип %T, пропускаю\n", d.ID, pt.Name, val)
+            return
+        }
+        if result[pt.Name] == nil {
+            result[pt.Name] = make(map[string]int64)
+        }
+        result[pt.Name][instance] = intVal
+    }
+
+    for _, pt := range d.Profile.Points {
+        if !sourceNames[pt.Name] {
             continue
         }
-        result[pt.Name] = intVal
+
+        if pt.Instance == "" {
+            readOne(pt, pt.Addr, "")
+            continue
+        }
+
+        inst, ok := d.Profile.Instances[pt.Instance]
+        if !ok || inst.Enumerate != "fixed_count" || inst.Count <= 0 {
+            log.Printf("[%s] статус %s: instance %q не поддерживается для сбора статуса\n", d.ID, pt.Name, pt.Instance)
+            continue
+        }
+        for i := 1; i <= inst.Count; i++ {
+            addr, err := pointresolver.Resolve(pt.AddrFormula, pt.Instance, i)
+            if err != nil {
+                log.Printf("[%s] статус %s (instance %d): ошибка формулы адреса: %v\n", d.ID, pt.Name, i, err)
+                continue
+            }
+            readOne(pt, addr, fmt.Sprintf("%d", i))
+        }
     }
 
     return result
 }
-func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, instance string, statusValues map[string]int64) {
+func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, instance string, statusValues quality.StatusValues) {
     dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, addr, pt.Type)
     if err != nil {
         log.Printf("[%s] ошибка опроса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
@@ -216,7 +242,7 @@ func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, i
         return
     }
 
-    quality, reason := evaluateQuality(pt.Name, d.Profile.QualityMap, statusValues)
+    qTag, reason := quality.Evaluate(pt.Name, instance, d.Profile.QualityMap, statusValues)
 
     reading := storage.ReadingCurrent{
         DeviceID:      d.ID,
@@ -224,7 +250,7 @@ func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, i
         Instance:      instance,
         Value:         val,
         Unit:          pt.Unit,
-        Quality:       quality,
+        Quality:       string(qTag),
         QualityReason: reason,
         Timestamp:     time.Now(),
     }

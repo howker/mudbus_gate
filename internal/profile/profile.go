@@ -103,6 +103,7 @@ type Archive struct {
 type QualityRule struct {
     Source  string `yaml:"source"`
     Bit     int    `yaml:"bit"`
+    Code    *int   `yaml:"code"`
     Meaning string `yaml:"meaning"`
     Quality string `yaml:"quality"`
 }
