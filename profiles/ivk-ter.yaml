@@ -46,6 +46,9 @@ archives:
   - id: "main"
     strategy: "mb_indexed_binary"
     index_access: true
-    note: "IVK-TER ring buffer archive, indexed access (vertical slice)."
+    params:
+      base_addr: 200
+      record_regs: 4
+    note: "IVK-TER ring buffer archive, indexed access. base_addr/record_regs previously hardcoded in code, now profile-driven (see backlog item #3)."
     record_layout:
       - { offset: 0, name: "V_plus", type: "u32+float", unit: "m3" }

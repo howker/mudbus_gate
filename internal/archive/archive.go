@@ -24,6 +24,17 @@ type ArchiveQuery struct {
     RecordLayout []RecordLayoutField
     WordOrder32  string
     WordOrder64  string
+
+    // Params carries the profile-declared archive.params block (mirrors
+    // profile.Archive.Params via map[string]any, same layering rationale
+    // as RecordLayout above: archive must not import profile directly).
+    // Strategy-specific keys are documented on each strategy
+    // (e.g. mb_indexed_binary.go: "base_addr", "record_regs";
+    // mb_func65.go: "archive_type"). Per IMPLEMENTATION_BACKLOG.md T7
+    // ("апрещено: хардкод форматов записей вне профиля"), strategies
+    // must treat a missing required key as an error, not fall back to a
+    // hardcoded default.
+    Params map[string]any
 }
 
 // RecordLayoutField mirrors profile.RecordField's shape without importing

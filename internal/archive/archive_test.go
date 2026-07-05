@@ -47,8 +47,18 @@ func TestMBIndexedBinaryReadShort(t *testing.T) {
     r := NewMBIndexedBinary()
     // Full PDU: funcCode + byteCount + 3 bytes of data (too short after stripping header).
     tx := &fakeTransactor{resp: []byte{0x04, 3, 1, 2, 3}}
-    if _, err := r.Read(context.Background(), nil, tx, ArchiveQuery{}); err == nil {
+    q := ArchiveQuery{Params: map[string]any{"base_addr": 200, "record_regs": 4}}
+    if _, err := r.Read(context.Background(), nil, tx, q); err == nil {
         t.Fatal("expected error for short raw")
+    }
+}
+
+func TestMBIndexedBinaryRead_MissingParamsIsError(t *testing.T) {
+    r := NewMBIndexedBinary()
+    tx := &fakeTransactor{resp: []byte{0x04, 8, 0x7F, 2, 3, 4, 0, 0, 0, 42}}
+    _, err := r.Read(context.Background(), nil, tx, ArchiveQuery{})
+    if err == nil {
+        t.Fatal("expected error when archive.params.base_addr/record_regs are missing from the profile")
     }
 }
 
@@ -83,7 +93,8 @@ func TestMBIndexedBinaryRead(t *testing.T) {
     r := NewMBIndexedBinary()
     // Full PDU: funcCode(0x04) + byteCount(8) + 8 bytes of record data.
     tx := &fakeTransactor{resp: []byte{0x04, 8, 0x7F, 2, 3, 4, 0, 0, 0, 42}}
-    recs, err := r.Read(context.Background(), nil, tx, ArchiveQuery{})
+    q := ArchiveQuery{Params: map[string]any{"base_addr": 200, "record_regs": 4}}
+    recs, err := r.Read(context.Background(), nil, tx, q)
     if err != nil {
         t.Fatalf("unexpected error: %v", err)
     }
@@ -96,5 +107,64 @@ func TestMBIndexedBinaryRead(t *testing.T) {
     }
     if rec.Fields["ts_unix"] != int64(42) {
         t.Fatalf("expected ts_unix 42, got %v", rec.Fields["ts_unix"])
+    }
+}
+func TestMBFunc65_MissingParamsIsError(t *testing.T) {
+    r := NewMBFunc65()
+    tx := &fakeTransactor{resp: []byte{0x41, 8, 0, 0, 0, 1, 0, 42, 0xD0, 0x04}}
+    _, err := r.Read(context.Background(), nil, tx, ArchiveQuery{})
+    if err == nil {
+        t.Fatal("expected error when archive.params.archive_type is missing from the profile")
+    }
+}
+
+func TestMBFunc65_Read(t *testing.T) {
+    r := NewMBFunc65()
+    // funcCode(0x41) + byteCount(8) + record: time=1 (not the nonexistent
+    // marker), data=42 (uint16 0x002A), CRC16-modbus over first 6 bytes
+    // (0x04D0, little-endian on wire: D0 04) - same fixture the tsrv024
+    // simulator uses.
+    tx := &fakeTransactor{resp: []byte{0x41, 8, 0, 0, 0, 1, 0, 42, 0xD0, 0x04}}
+    q := ArchiveQuery{Params: map[string]any{"archive_type": 1}}
+    recs, err := r.Read(context.Background(), nil, tx, q)
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    if len(recs) != 1 {
+        t.Fatalf("expected 1 record, got %d", len(recs))
+    }
+    if !recs[0].CRCOK {
+        t.Fatal("expected CRCOK=true for a valid CRC")
+    }
+}
+
+func TestMBFunc65_NonexistentRecordMarker(t *testing.T) {
+    r := NewMBFunc65()
+    // time = 0xFFFFFFFF marker -> no record, regardless of remaining bytes/CRC.
+    tx := &fakeTransactor{resp: []byte{0x41, 4, 0xFF, 0xFF, 0xFF, 0xFF}}
+    q := ArchiveQuery{Params: map[string]any{"archive_type": 1}}
+    recs, err := r.Read(context.Background(), nil, tx, q)
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    if len(recs) != 0 {
+        t.Fatalf("expected 0 records for nonexistent-record marker, got %d", len(recs))
+    }
+}
+
+func TestMBFunc65_BadCRCIsFlagged(t *testing.T) {
+    r := NewMBFunc65()
+    // Same record as TestMBFunc65_Read but with a corrupted CRC byte.
+    tx := &fakeTransactor{resp: []byte{0x41, 8, 0, 0, 0, 1, 0, 42, 0x00, 0x00}}
+    q := ArchiveQuery{Params: map[string]any{"archive_type": 1}}
+    recs, err := r.Read(context.Background(), nil, tx, q)
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    if len(recs) != 1 {
+        t.Fatalf("expected 1 record, got %d", len(recs))
+    }
+    if recs[0].CRCOK {
+        t.Fatal("expected CRCOK=false for a corrupted CRC")
     }
 }

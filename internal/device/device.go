@@ -299,6 +299,7 @@ func (d *Device) pollArchives(ctx context.Context) {
             RecordLayout: layout,
             WordOrder32:  d.Profile.Codec.WordOrder32,
             WordOrder64:  d.Profile.Codec.WordOrder64,
+            Params:       a.Params,
         }
 
         release, leaseErr := d.Lease.Acquire(ctx, d.ID, a.ID, 30*time.Second)
