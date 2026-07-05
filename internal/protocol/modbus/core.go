@@ -231,9 +231,18 @@ func Transact(ctx context.Context, tr transport.Transport, isTCP bool, txID uint
         }
         lastErr = err
 
+        // Modbus exceptions (including 0x06 BUSY) are complete, valid
+        // responses from the slave, not transport failures. Whether and
+        // when to retry after an exception is the caller's decision -
+        // session.authorize for the VKM auth register's 30s throttle
+        // (CONTRACTS.md section 4.2), mb_request_poll_string for archive
+        // collection in progress (section 6.1) - so Transact returns the
+        // exception immediately instead of spending its own retry budget
+        // on an error that will not change on repetition. Only transport-
+        // level errors (timeout, CRC, malformed frame) are retried below.
         var exc *ExceptionError
-        if errors.As(err, &exc) && exc.Code == 0x06 {
-            continue // BUSY: retry per CONTRACTS.md section 2
+        if errors.As(err, &exc) {
+            return nil, err
         }
     }
 
