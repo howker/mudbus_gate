@@ -331,6 +331,17 @@ func (d *Device) decodePoint(pt profile.Point, data []byte) (any, error) {
     order32 := d.Profile.Codec.WordOrder32
     order64 := d.Profile.Codec.WordOrder64
 
+    // ByteOffset lets a point read a sub-region of the raw register data,
+    // for devices that pack more than one logical field into a single
+    // register (e.g. Akron-01/02's clock register 0x0010 = [second, minute]).
+    // Zero (the common case) leaves data untouched.
+    if pt.ByteOffset > 0 {
+        if pt.ByteOffset >= len(data) {
+            return nil, fmt.Errorf("point %q: byte_offset %d is out of range for %d bytes read", pt.Name, pt.ByteOffset, len(data))
+        }
+        data = data[pt.ByteOffset:]
+    }
+
     switch pt.Type {
     case "float":
         v, err := codec.DecodeFloat32(data, order32)

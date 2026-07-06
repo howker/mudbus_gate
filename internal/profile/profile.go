@@ -71,6 +71,15 @@ type Point struct {
     Group       string            `yaml:"group"`
     Bits        map[string]string `yaml:"bits"`
     Note        string            `yaml:"note"`
+    // ByteOffset selects a sub-region of the raw register read, for
+    // devices that pack more than one logical field into a single
+    // register (e.g. Akron-01/02's clock: register 0x0010 holds both
+    // "second" (byte 0) and "minute" (byte 1)). Zero for the common case
+    // (the point occupies the whole read). Two points may then share the
+    // same Addr with different ByteOffset - each triggers its own
+    // (duplicate) register read, which is an acceptable tradeoff for
+    // rarely-polled fields like a clock.
+    ByteOffset int `yaml:"byte_offset"`
 }
 
 // RecordField describes one field inside an archive record layout.
@@ -168,6 +177,9 @@ func (p *Profile) Validate() error {
         }
         if pt.Access != "" && !allowedAccess[pt.Access] {
             return fmt.Errorf("points[%d] %q: access %q is not allowed", i, pt.Name, pt.Access)
+        }
+        if pt.ByteOffset < 0 {
+            return fmt.Errorf("points[%d] %q: byte_offset must be >= 0, got %d", i, pt.Name, pt.ByteOffset)
         }
         if pt.Instance != "" {
             if _, ok := p.Instances[pt.Instance]; !ok {
