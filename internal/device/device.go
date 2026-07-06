@@ -378,6 +378,20 @@ func (d *Device) decodePoint(pt profile.Point, data []byte) (any, error) {
         return codec.DecodeU32Float(data, order32)
     case "long+float":
         return codec.DecodeLongFloat(data, order32)
+    case "bcd":
+        // Decodes the first byte of data as a single BCD digit pair
+        // (0-99). This assumes one BCD field occupies its own register
+        // (RegisterCount("bcd")=1, i.e. 2 bytes read, first byte used) -
+        // a device that packs two BCD fields into one register (e.g.
+        // Akron-01/02's clock: second+minute sharing register 0x0010)
+        // cannot be modeled as two separate Points this way; that needs
+        // a sub-register field offset concept, deliberately not solved
+        // here (see backlog).
+        v, err := codec.DecodeBCDByte(data[0])
+        if err != nil {
+            return nil, err
+        }
+        return int64(v), nil
     case "string", "asciiz":
         return codec.DecodeString(data), nil
     default:

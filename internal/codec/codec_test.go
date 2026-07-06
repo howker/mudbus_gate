@@ -387,3 +387,8 @@ func TestEncodeFloat64(t *testing.T) {
 		})
 	}
 }
+func TestRegisterCount_BCD(t *testing.T) {
+    if got := RegisterCount("bcd"); got != 1 {
+        t.Fatalf("RegisterCount(\"bcd\"): want 1, got %d", got)
+    }
+}
