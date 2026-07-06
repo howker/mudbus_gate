@@ -12,7 +12,7 @@ import (
 // with a special case for stInfoEvent which is a single byte and not yet
 // modeled in codec.RegisterCount.
 func fieldByteSize(dataType string) int {
-    if dataType == "stInfoEvent" {
+    if dataType == "stInfoEvent" || dataType == "bcd" {
         return 1
     }
     return codec.RegisterCount(dataType) * 2
@@ -76,6 +76,10 @@ func decodeByLayout(raw []byte, layout []RecordLayoutField, order32 string, orde
             val, err = codec.DecodeU32Float(chunk, order32)
         case "long+float":
             val, err = codec.DecodeLongFloat(chunk, order32)
+        case "bcd":
+            var v int
+            v, err = codec.DecodeBCDByte(chunk[0])
+            val = int64(v)
         case "stInfoEvent":
             b := chunk[0]
             val = map[string]any{

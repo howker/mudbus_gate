@@ -192,3 +192,47 @@ func TestMBFunc65_NoCRCFieldSkipsCheck(t *testing.T) {
         t.Fatal("expected CRCOK=true (no CRC check) when record_layout has no crc:true field")
     }
 }
+
+func TestDecodeByLayout_BCD(t *testing.T) {
+    // Merkuriy timedate structure (dow-hh-mm-ss-dd-mon-yy), section 4.6's
+    // worked example: 10:00, 5 марта 2008 (day-of-week not specified in
+    // that example, using Wednesday=3 as a synthetic value here).
+    layout := []RecordLayoutField{
+        {Offset: 0, Name: "dow", Type: "bcd"},
+        {Offset: 1, Name: "hour", Type: "bcd"},
+        {Offset: 2, Name: "minute", Type: "bcd"},
+        {Offset: 3, Name: "second", Type: "bcd"},
+        {Offset: 4, Name: "day", Type: "bcd"},
+        {Offset: 5, Name: "month", Type: "bcd"},
+        {Offset: 6, Name: "year", Type: "bcd"},
+    }
+    raw := []byte{0x03, 0x10, 0x00, 0x00, 0x05, 0x03, 0x08}
+
+    got := decodeByLayout(raw, layout, "0123", "01234567")
+
+    want := map[string]int64{
+        "dow": 3, "hour": 10, "minute": 0, "second": 0,
+        "day": 5, "month": 3, "year": 8,
+    }
+    for name, wantVal := range want {
+        if got[name] != wantVal {
+            t.Fatalf("field %q: want %d, got %v", name, wantVal, got[name])
+        }
+    }
+}
+
+func TestDecodeByLayout_BCD_InvalidNibbleIsError(t *testing.T) {
+    layout := []RecordLayoutField{
+        {Offset: 0, Name: "hour", Type: "bcd"},
+    }
+    raw := []byte{0xFA} // invalid BCD (both nibbles out of 0-9 range)
+
+    got := decodeByLayout(raw, layout, "0123", "01234567")
+
+    if _, ok := got["hour"]; ok {
+        t.Fatal("expected no valid 'hour' field for invalid BCD byte")
+    }
+    if _, ok := got["hour_error"]; !ok {
+        t.Fatal("expected 'hour_error' to be set for invalid BCD byte")
+    }
+}

@@ -115,7 +115,7 @@ var allowedDataTypes = map[string]bool{
     "float": true, "double": true,
     "string": true, "asciiz": true,
     "u32+float": true, "long+float": true,
-    "scaled_int": true, "bitfield": true, "stInfoEvent": true,
+    "scaled_int": true, "bitfield": true, "stInfoEvent": true, "bcd": true,
     "coil": true,
 }
 var allowedSpaces = map[string]bool{"HR": true, "IR": true, "coil": true, "discrete": true}
