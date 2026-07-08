@@ -124,7 +124,7 @@ var allowedDataTypes = map[string]bool{
     "float": true, "double": true,
     "string": true, "asciiz": true,
     "u32+float": true, "long+float": true,
-    "scaled_int": true, "bitfield": true, "stInfoEvent": true, "bcd": true,
+    "scaled_int": true, "bitfield": true, "stInfoEvent": true, "bcd": true, "akron_volume": true,
     "coil": true,
 }
 var allowedSpaces = map[string]bool{"HR": true, "IR": true, "coil": true, "discrete": true}
@@ -134,6 +134,7 @@ var allowedStrategies = map[string]bool{
     "mb_indexed_binary":       true,
     "mb_func65":                true,
     "merkuriy_long_response":  true,
+    "akron_archive":            true,
 }
 var allowedQuality = map[string]bool{
     "VALID": true, "VERIFIED": true, "ESTIMATED": true, "INTERPOLATED": true,

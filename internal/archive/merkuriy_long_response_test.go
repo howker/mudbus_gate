@@ -131,3 +131,100 @@ func appendCRC(body []byte) []byte {
     }
     return append(append([]byte(nil), body...), byte(crc&0xFF), byte(crc>>8))
 }
+func akronHourlyLayout() []RecordLayoutField {
+    return []RecordLayoutField{
+        {Offset: 0, Name: "volume", Type: "akron_volume"},
+        {Offset: 5, Name: "hour", Type: "bcd"},
+        {Offset: 6, Name: "day", Type: "bcd"},
+        {Offset: 7, Name: "month", Type: "bcd"},
+        {Offset: 8, Name: "year", Type: "bcd"},
+    }
+}
+
+func akronDailyLayout() []RecordLayoutField {
+    return []RecordLayoutField{
+        {Offset: 0, Name: "volume", Type: "akron_volume"},
+        {Offset: 5, Name: "day", Type: "bcd"},
+        {Offset: 6, Name: "month", Type: "bcd"},
+        {Offset: 7, Name: "year", Type: "bcd"},
+    }
+}
+
+func TestAkronArchive_MissingAddrParam(t *testing.T) {
+    r := NewAkronArchiveReader()
+    sess := fakeSession{state: "ready"}
+    tx := &fakeTransactor{}
+    q := ArchiveQuery{Params: map[string]any{"archive_kind": "hourly"}, RecordLayout: akronHourlyLayout()}
+    if _, err := r.Read(context.Background(), sess, tx, q); err == nil {
+        t.Fatal("expected error when archive.params.addr is missing")
+    }
+}
+
+func TestAkronArchive_MissingArchiveKindParam(t *testing.T) {
+    r := NewAkronArchiveReader()
+    sess := fakeSession{state: "ready"}
+    tx := &fakeTransactor{}
+    q := ArchiveQuery{Params: map[string]any{"addr": 1}, RecordLayout: akronHourlyLayout()}
+    if _, err := r.Read(context.Background(), sess, tx, q); err == nil {
+        t.Fatal("expected error when archive.params.archive_kind is missing")
+    }
+}
+
+func TestAkronArchive_InvalidArchiveKindParam(t *testing.T) {
+    r := NewAkronArchiveReader()
+    sess := fakeSession{state: "ready"}
+    tx := &fakeTransactor{}
+    q := ArchiveQuery{Params: map[string]any{"addr": 1, "archive_kind": "weekly"}, RecordLayout: akronHourlyLayout()}
+    if _, err := r.Read(context.Background(), sess, tx, q); err == nil {
+        t.Fatal("expected error for an archive_kind that is neither hourly nor daily")
+    }
+}
+
+func TestAkronArchive_HourlyRead(t *testing.T) {
+    r := NewAkronArchiveReader()
+    sess := fakeSession{state: "ready"}
+    // addr=01, code=104(0x68), byteCount=9, row: U=5827 raw (C3 16 00 00,
+    // '3210' order), Pu=02 -> 582.7 m3; hour=10(BCD), day=05, month=03,
+    // year=08 (2008-03-05 10:00) - same values as today's earlier
+    // codec.DecodeAkronVolume golden test, real CRC.
+    tx := &fakeTransactor{resp: []byte{0x01, 0x68, 0x09, 0xC3, 0x16, 0x00, 0x00, 0x02, 0x10, 0x05, 0x03, 0x08, 0x34, 0x6B}}
+    q := ArchiveQuery{
+        Params:       map[string]any{"addr": 1, "archive_kind": "hourly"},
+        RecordLayout: akronHourlyLayout(),
+        WordOrder32:  "3210",
+    }
+    recs, err := r.Read(context.Background(), sess, tx, q)
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    if len(recs) != 1 {
+        t.Fatalf("expected 1 record, got %d", len(recs))
+    }
+    rec := recs[0]
+    vol, ok := rec.Fields["volume"].(float64)
+    if !ok || vol < 582.69 || vol > 582.71 {
+        t.Fatalf("expected volume ~582.7, got %v", rec.Fields["volume"])
+    }
+    if rec.Fields["hour"] != int64(10) || rec.Fields["day"] != int64(5) || rec.Fields["month"] != int64(3) || rec.Fields["year"] != int64(8) {
+        t.Fatalf("date fields mismatch: %+v", rec.Fields)
+    }
+    if !rec.CRCOK {
+        t.Fatal("expected CRCOK=true")
+    }
+}
+
+func TestAkronArchive_MisalignedLengthIsError(t *testing.T) {
+    r := NewAkronArchiveReader()
+    sess := fakeSession{state: "ready"}
+    // Declares byteCount=8 (not a multiple of the 9-byte hourly row size).
+    body := []byte{0x01, 0x68, 0x08, 0xC3, 0x16, 0x00, 0x00, 0x02, 0x10, 0x05, 0x03}
+    tx := &fakeTransactor{resp: appendCRC(body)}
+    q := ArchiveQuery{
+        Params:       map[string]any{"addr": 1, "archive_kind": "hourly"},
+        RecordLayout: akronHourlyLayout(),
+        WordOrder32:  "3210",
+    }
+    if _, err := r.Read(context.Background(), sess, tx, q); err == nil {
+        t.Fatal("expected error for a response length not a multiple of row size")
+    }
+}

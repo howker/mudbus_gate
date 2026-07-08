@@ -1,23 +1,23 @@
 package archive
-
 import (
     "fmt"
     "time"
-
     "mbgw/internal/codec"
 )
-
 // fieldByteSize returns the number of bytes occupied by a record_layout
 // field of the given type, mirroring codec.RegisterCount (registers*2),
-// with a special case for stInfoEvent which is a single byte and not yet
-// modeled in codec.RegisterCount.
+// with special cases for stInfoEvent/bcd (1 byte) and akron_volume
+// (5 bytes: 4-byte raw + 1-byte Pu multiplier) which are not modeled in
+// codec.RegisterCount.
 func fieldByteSize(dataType string) int {
     if dataType == "stInfoEvent" || dataType == "bcd" {
         return 1
     }
+    if dataType == "akron_volume" {
+        return 5
+    }
     return codec.RegisterCount(dataType) * 2
 }
-
 // decodeByLayout decodes a raw archive record according to the profile's
 // record_layout: for each field, it slices raw[offset:offset+size] and
 // calls the matching codec.Decode* function, keyed by field.Name in the
@@ -25,7 +25,6 @@ func fieldByteSize(dataType string) int {
 // under "<name>_error" instead of failing the whole record).
 func decodeByLayout(raw []byte, layout []RecordLayoutField, order32 string, order64 string) map[string]any {
     out := make(map[string]any, len(layout))
-
     for _, f := range layout {
         size := fieldByteSize(f.Type)
         if f.Offset < 0 || f.Offset+size > len(raw) {
@@ -33,10 +32,8 @@ func decodeByLayout(raw []byte, layout []RecordLayoutField, order32 string, orde
             continue
         }
         chunk := raw[f.Offset : f.Offset+size]
-
         var val any
         var err error
-
         switch f.Type {
         case "float":
             var v float32
@@ -80,6 +77,8 @@ func decodeByLayout(raw []byte, layout []RecordLayoutField, order32 string, orde
             var v int
             v, err = codec.DecodeBCDByte(chunk[0])
             val = int64(v)
+        case "akron_volume":
+            val, err = codec.DecodeAkronVolume(chunk, order32)
         case "stInfoEvent":
             b := chunk[0]
             val = map[string]any{
@@ -90,13 +89,11 @@ func decodeByLayout(raw []byte, layout []RecordLayoutField, order32 string, orde
         default:
             err = fmt.Errorf("unsupported record_layout type: %s", f.Type)
         }
-
         if err != nil {
             out[f.Name+"_error"] = err.Error()
             continue
         }
         out[f.Name] = val
     }
-
     return out
 }
