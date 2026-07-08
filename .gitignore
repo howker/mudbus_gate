@@ -4,3 +4,6 @@
 mbgw.db
 internal/storage/sqlite/repo.go.disabled
 internal/storage/sqlite/repo_test.go.disabled
+.mirror_state/
+internal/device/test_worker.json
+*.json.tmp
