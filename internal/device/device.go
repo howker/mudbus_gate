@@ -267,8 +267,14 @@ func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, i
 }
 
 // pollArchives runs each archive strategy declared in the device profile.
-// The Client is used directly as archive.Transactor (client.Client now
-// includes Transact, so any implementation satisfies both interfaces).
+// The Client is used directly as archive.Transactor: every strategy's
+// requests/responses are bare Modbus PDUs (no address, no CRC baked in -
+// those are the RTU/TCP transport layer's job, added/stripped uniformly
+// by protocol/modbus.Transact for every strategy the same way, whether
+// the PDU carries a standard function code or a vendor User-Defined one
+// like VZLET's 65 or Akron's 100-110). See internal/protocol/akron's
+// package doc comment for why this matters and what happens if a
+// strategy builds a complete frame itself instead.
 func (d *Device) pollArchives(ctx context.Context) {
     for _, a := range d.Profile.Archives {
         reader, ok := archive.Get(a.Strategy)

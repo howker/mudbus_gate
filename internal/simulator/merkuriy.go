@@ -1,17 +1,14 @@
 package simulator
-
 import (
 "fmt"
 "net"
 )
-
 func RunMerkuriy(addr string) error {
 ln, err := net.Listen("tcp", addr)
 if err != nil {
 return err
 }
 defer ln.Close()
-
 for {
 conn, err := ln.Accept()
 if err != nil {
@@ -33,7 +30,6 @@ _, _ = c.Write([]byte{0x01, 0x00})
 }(conn)
 }
 }
-
 func Run(device string, addr string) error {
 switch device {
 case "merkuriy":
@@ -44,6 +40,8 @@ case "ivk-ter":
 return RunIVKTER(addr)
 case "tsrv024":
 return RunTSRV024(addr)
+case "acron-01":
+return RunAkron01(addr)
 default:
 return fmt.Errorf("unsupported simulator: %s", device)
 }

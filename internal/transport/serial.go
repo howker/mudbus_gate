@@ -144,15 +144,37 @@ func (t *serialTransport) Receive(ctx context.Context, timeout time.Duration) ([
     }
 
     for {
+        // For KindTCPSerial, t.port is a net.Conn, not a serial.Port, so
+        // the SetReadTimeout call above silently does nothing for it -
+        // without an explicit per-iteration read deadline here, Read
+        // would block forever on an unresponsive device instead of
+        // honoring interframeDelay/timeout at all. This mirrors what
+        // tcpTransport.Receive already does for KindModbusTCP.
+        if c, ok := t.port.(net.Conn); ok {
+            readDeadline := time.Now().Add(t.interframeDelay)
+            if readDeadline.After(deadline) {
+                readDeadline = deadline
+            }
+            _ = c.SetReadDeadline(readDeadline)
+        }
+
         n, err := t.port.Read(chunk)
         if n > 0 {
             buf = append(buf, chunk[:n]...)
         }
         if err != nil {
-            if len(buf) > 0 {
-                break // treat read error after some data as end-of-frame
+            if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+                // A per-iteration read timeout on net.Conn just means no
+                // bytes arrived within interframeDelay - that's either
+                // the normal interframe silence gap (if we already have
+                // data) or we should keep waiting (if we don't), not a
+                // hard error by itself. Fall through to the existing
+                // buf-length/deadline checks below.
+            } else if len(buf) > 0 {
+                break // treat other read errors after some data as end-of-frame
+            } else {
+                return nil, fmt.Errorf("serial read: %w", errs.ErrTransport)
             }
-            return nil, fmt.Errorf("serial read: %w", errs.ErrTransport)
         }
         if n == 0 && len(buf) > 0 {
             break // silence gap after receiving some data = frame boundary

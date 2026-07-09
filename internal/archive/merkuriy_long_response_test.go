@@ -150,21 +150,11 @@ func akronDailyLayout() []RecordLayoutField {
     }
 }
 
-func TestAkronArchive_MissingAddrParam(t *testing.T) {
-    r := NewAkronArchiveReader()
-    sess := fakeSession{state: "ready"}
-    tx := &fakeTransactor{}
-    q := ArchiveQuery{Params: map[string]any{"archive_kind": "hourly"}, RecordLayout: akronHourlyLayout()}
-    if _, err := r.Read(context.Background(), sess, tx, q); err == nil {
-        t.Fatal("expected error when archive.params.addr is missing")
-    }
-}
-
 func TestAkronArchive_MissingArchiveKindParam(t *testing.T) {
     r := NewAkronArchiveReader()
     sess := fakeSession{state: "ready"}
     tx := &fakeTransactor{}
-    q := ArchiveQuery{Params: map[string]any{"addr": 1}, RecordLayout: akronHourlyLayout()}
+    q := ArchiveQuery{Params: map[string]any{}, RecordLayout: akronHourlyLayout()}
     if _, err := r.Read(context.Background(), sess, tx, q); err == nil {
         t.Fatal("expected error when archive.params.archive_kind is missing")
     }
@@ -174,7 +164,7 @@ func TestAkronArchive_InvalidArchiveKindParam(t *testing.T) {
     r := NewAkronArchiveReader()
     sess := fakeSession{state: "ready"}
     tx := &fakeTransactor{}
-    q := ArchiveQuery{Params: map[string]any{"addr": 1, "archive_kind": "weekly"}, RecordLayout: akronHourlyLayout()}
+    q := ArchiveQuery{Params: map[string]any{"archive_kind": "weekly"}, RecordLayout: akronHourlyLayout()}
     if _, err := r.Read(context.Background(), sess, tx, q); err == nil {
         t.Fatal("expected error for an archive_kind that is neither hourly nor daily")
     }
@@ -183,13 +173,14 @@ func TestAkronArchive_InvalidArchiveKindParam(t *testing.T) {
 func TestAkronArchive_HourlyRead(t *testing.T) {
     r := NewAkronArchiveReader()
     sess := fakeSession{state: "ready"}
-    // addr=01, code=104(0x68), byteCount=9, row: U=5827 raw (C3 16 00 00,
-    // '3210' order), Pu=02 -> 582.7 m3; hour=10(BCD), day=05, month=03,
-    // year=08 (2008-03-05 10:00) - same values as today's earlier
-    // codec.DecodeAkronVolume golden test, real CRC.
-    tx := &fakeTransactor{resp: []byte{0x01, 0x68, 0x09, 0xC3, 0x16, 0x00, 0x00, 0x02, 0x10, 0x05, 0x03, 0x08, 0x34, 0x6B}}
+    // Bare PDU (no address, no CRC - the RTU transport layer's job, not
+    // this strategy's): code=104(0x68), byteCount=9, row: U=5827 raw
+    // (C3 16 00 00, '3210' order), Pu=02 -> 582.7 m3; hour=10(BCD),
+    // day=05, month=03, year=08 (2008-03-05 10:00) - same values as
+    // today's earlier codec.DecodeAkronVolume golden test.
+    tx := &fakeTransactor{resp: []byte{0x68, 0x09, 0xC3, 0x16, 0x00, 0x00, 0x02, 0x10, 0x05, 0x03, 0x08}}
     q := ArchiveQuery{
-        Params:       map[string]any{"addr": 1, "archive_kind": "hourly"},
+        Params:       map[string]any{"archive_kind": "hourly"},
         RecordLayout: akronHourlyLayout(),
         WordOrder32:  "3210",
     }
@@ -217,10 +208,9 @@ func TestAkronArchive_MisalignedLengthIsError(t *testing.T) {
     r := NewAkronArchiveReader()
     sess := fakeSession{state: "ready"}
     // Declares byteCount=8 (not a multiple of the 9-byte hourly row size).
-    body := []byte{0x01, 0x68, 0x08, 0xC3, 0x16, 0x00, 0x00, 0x02, 0x10, 0x05, 0x03}
-    tx := &fakeTransactor{resp: appendCRC(body)}
+    tx := &fakeTransactor{resp: []byte{0x68, 0x08, 0xC3, 0x16, 0x00, 0x00, 0x02, 0x10, 0x05, 0x03}}
     q := ArchiveQuery{
-        Params:       map[string]any{"addr": 1, "archive_kind": "hourly"},
+        Params:       map[string]any{"archive_kind": "hourly"},
         RecordLayout: akronHourlyLayout(),
         WordOrder32:  "3210",
     }
