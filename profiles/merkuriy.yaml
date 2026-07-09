@@ -1,10 +1,37 @@
 meta:
-  vendor: "Меркурий"
-  model: "M"
+  vendor: "еркурий"
+  model: "230"
   profile_version: "1.0.0"
   protocol: "merkuriy"
+  description: "Merkuriy 230: session/time-correction verified live over RTU. Current-value points are a placeholder only (see backlog - needs a MerkuriyPointClient, not yet built); archives use merkuriy_long_response with a synthetic test record_layout, not yet the real power-profile field structure."
 transport:
-  supported: ["tcp"]
+  supported: ["tcp", "rtu", "tcp-serial"]
+  defaults:
+    response_timeout_ms: 2000
+    retries: 3
 session:
   type: "merkuriy_channel"
-archives: []
+  params:
+    addr: 1
+  auth:
+    level: 1
+    password: [1, 1, 1, 1, 1, 1]
+points:
+  - name: "placeholder"
+    space: "HR"
+    addr: 0
+    type: "uint16"
+    access: "read"
+    group: "current"
+    note: "Placeholder only, to satisfy profile.Validate()'s points-not-empty requirement - Merkuriy current-value polling is not yet implemented (needs a dedicated PointClient, see backlog); this point is not meant to be read for real."
+archives:
+  - id: "power_profile"
+    strategy: "merkuriy_long_response"
+    time_access: false
+    index_access: true
+    params:
+      mem_number: 3
+    note: "Placeholder record_layout (2 synthetic uint16 fields) for live RTU verification only - the real power-profile field structure (section 4.6) has not been mapped to a record_layout yet (see backlog)."
+    record_layout:
+      - { offset: 0, name: "a", type: "uint16" }
+      - { offset: 2, name: "b", type: "uint16" }

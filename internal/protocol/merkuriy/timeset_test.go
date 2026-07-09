@@ -25,7 +25,7 @@ func TestParseCurrentTimeResponse_Golden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := time.Date(2008, time.March, 5, 10, 55, 0, 0, time.UTC)
+	want := time.Date(2008, time.March, 5, 10, 55, 0, 0, time.Local)
 	if !got.Equal(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
@@ -49,7 +49,7 @@ func TestParseCurrentTimeResponse_DeviceStatusError(t *testing.T) {
 func TestBuildSetTime_Golden(t *testing.T) {
 	// Section 3.10's worked example: set time to 10:55:00, среда (dow=3),
 	// 05 марта 2008, zima (isWinter=true).
-	tm := time.Date(2008, time.March, 5, 10, 55, 0, 0, time.UTC)
+	tm := time.Date(2008, time.March, 5, 10, 55, 0, 0, time.Local)
 	got, err := BuildSetTime(0x80, tm, 3, true)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -62,7 +62,7 @@ func TestBuildSetTime_Golden(t *testing.T) {
 
 func TestBuildCorrectTime_Golden(t *testing.T) {
 	// Section 3.11's worked example: correct time to 10:55:30.
-	tm := time.Date(2008, time.March, 5, 10, 55, 30, 0, time.UTC)
+	tm := time.Date(2008, time.March, 5, 10, 55, 30, 0, time.Local)
 	got, err := BuildCorrectTime(0x80, tm)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -77,7 +77,7 @@ func TestSetTimeAndCorrectTime_RoundTripThroughReadParse(t *testing.T) {
 	// Not a wire-format check - just verifies encodeTimeFields' BCD
 	// encoding stays internally consistent with ParseCurrentTimeResponse's
 	// decoding, for a value distinct from the manual's own example.
-	tm := time.Date(2025, time.December, 31, 23, 59, 58, 0, time.UTC)
+	tm := time.Date(2025, time.December, 31, 23, 59, 58, 0, time.Local)
 	data, err := encodeTimeFields(tm, 5, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -99,4 +99,55 @@ func TestSetTimeAndCorrectTime_RoundTripThroughReadParse(t *testing.T) {
 	if isWinter {
 		t.Fatal("expected isWinter=false")
 	}
+}
+func TestBuildReadCurrentTimePDU_Golden(t *testing.T) {
+    got := BuildReadCurrentTimePDU()
+    want := []byte{0x04, 0x00}
+    if !bytes.Equal(got, want) {
+        t.Fatalf("got % X, want % X", got, want)
+    }
+}
+
+func TestParseCurrentTimeData_Golden(t *testing.T) {
+    // Bare data (no address, no CRC): same section 3.10 worked time
+    // value (10:55:00, среда=3, 05 марта 2008, zima).
+    data := []byte{0x00, 0x55, 0x10, 0x03, 0x05, 0x03, 0x08, 0x01}
+    got, dow, isWinter, err := ParseCurrentTimeData(data)
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    want := time.Date(2008, time.March, 5, 10, 55, 0, 0, time.Local)
+    if !got.Equal(want) {
+        t.Fatalf("got %v, want %v", got, want)
+    }
+    if dow != 3 {
+        t.Fatalf("dow: want 3, got %d", dow)
+    }
+    if !isWinter {
+        t.Fatal("expected isWinter=true")
+    }
+}
+
+func TestBuildSetTimePDU_Golden(t *testing.T) {
+    tm := time.Date(2008, time.March, 5, 10, 55, 0, 0, time.Local)
+    got, err := BuildSetTimePDU(tm, 3, true)
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    want := []byte{0x03, 0x0C, 0x00, 0x55, 0x10, 0x03, 0x05, 0x03, 0x08, 0x01}
+    if !bytes.Equal(got, want) {
+        t.Fatalf("got % X, want % X", got, want)
+    }
+}
+
+func TestBuildCorrectTimePDU_Golden(t *testing.T) {
+    tm := time.Date(2008, time.March, 5, 10, 55, 30, 0, time.Local)
+    got, err := BuildCorrectTimePDU(tm)
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    want := []byte{0x03, 0x0D, 0x30, 0x55, 0x10}
+    if !bytes.Equal(got, want) {
+        t.Fatalf("got % X, want % X", got, want)
+    }
 }

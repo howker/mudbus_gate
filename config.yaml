@@ -23,3 +23,10 @@ devices:
       host: "127.0.0.1"
       port: 504
       timeout_ms: 1500
+  - id: "merkuriy_1"
+    profile: "profiles/merkuriy.yaml"
+    transport:
+      kind: "tcp_serial"
+      host: "127.0.0.1"
+      port: 15029
+      timeout_ms: 2000

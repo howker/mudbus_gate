@@ -108,7 +108,7 @@ func ParseCurrentTimeResponse(frame []byte) (t time.Time, dow int, isWinter bool
 		return time.Time{}, 0, false, fmt.Errorf("merkuriy: year: %w", err)
 	}
 
-	t = time.Date(2000+year, time.Month(month), day, hour, min, sec, 0, time.UTC)
+	t = time.Date(2000+year, time.Month(month), day, hour, min, sec, 0, time.Local)
 	return t, dowVal, data[7] == 1, nil
 }
 
@@ -189,4 +189,94 @@ func BuildCorrectTime(addr byte, t time.Time) ([]byte, error) {
 		return nil, fmt.Errorf("merkuriy: hours: %w", err)
 	}
 	return BuildWriteParameter(addr, paramCorrectTime, []byte{sec, min, hour}), nil
+}
+// --- Bare-PDU variants, for use via pollcore.Reader.Transact (which adds
+// address+CRC itself via RTU framing) - not the raw-transport-only
+// BuildReadCurrentTime/BuildSetTime/BuildCorrectTime above, which build
+// complete frames and would be double-framed if passed through
+// pollcore.Reader. See the archive package's identical fix (bare-PDU
+// BuildReadRelativePDU) for the same reasoning, discovered the hard way
+// via Akron's live-RTU test earlier this session.
+
+// BuildReadCurrentTimePDU builds the bare PDU (no address, no CRC) to
+// read the device's current time.
+func BuildReadCurrentTimePDU() []byte {
+    return []byte{codeReadParameter, paramReadCurrentTime}
+}
+
+// ParseCurrentTimeData decodes the 8-byte BCD time payload directly
+// (already stripped of address/CRC by the RTU transport) - same field
+// layout as ParseCurrentTimeResponse, without the extra ParseResponse
+// frame-validation step (already done by the transport).
+func ParseCurrentTimeData(data []byte) (t time.Time, dow int, isWinter bool, err error) {
+    if len(data) == 1 {
+        return time.Time{}, 0, false, fmt.Errorf("merkuriy: device returned status %s instead of time data", ParseStatus(data[0]))
+    }
+    if len(data) != 8 {
+        return time.Time{}, 0, false, fmt.Errorf("merkuriy: expected 8-byte time response, got %d bytes", len(data))
+    }
+
+    sec, err := codec.DecodeBCDByte(data[0])
+    if err != nil {
+        return time.Time{}, 0, false, fmt.Errorf("merkuriy: seconds: %w", err)
+    }
+    min, err := codec.DecodeBCDByte(data[1])
+    if err != nil {
+        return time.Time{}, 0, false, fmt.Errorf("merkuriy: minutes: %w", err)
+    }
+    hour, err := codec.DecodeBCDByte(data[2])
+    if err != nil {
+        return time.Time{}, 0, false, fmt.Errorf("merkuriy: hours: %w", err)
+    }
+    dowVal, err := codec.DecodeBCDByte(data[3])
+    if err != nil {
+        return time.Time{}, 0, false, fmt.Errorf("merkuriy: day-of-week: %w", err)
+    }
+    day, err := codec.DecodeBCDByte(data[4])
+    if err != nil {
+        return time.Time{}, 0, false, fmt.Errorf("merkuriy: day: %w", err)
+    }
+    month, err := codec.DecodeBCDByte(data[5])
+    if err != nil {
+        return time.Time{}, 0, false, fmt.Errorf("merkuriy: month: %w", err)
+    }
+    year, err := codec.DecodeBCDByte(data[6])
+    if err != nil {
+        return time.Time{}, 0, false, fmt.Errorf("merkuriy: year: %w", err)
+    }
+
+    t = time.Date(2000+year, time.Month(month), day, hour, min, sec, 0, time.Local)
+    return t, dowVal, data[7] == 1, nil
+}
+
+// BuildSetTimePDU builds the bare PDU (no address, no CRC) to set the
+// device's full internal time+date. See BuildSetTime for field semantics.
+func BuildSetTimePDU(t time.Time, dow int, isWinter bool) ([]byte, error) {
+    data, err := encodeTimeFields(t, dow, isWinter)
+    if err != nil {
+        return nil, err
+    }
+    pdu := make([]byte, 0, 2+len(data))
+    pdu = append(pdu, codeWriteParameter, paramSetTime)
+    pdu = append(pdu, data...)
+    return pdu, nil
+}
+
+// BuildCorrectTimePDU builds the bare PDU (no address, no CRC) to correct
+// the device's time within +/-4 minutes/day. See BuildCorrectTime for
+// field semantics.
+func BuildCorrectTimePDU(t time.Time) ([]byte, error) {
+    sec, err := codec.EncodeBCDByte(t.Second())
+    if err != nil {
+        return nil, fmt.Errorf("merkuriy: seconds: %w", err)
+    }
+    min, err := codec.EncodeBCDByte(t.Minute())
+    if err != nil {
+        return nil, fmt.Errorf("merkuriy: minutes: %w", err)
+    }
+    hour, err := codec.EncodeBCDByte(t.Hour())
+    if err != nil {
+        return nil, fmt.Errorf("merkuriy: hours: %w", err)
+    }
+    return []byte{codeWriteParameter, paramCorrectTime, sec, min, hour}, nil
 }
