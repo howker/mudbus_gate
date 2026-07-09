@@ -31,7 +31,7 @@ archives:
     index_access: true
     params:
       mem_number: 3
-    note: "Placeholder record_layout (2 synthetic uint16 fields) for live RTU verification only - the real power-profile field structure (section 4.6) has not been mapped to a record_layout yet (see backlog)."
+    note: "Placeholder record_layout (2 synthetic uint16 fields) for live RTU verification only. The real power-profile record structure (memory 3, section 4.4.16.2 figure 4.73) is now confirmed and documented here for future work: status(1B bitfield), hour(1B BCD), min(1B BCD), day(1B BCD), month(1B BCD), year(1B BCD), integration_period(1B binary, not BCD - e.g. 0x1E equals 30 for a half-hourly profile), P_plus(2B), P_minus(2B), Q_plus(2B), Q_minus(2B) - 15 bytes total. Cross-verified against this session earlier golden bytes: 0A 10 00 05 03 08 1E 04 29 FF FF 00 00 00 00 decodes to 10:00 05.03.2008, 30-minute integration period. NOT yet implemented as the real record_layout: the byte order of the 2-byte P_plus/P_minus/Q_plus/Q_minus fields is not confirmed by any worked example in the manufacturer document, and codec.DecodeUint16 currently has no byte-order parameter at all, unlike DecodeFloat32/DecodeInt32 - guessing wrong here would silently produce plausible but wrong power values rather than an error, so this is deliberately left as a placeholder pending verification against a real device."
     record_layout:
       - { offset: 0, name: "a", type: "uint16" }
       - { offset: 2, name: "b", type: "uint16" }
