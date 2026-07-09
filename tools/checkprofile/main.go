@@ -21,7 +21,7 @@ func main() {
     fmt.Printf("points=%d archives=%d quality_map=%d\n", len(p.Points), len(p.Archives), len(p.QualityMap))
 
     for i, pt := range p.Points {
-        fmt.Printf("  point[%d]: name=%q space=%q addr=%d type=%q unit=%q\n", i, pt.Name, pt.Space, pt.Addr, pt.Type, pt.Unit)
+        fmt.Printf("  point[%d]: name=%q space=%q addr=%d type=%q unit=%q\n", i, pt.Name, pt.Space, pt.AddrOrZero(), pt.Type, pt.Unit)
     }
     for i, a := range p.Archives {
         fmt.Printf("  archive[%d]: id=%q strategy=%q note=%q params_count=%d record_layout_count=%d\n", i, a.ID, a.Strategy, a.Note, len(a.Params), len(a.RecordLayout))

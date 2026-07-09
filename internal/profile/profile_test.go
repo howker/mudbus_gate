@@ -37,7 +37,7 @@ points:
     if p.Codec.WordOrder32 != "0123" {
         t.Errorf("ожидался порядок 0123, получено '%s'", p.Codec.WordOrder32)
     }
-    if len(p.Points) != 1 || p.Points[0].Addr != 2008 {
+    if len(p.Points) != 1 || p.Points[0].AddrOrZero() != 2008 {
         t.Errorf("точки данных распарсились неверно")
     }
 }

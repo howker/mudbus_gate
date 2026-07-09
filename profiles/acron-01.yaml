@@ -1,0 +1,124 @@
+meta:
+  vendor: "Взлёт"
+  model: "Акрон-01"
+  profile_version: "1.0.0"
+  protocol: "modbus"
+  firmware_compat: [">=3.7"]
+  description: "Akron-01/02: current values via standard function 03 (firmware >=3.7 required), hourly archive via User-Defined command 104. See ВЗАИМОДЕЙСТВИЕ С КОНТРОЛЛЕРОМ СЕТИ MODBUS ПРИБОРОВ Акрон-01 и Акрон-02-1."
+transport:
+  supported: ["tcp", "rtu", "tcp-serial"]
+  defaults:
+    tcp_port: 502
+    baudrate: 9600
+    parity: "none"
+    stopbits: 1
+    response_timeout_ms: 1000
+    interframe_delay_ms: 10
+    retries: 3
+codec:
+  word_order_32: "3210"
+  word_order_64: "76543210"
+  string_encoding: "ansi"
+session:
+  type: "none"
+points:
+  - name: "V"
+    space: "HR"
+    addr: 0
+    type: "float"
+    unit: "m/s"
+    access: "read"
+    group: "current"
+    note: "Скорость потока"
+
+  - name: "Q"
+    space: "HR"
+    addr: 2
+    type: "float"
+    unit: "m3/h"
+    access: "read"
+    group: "current"
+    note: "Расход"
+
+  - name: "am"
+    space: "HR"
+    addr: 4
+    type: "float"
+    unit: "mV"
+    access: "read"
+    group: "current"
+    note: "Амплитуда сигнала"
+
+  - name: "acc_time"
+    space: "HR"
+    addr: 10
+    type: "int32"
+    unit: "min"
+    access: "read"
+    group: "current"
+    note: "Время наработки (интегрирования расхода)"
+
+  - name: "second"
+    space: "HR"
+    addr: 16
+    type: "bcd"
+    byte_offset: 0
+    access: "read"
+    group: "time"
+
+  - name: "minute"
+    space: "HR"
+    addr: 16
+    type: "bcd"
+    byte_offset: 1
+    access: "read"
+    group: "time"
+
+  - name: "hour"
+    space: "HR"
+    addr: 17
+    type: "bcd"
+    byte_offset: 0
+    access: "read"
+    group: "time"
+
+  - name: "date"
+    space: "HR"
+    addr: 18
+    type: "bcd"
+    byte_offset: 0
+    access: "read"
+    group: "time"
+    note: "День месяца"
+
+  - name: "month"
+    space: "HR"
+    addr: 18
+    type: "bcd"
+    byte_offset: 1
+    access: "read"
+    group: "time"
+
+  - name: "year"
+    space: "HR"
+    addr: 19
+    type: "bcd"
+    byte_offset: 0
+    access: "read"
+    group: "time"
+    note: "Две младшие цифры года"
+
+archives:
+  - id: "hourly"
+    strategy: "akron_archive"
+    index_access: true
+    params:
+      addr: 1
+      archive_kind: "hourly"
+    note: "Akron-01 hourly archive via User-Defined command 104. Row format U(4B)+Pu(1B)+H/D/M/Y(BCD), per section 2 table 1. N<=31 rows per request, M=1925 total rows in the ring buffer."
+    record_layout:
+      - { offset: 0, name: "volume", type: "akron_volume" }
+      - { offset: 5, name: "hour", type: "bcd" }
+      - { offset: 6, name: "day", type: "bcd" }
+      - { offset: 7, name: "month", type: "bcd" }
+      - { offset: 8, name: "year", type: "bcd" }

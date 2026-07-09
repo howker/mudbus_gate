@@ -129,7 +129,7 @@ func (d *Device) poll(ctx context.Context) {
 
     for _, pt := range d.Profile.Points {
         if pt.Instance == "" {
-            d.pollOnePoint(ctx, pt, pt.Addr, "", statusValues)
+            d.pollOnePoint(ctx, pt, pt.AddrOrZero(), "", statusValues)
             continue
         }
 
@@ -208,7 +208,7 @@ func (d *Device) collectStatusValues(ctx context.Context) quality.StatusValues {
         }
 
         if pt.Instance == "" {
-            readOne(pt, pt.Addr, "")
+            readOne(pt, pt.AddrOrZero(), "")
             continue
         }
 

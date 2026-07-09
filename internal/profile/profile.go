@@ -60,7 +60,13 @@ type Instance struct {
 type Point struct {
     Name        string            `yaml:"name"`
     Space       string            `yaml:"space"`        // Modbus: HR | IR | coil | discrete
-    Addr        int               `yaml:"addr"`          // Modbus fixed address
+    // Addr is a pointer so that a legitimate register address of 0
+    // (e.g. Akron-01's "V" point at HR 0x0000) is distinguishable from
+    // "not set" - a plain int couldn't tell those apart, which would
+    // have wrongly rejected any point living at address 0 as missing an
+    // address (mirrors the same fix already applied to QualityRule.Code
+    // for the same reason).
+    Addr        *int              `yaml:"addr"`
     AddrFormula string            `yaml:"addr_formula"`  // parametric address (e.g. pipe-based) or Merkuriy command encoding
     Instance    string            `yaml:"instance"`       // reference to Instances key
     Type        string            `yaml:"type"`
@@ -80,6 +86,18 @@ type Point struct {
     // (duplicate) register read, which is an acceptable tradeoff for
     // rarely-polled fields like a clock.
     ByteOffset int `yaml:"byte_offset"`
+}
+
+// AddrOrZero returns *Addr, or 0 if Addr is nil (a point whose address is
+// unset, e.g. because it uses AddrFormula/Instance instead of a fixed
+// Addr). Callers that only read Addr for non-instance points can use this
+// safely, since Validate() guarantees every point has either Addr set or
+// AddrFormula set.
+func (p Point) AddrOrZero() int {
+    if p.Addr == nil {
+        return 0
+    }
+    return *p.Addr
 }
 
 // RecordField describes one field inside an archive record layout.
@@ -167,7 +185,7 @@ func (p *Profile) Validate() error {
         if pt.Name == "" {
             return fmt.Errorf("points[%d]: name is required", i)
         }
-        if pt.Addr == 0 && pt.AddrFormula == "" {
+        if pt.Addr == nil && pt.AddrFormula == "" {
             return fmt.Errorf("points[%d] %q: addr or addr_formula is required", i, pt.Name)
         }
         if !allowedDataTypes[pt.Type] {
