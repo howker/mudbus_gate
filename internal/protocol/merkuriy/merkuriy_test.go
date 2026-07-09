@@ -79,3 +79,14 @@ func TestParseResponse_BadCRC(t *testing.T) {
         t.Fatal("expected error for corrupted CRC")
     }
 }
+
+func TestBuildReadRelativePDU_Golden(t *testing.T) {
+    // Bare PDU (no address, no CRC) for the same section 4.6 worked
+    // example as TestBuildReadRelative_Golden: memory #3, offset 1, 1
+    // record. PDU: 16 03 00 01 01
+    got := BuildReadRelativePDU(0x03, 0x0001, 0x01)
+    want := []byte{0x16, 0x03, 0x00, 0x01, 0x01}
+    if !bytes.Equal(got, want) {
+        t.Fatalf("got % X, want % X", got, want)
+    }
+}

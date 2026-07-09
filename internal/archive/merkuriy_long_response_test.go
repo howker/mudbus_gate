@@ -16,21 +16,11 @@ func merkuriyTestLayout() []RecordLayoutField {
     }
 }
 
-func TestMerkuriyLongResponse_MissingAddrParam(t *testing.T) {
-    r := NewMerkuriyLongResponseReader()
-    sess := fakeSession{state: "ready"}
-    tx := &fakeTransactor{}
-    q := ArchiveQuery{Params: map[string]any{"mem_number": 3}, RecordLayout: merkuriyTestLayout()}
-    if _, err := r.Read(context.Background(), sess, tx, q); err == nil {
-        t.Fatal("expected error when archive.params.addr is missing")
-    }
-}
-
 func TestMerkuriyLongResponse_MissingMemNumberParam(t *testing.T) {
     r := NewMerkuriyLongResponseReader()
     sess := fakeSession{state: "ready"}
     tx := &fakeTransactor{}
-    q := ArchiveQuery{Params: map[string]any{"addr": 1}, RecordLayout: merkuriyTestLayout()}
+    q := ArchiveQuery{Params: map[string]any{}, RecordLayout: merkuriyTestLayout()}
     if _, err := r.Read(context.Background(), sess, tx, q); err == nil {
         t.Fatal("expected error when archive.params.mem_number is missing")
     }
@@ -41,7 +31,7 @@ func TestMerkuriyLongResponse_SessionNotReady(t *testing.T) {
     sess := fakeSession{state: "closed"}
     tx := &fakeTransactor{}
     q := ArchiveQuery{
-        Params:       map[string]any{"addr": 1, "mem_number": 3},
+        Params:       map[string]any{"mem_number": 3},
         RecordLayout: merkuriyTestLayout(),
     }
     if _, err := r.Read(context.Background(), sess, tx, q); err == nil {
@@ -53,7 +43,7 @@ func TestMerkuriyLongResponse_NilSession(t *testing.T) {
     r := NewMerkuriyLongResponseReader()
     tx := &fakeTransactor{}
     q := ArchiveQuery{
-        Params:       map[string]any{"addr": 1, "mem_number": 3},
+        Params:       map[string]any{"mem_number": 3},
         RecordLayout: merkuriyTestLayout(),
     }
     if _, err := r.Read(context.Background(), nil, tx, q); err == nil {
@@ -64,9 +54,11 @@ func TestMerkuriyLongResponse_NilSession(t *testing.T) {
 func TestMerkuriyLongResponse_DeviceStatusError(t *testing.T) {
     r := NewMerkuriyLongResponseReader()
     sess := fakeSession{state: "ready"}
-    tx := &fakeTransactor{resp: []byte{0x01, 0x03, 0x40, 0x21}}
+    // Bare data (no address, no CRC - RTU transport's job): a single
+    // status byte (X3h - insufficient access level) instead of real data.
+    tx := &fakeTransactor{resp: []byte{0x03}}
     q := ArchiveQuery{
-        Params:       map[string]any{"addr": 1, "mem_number": 3},
+        Params:       map[string]any{"mem_number": 3},
         RecordLayout: merkuriyTestLayout(),
     }
     _, err := r.Read(context.Background(), sess, tx, q)
@@ -78,9 +70,11 @@ func TestMerkuriyLongResponse_DeviceStatusError(t *testing.T) {
 func TestMerkuriyLongResponse_MultiRecordSplit(t *testing.T) {
     r := NewMerkuriyLongResponseReader()
     sess := fakeSession{state: "ready"}
-    tx := &fakeTransactor{resp: []byte{0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x9F, 0xA3}}
+    // Bare data (no address, no CRC): two 4-byte records {a:1,b:2} and
+    // {a:3,b:4}.
+    tx := &fakeTransactor{resp: []byte{0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04}}
     q := ArchiveQuery{
-        Params:       map[string]any{"addr": 1, "mem_number": 3},
+        Params:       map[string]any{"mem_number": 3},
         RecordLayout: merkuriyTestLayout(),
         FromIndex:    0,
         ToIndex:      1,
@@ -99,17 +93,17 @@ func TestMerkuriyLongResponse_MultiRecordSplit(t *testing.T) {
         t.Fatalf("record 1 mismatch: %+v", recs[1].Fields)
     }
     if !recs[0].CRCOK || !recs[1].CRCOK {
-        t.Fatal("expected CRCOK=true for both records (frame CRC already validated)")
+        t.Fatal("expected CRCOK=true for both records (RTU frame CRC already validated by the transport)")
     }
 }
 
 func TestMerkuriyLongResponse_MisalignedLengthIsError(t *testing.T) {
     r := NewMerkuriyLongResponseReader()
     sess := fakeSession{state: "ready"}
-    body := []byte{0x01, 0x00, 0x01, 0x00, 0x02, 0x00}
-    tx := &fakeTransactor{resp: appendCRC(body)}
+    // 6 bytes is not a multiple of the 4-byte record size.
+    tx := &fakeTransactor{resp: []byte{0x00, 0x01, 0x00, 0x02, 0x00, 0x03}}
     q := ArchiveQuery{
-        Params:       map[string]any{"addr": 1, "mem_number": 3},
+        Params:       map[string]any{"mem_number": 3},
         RecordLayout: merkuriyTestLayout(),
     }
     if _, err := r.Read(context.Background(), sess, tx, q); err == nil {

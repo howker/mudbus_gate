@@ -75,10 +75,28 @@ return BuildFrame(addr, 0x02, nil)
 // [count 1B][CRC16-modbus 2B]. Golden vector (section 4.6 worked example,
 // device addr 0x80, memory #3, offset 1, 1 record):
 //   80 16 03 00 01 01 96 0C
+//
+// NOTE: this builds a COMPLETE frame (address+CRC included) - correct
+// only for direct raw-transport calls like MerkuriySession's own
+// testLink/openChannel (which use Transact(ctx, tr, frame) directly on
+// the raw transport, bypassing any Modbus-level framing entirely). For
+// archive strategies going through pollcore.Reader/modbus.Transact
+// (which adds its own address+CRC via BuildRTUFrame), use
+// BuildReadRelativePDU instead - passing this function's output there
+// double-frames the request and silently breaks on the wire (this bit
+// the archive strategy in exactly this way; see BuildReadRelativePDU).
 func BuildReadRelative(addr byte, memNumber byte, offset uint16, count byte) []byte {
     payload := make([]byte, 0, 4)
     payload = append(payload, memNumber, byte(offset>>8), byte(offset&0xFF), count)
     return BuildFrame(addr, 0x16, payload)
+}
+
+// BuildReadRelativePDU builds the bare PDU (no address, no CRC) for a
+// command 0x16 request - for use via pollcore.Reader/modbus.Transact,
+// which adds address+CRC itself (RTU framing) exactly once. See
+// BuildReadRelative's doc comment for why this distinction matters.
+func BuildReadRelativePDU(memNumber byte, offset uint16, count byte) []byte {
+    return []byte{0x16, memNumber, byte(offset >> 8), byte(offset & 0xFF), count}
 }
 
 // ParseResponse validates CRC and returns addr and the full data field of
