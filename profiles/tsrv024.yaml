@@ -42,6 +42,24 @@ points:
     unit: "C"
     access: "read"
     group: "current"
+
+  - name: "current_time"
+    space: "IR"
+    addr: 32768
+    type: "uint32"
+    epoch: "1970-01-01"
+    access: "read"
+    group: "time"
+    note: "IR 0x8000 (32768): device clock, read-only view. 4-byte Unix timestamp - same VZLET register map as IVK-TER (mb_reg_ivk_ter.pdf), same encoding as archive_time in this profiles own record_layout (already live-verified)."
+
+  - name: "time_set"
+    space: "HR"
+    addr: 32768
+    type: "uint32"
+    epoch: "1970-01-01"
+    access: "write"
+    group: "time"
+    note: "HR 0x8000 (32768): device clock, WRITE register (settable only in Service/Setup mode). Marked access:write so the normal poll cycle skips it - written by the set-time CLI command, never read back as a live value."
 archives:
   - id: "hourly"
     strategy: "mb_func65"

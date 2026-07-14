@@ -128,6 +128,15 @@ func (d *Device) poll(ctx context.Context) {
     statusValues := d.collectStatusValues(ctx)
 
     for _, pt := range d.Profile.Points {
+        // Write-only points (e.g. VZLET's HR 0x8000 "time set" register)
+        // are not part of the regular read cycle - reading them back
+        // would just echo the last written value, not any live reading,
+        // and wastes a poll slot. Points not explicitly marked
+        // access:"write" (the common case: unset, "read", "readwrite")
+        // are polled as before.
+        if pt.Access == "write" {
+            continue
+        }
         if pt.Instance == "" {
             d.pollOnePoint(ctx, pt, pt.AddrOrZero(), "", statusValues)
             continue
@@ -367,6 +376,9 @@ func (d *Device) decodePoint(pt profile.Point, data []byte) (any, error) {
         v, err := codec.DecodeUint32(data, order32)
         if err != nil {
             return nil, err
+        }
+        if pt.Epoch != "" {
+            return time.Unix(int64(v), 0).UTC(), nil
         }
         return int64(v), nil
     case "int16":

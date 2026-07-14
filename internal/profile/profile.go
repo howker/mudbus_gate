@@ -86,6 +86,11 @@ type Point struct {
     // (duplicate) register read, which is an acceptable tradeoff for
     // rarely-polled fields like a clock.
     ByteOffset int `yaml:"byte_offset"`
+    // Epoch mirrors RecordField.Epoch: when set on a uint32 point (e.g.
+    // "1970-01-01"), decodePoint returns a time.Time instead of a raw
+    // int64, for registers that hold a Unix timestamp (e.g. VZLET's own
+    // HR/IR 0x8000 "Текущее время" registers).
+    Epoch string `yaml:"epoch"`
 }
 
 // AddrOrZero returns *Addr, or 0 if Addr is nil (a point whose address is
