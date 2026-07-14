@@ -18,6 +18,8 @@ func cli() {
         showCurrent()
     case "correct-time":
         correctTime()
+    case "set-time":
+        setTime()
     default:
         fmt.Printf("Unknown CLI command: %s\n", cmd)
         os.Exit(1)

@@ -4,15 +4,33 @@ import (
     "encoding/binary"
     "log"
     "net"
+    "sync"
+    "time"
 
     "mbgw/internal/protocol/modbus"
 )
 
+var ivkterMu sync.Mutex
+
 // ivkterRegisters holds static current-value registers for the IVK-TER
-// vertical-slice emulator.
+// vertical-slice emulator. This simplification does not distinguish HR
+// from IR (both function 03 and 04 read the same map) - acceptable for
+// this vertical slice, and it conveniently means a function-16 write to
+// "HR 0x8000" is immediately visible on the next "IR 0x8000" read,
+// mirroring a real device's single underlying clock register.
+//
+// Register 32768 (0x8000) starts ~90s behind "now" (mirroring the same
+// deliberate-drift pattern used in the Merkuriy simulator), so a live
+// set-time test has something real to correct.
 var ivkterRegisters = map[int][]byte{
     100: {0x42, 0xC8, 0x00, 0x00}, // float 100.0 (flow rate)
     102: {0x41, 0xA0, 0x00, 0x00}, // float 20.0 (temperature)
+}
+
+func init() {
+    buf := make([]byte, 4)
+    binary.BigEndian.PutUint32(buf, uint32(time.Now().Add(-90*time.Second).Unix()))
+    ivkterRegisters[32768] = buf
 }
 
 // ivkterHourlyRecord is a fixed test hourly-archive record (30 bytes,
@@ -101,6 +119,13 @@ func buildIVKTERResponse(pdu []byte) []byte {
         return append([]byte{funcCode, byte(len(ivkterHourlyRecord))}, ivkterHourlyRecord...)
     }
 
+    // Function 16 (0x10): write multiple registers. Only used by this
+    // vertical slice for the HR 0x8000 "time set" register, but handled
+    // generically for any address present in ivkterRegisters.
+    if funcCode == 0x10 {
+        return buildIVKTERWriteResponse(pdu)
+    }
+
     if funcCode != 0x03 && funcCode != 0x04 {
         return nil
     }
@@ -112,7 +137,9 @@ func buildIVKTERResponse(pdu []byte) []byte {
     addr := int(binary.BigEndian.Uint16(pdu[1:3]))
     qty := int(binary.BigEndian.Uint16(pdu[3:5]))
 
+    ivkterMu.Lock()
     data := readIVKTERRegisters(addr, qty)
+    ivkterMu.Unlock()
     if data == nil {
         return nil
     }
@@ -120,6 +147,36 @@ func buildIVKTERResponse(pdu []byte) []byte {
     resp[0] = funcCode
     resp[1] = byte(len(data))
     copy(resp[2:], data)
+    return resp
+}
+
+// buildIVKTERWriteResponse handles function 16 (write multiple
+// registers): [func(1)][addr(2)][qty(2)][byteCount(1)][data(byteCount)].
+// Response echoes addr+qty per the standard function 16 reply shape.
+func buildIVKTERWriteResponse(pdu []byte) []byte {
+    if len(pdu) < 6 {
+        return nil
+    }
+    addr := int(binary.BigEndian.Uint16(pdu[1:3]))
+    qty := int(binary.BigEndian.Uint16(pdu[3:5]))
+    byteCount := int(pdu[5])
+    if len(pdu) < 6+byteCount || byteCount != qty*2 {
+        return nil
+    }
+    data := pdu[6 : 6+byteCount]
+
+    ivkterMu.Lock()
+    a := addr
+    for i := 0; i < byteCount; i += 2 {
+        ivkterRegisters[a] = append([]byte(nil), data[i:i+2]...)
+        a++
+    }
+    ivkterMu.Unlock()
+
+    resp := make([]byte, 5)
+    resp[0] = 0x10
+    binary.BigEndian.PutUint16(resp[1:3], uint16(addr))
+    binary.BigEndian.PutUint16(resp[3:5], uint16(qty))
     return resp
 }
 
