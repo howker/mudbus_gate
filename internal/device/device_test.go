@@ -36,7 +36,7 @@ func TestDevicePoll(t *testing.T) {
     repo, _ := sqlite.New("test_worker.json")
     leaseMgr := lease.New()
     dev := New("vkm_test", p, cli, sess, repo, leaseMgr)
-    dev.poll(context.Background())
+    dev.Poll(context.Background())
 }
 func TestDecodePoint_ByteOffset_PackedBCDRegister(t *testing.T) {
     // Simulates Akron-01/02's clock register (e.g. 0x0010), which packs
@@ -159,7 +159,7 @@ func TestPoll_SkipsWriteOnlyPoints(t *testing.T) {
     repo, _ := sqlite.New("test_worker.json")
     leaseMgr := lease.New()
     dev := New("vzlet_test", p, cli, sess, repo, leaseMgr)
-    dev.poll(context.Background())
+    dev.Poll(context.Background())
 
     if len(cli.readAddrs) != 1 {
         t.Fatalf("expected exactly 1 ReadRaw call (write-only point must be skipped), got %d: %v", len(cli.readAddrs), cli.readAddrs)

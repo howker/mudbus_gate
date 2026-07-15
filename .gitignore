@@ -7,3 +7,4 @@ internal/storage/sqlite/repo_test.go.disabled
 .mirror_state/
 internal/device/test_worker.json
 *.json.tmp
+storage.json

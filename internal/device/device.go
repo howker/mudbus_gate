@@ -86,7 +86,7 @@ func (d *Device) Start(ctx context.Context, pointInterval time.Duration, archive
     log.Printf("[%s] запуск цикла опроса (текущие: %v, архивы: %v)...\n", d.ID, pointInterval, archiveInterval)
 
     d.detectFirmwareVariant(ctx)
-    d.poll(ctx)
+    d.Poll(ctx)
 
     for {
         select {
@@ -94,9 +94,9 @@ func (d *Device) Start(ctx context.Context, pointInterval time.Duration, archive
             log.Printf("[%s] остановка опроса\n", d.ID)
             return
         case <-pointTicker.C:
-            d.poll(ctx)
+            d.Poll(ctx)
         case <-archiveChan:
-            d.pollArchives(ctx)
+            d.PollArchives(ctx)
         }
     }
 }
@@ -124,7 +124,10 @@ func (d *Device) detectFirmwareVariant(ctx context.Context) {
 
     log.Printf("[%s] диагностика (func17): run_status=0x%02X raw_data=%q\n", d.ID, resp.RunStatus, string(resp.RawData))
 }
-func (d *Device) poll(ctx context.Context) {
+// Poll reads every current-value point declared in the device profile
+// (exported so internal/poller can drive it centrally; Device.Start
+// still exists for standalone/single-device use and calls this too).
+func (d *Device) Poll(ctx context.Context) {
     statusValues := d.collectStatusValues(ctx)
 
     for _, pt := range d.Profile.Points {
@@ -284,7 +287,9 @@ func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, i
 // like VZLET's 65 or Akron's 100-110). See internal/protocol/akron's
 // package doc comment for why this matters and what happens if a
 // strategy builds a complete frame itself instead.
-func (d *Device) pollArchives(ctx context.Context) {
+// PollArchives runs each archive strategy declared in the device profile
+// (exported so internal/poller can drive it centrally).
+func (d *Device) PollArchives(ctx context.Context) {
     for _, a := range d.Profile.Archives {
         reader, ok := archive.Get(a.Strategy)
         if !ok {
