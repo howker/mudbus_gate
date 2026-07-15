@@ -11,6 +11,7 @@ import (
     "mbgw/internal/pollcore"
     "mbgw/internal/config"
     "mbgw/internal/device"
+    "mbgw/internal/monitor"
     "mbgw/internal/poller"
     "mbgw/internal/profile"
     "mbgw/internal/scheduler"
@@ -48,12 +49,20 @@ func run() {
     go webServer.Start(ctx)
     leaseMgr := lease.New()
 
+    // eventBus feeds the future SSE /monitor/stream endpoint (T13) and
+    // gives channel/scheduler events a real destination instead of the
+    // NoopEventRecorder default - events currently have no durable
+    // persistence (internal/monitor's comm_events table does not exist
+    // yet, see monitor.Persister's doc comment) but ARE delivered to any
+    // live subscriber.
+    eventBus := monitor.NewBus(nil)
+
     // Devices are now polled centrally through internal/scheduler +
     // internal/poller (see IMPLEMENTATION_BACKLOG.md T11), replacing the
     // earlier one-goroutine-per-device dev.Start() ticker loop - this is
     // what makes manual polls, priority, deferred retry, and a bounded
     // queue actually apply across the whole gateway, not just per device.
-    sched := scheduler.New(nil)
+    sched := scheduler.New(eventBus)
     devices := make(map[string]*device.Device)
 
     for _, devCfg := range cfg.Devices {
