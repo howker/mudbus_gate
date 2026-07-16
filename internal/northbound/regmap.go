@@ -34,6 +34,7 @@ type NorthPoint struct {
 // archive interval (see TRD addendum §A.4): meters → 30m, others → 60m.
 type NorthUSPD struct {
 	ID            string       // "mbgw-heat" | "mbgw-meters"
+	DeviceID      string       // storage device id whose readings this logical UPD exposes (MVP: single device)
 	Listen        string       // listener address, e.g. ":1502"
 	UnitID        uint8        // modbus unit id of this logical UPD
 	Interval      string       // "60m" | "30m"
