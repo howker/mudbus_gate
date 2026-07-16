@@ -30,3 +30,10 @@ devices:
       host: "127.0.0.1"
       port: 15029
       timeout_ms: 2000
+  - id: "acron_1"
+    profile: "profiles/acron-01.yaml"
+    transport:
+      kind: "tcp_serial"
+      host: "127.0.0.1"
+      port: 505
+      timeout_ms: 1000

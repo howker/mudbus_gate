@@ -314,3 +314,31 @@ func TestServer_OutsideMap_ExceptionIllegalDataAddress(t *testing.T) {
 		t.Fatalf("expected exception 02, got func=0x%02X code=%d", resp[7], resp[8])
 	}
 }
+
+// This is a regression test for a real bug found running against the live
+// system: internal/storage/sqlite.Repo always round-trips Value through a
+// TEXT column and returns it as a Go `string` (e.g. "0.5"), never as a
+// native float64 — see toFloat64's doc comment in handler_read.go. Using a
+// fakeRepo with native float64 Values (as the other tests above do) does
+// NOT exercise this path and would not have caught it; this test
+// deliberately stores string values, matching production behaviour.
+func TestServer_ReadHoldingRegisters_StringValues_LikeRealRepo(t *testing.T) {
+	repo := &fakeRepo{}
+	repo.SaveReadingCurrent(context.Background(), storage.ReadingCurrent{DeviceID: "acron-1", PointID: "V", Value: "0.5"})
+	repo.SaveReadingCurrent(context.Background(), storage.ReadingCurrent{DeviceID: "acron-1", PointID: "Q", Value: "-12.25"})
+
+	addr, cancel := startTestServer(t, testUSPD("127.0.0.1:0"), repo, nil)
+	defer cancel()
+
+	conn := dial(t, addr)
+	defer conn.Close()
+
+	req := buildReadRequest(0x0009, 1, funcReadHolding, 0, 4)
+	conn.Write(req)
+	resp := readResponse(t, conn)
+
+	wantData := []byte{0x3F, 0x00, 0x00, 0x00, 0xC1, 0x44, 0x00, 0x00}
+	if got := resp[9:]; string(got) != string(wantData) {
+		t.Fatalf("string-valued readings: got % X, want % X (this is the exact bug seen against the live sqlite Repo)", got, wantData)
+	}
+}

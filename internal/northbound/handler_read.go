@@ -3,6 +3,8 @@ package northbound
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"strings"
 )
 
 // handleReadRegisters serves function 03 (Read Holding Registers) and 04
@@ -74,10 +76,25 @@ func (s *Server) currentValues(ctx context.Context) (map[string]float64, error) 
 }
 
 // toFloat64 converts a storage.ReadingCurrent.Value (typed `any`) to
-// float64 for the register-encoding pipeline, covering the numeric kinds
-// codec/pointresolver are known to produce.
+// float64 for the register-encoding pipeline.
+//
+// The string case matters more than it looks: internal/storage/sqlite's
+// Repo round-trips every value through a TEXT column (value_text) — it
+// calls fmt.Sprint(v) on write and always scans back a plain string on
+// read (see repo.go's GetLatestReadings: "rd.Value = valueText"). So in
+// practice, with the real sqlite-backed Repo, Value is *always* a string
+// here, never a native float64/int32/etc. The typed numeric cases below
+// exist for any other/future Repo implementation (e.g. an in-memory one
+// that keeps native types, as fakeRepo does in tests) but the string path
+// is the one that matters for the actual running system.
 func toFloat64(v any) (float64, bool) {
 	switch x := v.(type) {
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(x), 64)
+		if err != nil {
+			return 0, false
+		}
+		return f, true
 	case float64:
 		return x, true
 	case float32:

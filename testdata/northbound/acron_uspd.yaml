@@ -1,0 +1,46 @@
+# Логический УСПД "mbgw-heat" (часовики, интервал 60m) для одного Акрона.
+# device_id совпадает с id в config.yaml -> devices[].id, чтобы northbound
+# читал показания того же прибора, который опрашивает `mbgw run`.
+#
+# Порядок байт (order) здесь — независимый, "северный": как МШ отдаёт
+# значение НАВЕРХ, в сторону Энергосферы (по умолчанию линии Modbus TCP —
+# "старшим вперёд" / big-endian, см. скриншот параметров связи УСПД).
+# Это НЕ тот порядок, которым Акрон говорит на своей RTU-линии внутрь
+# (там у него в profiles/acron-01.yaml свой word_order_32: "3210") —
+# decode/encode с прибором делает internal/protocol/akron, northbound
+# работает только с уже нормализованными инженерными значениями из Repo.
+
+id: mbgw-heat
+device_id: acron_1
+listen: ":1502"
+unit_id: 1
+interval: "60m"
+
+points:
+  - register: 0
+    space: holding
+    type: float
+    order: "0123"
+    source: "V"
+    note: "Скорость потока, м/с"
+
+  - register: 2
+    space: holding
+    type: float
+    order: "0123"
+    source: "Q"
+    note: "Расход, м3/ч"
+
+  - register: 4
+    space: holding
+    type: float
+    order: "0123"
+    source: "am"
+    note: "Амплитуда сигнала, мВ"
+
+  - register: 6
+    space: holding
+    type: int32
+    order: "0123"
+    source: "acc_time"
+    note: "Время наработки, мин"
