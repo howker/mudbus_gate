@@ -1,6 +1,6 @@
 module mbgw
 
-go 1.26.5
+go 1.20
 
 require (
 	go.bug.st/serial v1.6.4

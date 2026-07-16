@@ -8,3 +8,26 @@ internal/storage/sqlite/repo_test.go.disabled
 internal/device/test_worker.json
 *.json.tmp
 storage.json
+# Runtime artifacts - not part of the source tree
+storage.json
+mbgw.log
+discovery*.jsonl
+*.db
+*.db-wal
+*.db-shm
+# Build outputs
+/bin/
+*.exe
+
+# Probe / scratch build artifacts
+mbgw_probe.exe
+mbgw_win7test.exe
+go.mod.bak
+
+# Runtime artifacts
+storage.json
+mbgw.log
+discovery*.jsonl
+*.db
+*.db-wal
+*.db-shm
