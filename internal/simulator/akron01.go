@@ -1,11 +1,11 @@
 package simulator
 
 import (
-"encoding/binary"
-"log"
-"net"
+	"encoding/binary"
+	"log"
+	"net"
 
-"mbgw/internal/protocol/modbus"
+	"mbgw/internal/protocol/modbus"
 )
 
 // akron01Registers holds static current-value/time registers for the
@@ -23,14 +23,14 @@ import (
 // this project's real deployment, so RTU-over-TCP is the correct model
 // to test against here.
 var akron01Registers = map[int][]byte{
-0:  {0xBD, 0x6D, 0xF7, 0x3E}, // V = 0.483 m/s
-2:  {0x3B, 0xBB, 0xE7, 0x41}, // Q = 28.96 m3/h
-4:  {0x00, 0x00, 0x83, 0x42}, // am = 65.5 mV
-10: {0xAE, 0x06, 0x00, 0x00}, // acc_time = 1710 min
-16: {0x00, 0x55},             // second=00(BCD), minute=55(BCD)
-17: {0x10, 0x03},             // hour=10(BCD), day_of_week=3
-18: {0x05, 0x03},             // date=05(BCD), month=03(BCD)
-19: {0x08, 0x00},             // year=08(BCD,2008), id_am unused
+	0:  {0xBD, 0x6D, 0xF7, 0x3E}, // V = 0.483 m/s
+	2:  {0x3B, 0xBB, 0xE7, 0x41}, // Q = 28.96 m3/h
+	4:  {0x00, 0x00, 0x83, 0x42}, // am = 65.5 mV
+	10: {0xAE, 0x06, 0x00, 0x00}, // acc_time = 1710 min
+	16: {0x00, 0x55},             // second=00(BCD), minute=55(BCD)
+	17: {0x10, 0x03},             // hour=10(BCD), day_of_week=3
+	18: {0x05, 0x03},             // date=05(BCD), month=03(BCD)
+	19: {0x08, 0x00},             // year=08(BCD,2008), id_am unused
 }
 
 // akron01HourlyRow is a fixed test hourly-archive row (9 bytes): the same
@@ -39,113 +39,123 @@ var akron01Registers = map[int][]byte{
 var akron01HourlyRow = []byte{0xC3, 0x16, 0x00, 0x00, 0x02, 0x10, 0x05, 0x03, 0x08}
 
 func RunAkron01(addr string) error {
-ln, err := net.Listen("tcp", addr)
-if err != nil {
-return err
-}
-defer ln.Close()
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
 
-for {
-conn, err := ln.Accept()
-if err != nil {
-return err
-}
-go handleAkron01Conn(conn)
-}
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		go handleAkron01Conn(conn)
+	}
 }
 
 func handleAkron01Conn(conn net.Conn) {
-defer conn.Close()
+	defer conn.Close()
 
-buf := make([]byte, 512)
-for {
-n, err := conn.Read(buf)
-if err != nil || n < 4 {
-// RTU minimum frame: addr(1)+code(1)+CRC(2) = 4 bytes.
-return
-}
-frame := append([]byte(nil), buf[:n]...)
+	buf := make([]byte, 512)
+	for {
+		n, err := conn.Read(buf)
+		if err != nil || n < 4 {
+			// RTU minimum frame: addr(1)+code(1)+CRC(2) = 4 bytes.
+			return
+		}
+		frame := append([]byte(nil), buf[:n]...)
 
-unitID, pdu, err := modbus.ParseRTUFrame(frame)
-if err != nil {
-log.Printf("[sim akron-01] bad RTU frame: %v\n", err)
-continue
-}
-if len(pdu) < 1 {
-continue
-}
+		unitID, pdu, err := modbus.ParseRTUFrame(frame)
+		if err != nil {
+			log.Printf("[sim akron-01] bad RTU frame: %v\n", err)
+			continue
+		}
+		if len(pdu) < 1 {
+			continue
+		}
 
-respPDU := buildAkron01Response(pdu)
-if respPDU == nil {
-continue
-}
+		respPDU := buildAkron01Response(pdu)
+		if respPDU == nil {
+			continue
+		}
 
-respFrame := modbus.BuildRTUFrame(unitID, respPDU)
-if _, err := conn.Write(respFrame); err != nil {
-return
-}
-}
+		respFrame := modbus.BuildRTUFrame(unitID, respPDU)
+		if _, err := conn.Write(respFrame); err != nil {
+			return
+		}
+	}
 }
 
 func buildAkron01Response(pdu []byte) []byte {
-funcCode := pdu[0]
+	funcCode := pdu[0]
 
-// User-Defined commands (100-110 decimal): hourly (104) and daily
-// (105) archive. PDU shape: code(1) + i-hi(1) + i-lo(1) + n(1) - see
-// internal/protocol/akron.BuildRequestPDU. This vertical-slice
-// emulator always returns the same fixed row(s) regardless of the
-// requested start index, up to the requested count.
-if funcCode == 104 || funcCode == 105 {
-if len(pdu) < 4 {
-return nil
-}
-n := int(pdu[3])
-if n < 1 {
-n = 1
-}
-data := make([]byte, 0, n*len(akron01HourlyRow))
-for i := 0; i < n; i++ {
-data = append(data, akron01HourlyRow...)
-}
-return append([]byte{funcCode, byte(len(data))}, data...)
-}
+	// Command 101 (identification): the device's static passport. Added so
+	// that the gateway's one-time DetectPassport (startup, cmd/mbgw/run.go)
+	// works against this emulator too, not only against the discovery
+	// responder — same reply shape and fixture identity as
+	// akron_responder.go's akronIdentityPDU: type 0x00, firmware 3.7 (0x37),
+	// serial 12345 little-endian.
+	if funcCode == 101 {
+		return []byte{101, 6, 0x00, 0x37, 0x39, 0x30, 0x00, 0x00}
+	}
 
-if funcCode != 0x03 && funcCode != 0x04 {
-return nil
-}
-if len(pdu) < 5 {
-return nil
-}
+	// User-Defined commands (100-110 decimal): hourly (104) and daily
+	// (105) archive. PDU shape: code(1) + i-hi(1) + i-lo(1) + n(1) - see
+	// internal/protocol/akron.BuildRequestPDU. This vertical-slice
+	// emulator always returns the same fixed row(s) regardless of the
+	// requested start index, up to the requested count.
+	if funcCode == 104 || funcCode == 105 {
+		if len(pdu) < 4 {
+			return nil
+		}
+		n := int(pdu[3])
+		if n < 1 {
+			n = 1
+		}
+		data := make([]byte, 0, n*len(akron01HourlyRow))
+		for i := 0; i < n; i++ {
+			data = append(data, akron01HourlyRow...)
+		}
+		return append([]byte{funcCode, byte(len(data))}, data...)
+	}
 
-addr := int(binary.BigEndian.Uint16(pdu[1:3]))
-qty := int(binary.BigEndian.Uint16(pdu[3:5]))
+	if funcCode != 0x03 && funcCode != 0x04 {
+		return nil
+	}
+	if len(pdu) < 5 {
+		return nil
+	}
 
-data := readAkron01Registers(addr, qty)
-if data == nil {
-return nil
-}
-resp := make([]byte, 2+len(data))
-resp[0] = funcCode
-resp[1] = byte(len(data))
-copy(resp[2:], data)
-return resp
+	addr := int(binary.BigEndian.Uint16(pdu[1:3]))
+	qty := int(binary.BigEndian.Uint16(pdu[3:5]))
+
+	data := readAkron01Registers(addr, qty)
+	if data == nil {
+		return nil
+	}
+	resp := make([]byte, 2+len(data))
+	resp[0] = funcCode
+	resp[1] = byte(len(data))
+	copy(resp[2:], data)
+	return resp
 }
 
 func readAkron01Registers(addr int, qty int) []byte {
-out := make([]byte, 0, qty*2)
-remaining := qty * 2
-a := addr
-for remaining > 0 {
-raw, ok := akron01Registers[a]
-if !ok {
-return nil
-}
-out = append(out, raw...)
-remaining -= len(raw)
-a += len(raw) / 2
-}
-if remaining != 0 {
-return nil
-}
-return out
+	out := make([]byte, 0, qty*2)
+	remaining := qty * 2
+	a := addr
+	for remaining > 0 {
+		raw, ok := akron01Registers[a]
+		if !ok {
+			return nil
+		}
+		out = append(out, raw...)
+		remaining -= len(raw)
+		a += len(raw) / 2
+	}
+	if remaining != 0 {
+		return nil
+	}
+	return out
 }
