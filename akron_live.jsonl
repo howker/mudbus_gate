@@ -1,0 +1,14 @@
+{"ts":"2026-07-18T20:44:31.1004838+04:00","remote_addr":"127.0.0.1:49301","unit":0,"function":0,"direction":"request","payload_hex":"016e81cc"}
+{"ts":"2026-07-18T20:44:31.1004838+04:00","remote_addr":"127.0.0.1:49301","unit":1,"function":110,"direction":"request-decoded","payload_hex":"6e"}
+{"ts":"2026-07-18T20:44:31.1004838+04:00","remote_addr":"127.0.0.1:49301","unit":1,"function":110,"direction":"response","payload_hex":"016e0101a055"}
+{"ts":"2026-07-18T20:44:31.1822687+04:00","remote_addr":"127.0.0.1:49301","unit":0,"function":0,"direction":"request","payload_hex":"0165c00b"}
+{"ts":"2026-07-18T20:44:31.1822687+04:00","remote_addr":"127.0.0.1:49301","unit":1,"function":101,"direction":"request-decoded","payload_hex":"65"}
+{"ts":"2026-07-18T20:44:35.1814561+04:00","remote_addr":"127.0.0.1:49301","unit":0,"function":0,"direction":"request","payload_hex":"01030010000445cc"}
+{"ts":"2026-07-18T20:44:35.1814561+04:00","remote_addr":"127.0.0.1:49301","unit":1,"function":3,"direction":"request-decoded","payload_hex":"0300100004"}
+{"ts":"2026-07-18T20:44:35.1814561+04:00","remote_addr":"127.0.0.1:49301","unit":1,"function":3,"direction":"response","payload_hex":"01030835442006180726007099"}
+{"ts":"2026-07-18T20:44:35.2616075+04:00","remote_addr":"127.0.0.1:49301","unit":0,"function":0,"direction":"request","payload_hex":"0166800a"}
+{"ts":"2026-07-18T20:44:35.2616075+04:00","remote_addr":"127.0.0.1:49301","unit":1,"function":102,"direction":"request-decoded","payload_hex":"66"}
+{"ts":"2026-07-18T20:44:35.2616075+04:00","remote_addr":"127.0.0.1:49301","unit":1,"function":102,"direction":"response","payload_hex":"016612000000000000000000000000000000000000b77f"}
+{"ts":"2026-07-18T20:44:35.342771+04:00","remote_addr":"127.0.0.1:49301","unit":0,"function":0,"direction":"request","payload_hex":"01680001034431"}
+{"ts":"2026-07-18T20:44:35.342771+04:00","remote_addr":"127.0.0.1:49301","unit":1,"function":104,"direction":"request-decoded","payload_hex":"68000103"}
+{"ts":"2026-07-18T20:44:35.342771+04:00","remote_addr":"127.0.0.1:49301","unit":1,"function":104,"direction":"response","payload_hex":"0168000fc0"}
