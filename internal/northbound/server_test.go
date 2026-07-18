@@ -16,8 +16,9 @@ import (
 // does not need migrations/InitSchema semantics — only the two read/write
 // paths the northbound server actually calls.
 type fakeRepo struct {
-	readings []storage.ReadingCurrent
-	hourly   []storage.HourlyArchiveRecord
+	readings  []storage.ReadingCurrent
+	hourly    []storage.HourlyArchiveRecord
+	passports map[string]storage.DevicePassport
 }
 
 func (f *fakeRepo) InitSchema(ctx context.Context) error { return nil }
@@ -79,6 +80,23 @@ func (f *fakeRepo) CountHourlyArchive(ctx context.Context, deviceID, channel, pa
 		}
 	}
 	return n, nil
+}
+
+// --- M4.3a device-passport methods ---
+
+func (f *fakeRepo) InitPassportSchema(ctx context.Context) error { return nil }
+
+func (f *fakeRepo) SaveDevicePassport(ctx context.Context, p storage.DevicePassport) error {
+	if f.passports == nil {
+		f.passports = make(map[string]storage.DevicePassport)
+	}
+	f.passports[p.DeviceID] = p
+	return nil
+}
+
+func (f *fakeRepo) GetDevicePassport(ctx context.Context, deviceID string) (storage.DevicePassport, bool, error) {
+	p, ok := f.passports[deviceID]
+	return p, ok, nil
 }
 
 // testUSPD is a small Akron-shaped logical UPD: V@0 and Q@2, both float,
