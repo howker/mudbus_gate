@@ -23,6 +23,8 @@ func runNorthbound() {
 	var cfgPath, dbPath, listenAddr, fixturePath, logPath, simPath, cmd110 string
 	discovery := false
 	raw := false
+	serveAkron := false
+	var deviceID string
 
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
@@ -40,6 +42,13 @@ func runNorthbound() {
 			discovery = true
 		case "--raw":
 			raw = true
+		case "--serve-akron":
+			serveAkron = true
+		case "--device":
+			if i+1 < len(os.Args) {
+				deviceID = os.Args[i+1]
+				i++
+			}
 		case "--listen":
 			if i+1 < len(os.Args) {
 				listenAddr = os.Args[i+1]
@@ -69,6 +78,11 @@ func runNorthbound() {
 			printNorthboundUsage()
 			os.Exit(0)
 		}
+	}
+
+	if serveAkron {
+		runAkronLiveMode(listenAddr, dbPath, deviceID, logPath)
+		return
 	}
 
 	if discovery {
@@ -155,6 +169,50 @@ func runDiscoveryMode(listenAddr, fixturePath, logPath string) {
 	log.Println("northbound --discovery: остановлен")
 }
 
+// runAkronLiveMode starts the PRODUCTION raw-RTU carrier: the discovery
+// transport with the database-backed Akron responder
+// (northbound.NewAkronLiveServer). This is what actually stands in front
+// of Энергосфера as the АКРОН-01-1-type УСПД in model B.
+func runAkronLiveMode(listenAddr, dbPath, deviceID, logPath string) {
+	if listenAddr == "" || dbPath == "" || deviceID == "" {
+		fmt.Println("northbound --serve-akron: --listen, --db и --device обязательны")
+		os.Exit(1)
+	}
+	if logPath == "" {
+		logPath = "akron_live.jsonl"
+	}
+
+	repo, err := sqliterepo.New(dbPath)
+	if err != nil {
+		log.Fatalf("[FATAL] northbound --serve-akron: ошибка хранилища: %v", err)
+	}
+	// InitSchema is idempotent and also provisions the archive/passport
+	// tables — safe when sharing the DB file with a running gateway.
+	if err := repo.InitSchema(context.Background()); err != nil {
+		log.Fatalf("[FATAL] northbound --serve-akron: ошибка схемы: %v", err)
+	}
+
+	dlog, err := northbound.NewDiscoveryLog(logPath)
+	if err != nil {
+		log.Fatalf("[FATAL] northbound --serve-akron: %v", err)
+	}
+	defer dlog.Close()
+
+	srv := northbound.NewAkronLiveServer(listenAddr, dlog, repo, deviceID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	waitForShutdownSignal(cancel, "northbound --serve-akron")
+
+	log.Printf("northbound --serve-akron: слушаем %s, прибор %s, база %s (лог: %s)\n",
+		listenAddr, deviceID, dbPath, logPath)
+
+	if err := srv.Listen(ctx); err != nil {
+		log.Fatalf("[FATAL] northbound --serve-akron: %v", err)
+	}
+	log.Println("northbound --serve-akron: остановлен")
+}
+
 func runRawDiscoveryMode(listenAddr, logPath, simPath, cmd110 string) {
 	if listenAddr == "" {
 		fmt.Println("northbound --discovery --raw: --listen is required")
@@ -219,6 +277,7 @@ func printNorthboundUsage() {
 	fmt.Println("      MBAP discovery: log every inbound Modbus TCP frame, reply with a stub (M3).")
 	fmt.Println()
 	fmt.Println("  mbgw northbound --discovery --raw --listen <addr> [--log <p.jsonl>] [--sim <s.yaml>] [--cmd110 <mode>]")
+	fmt.Println("  mbgw northbound --serve-akron --listen <addr> --db <path> --device <id> [--log <p.jsonl>]")
 	fmt.Println("      Raw-TCP discovery: log bare Modbus RTU and answer as an Akron (M3).")
 	fmt.Println("      --sim <file>  YAML controlling responder behaviour (edit on server, no rebuild):")
 	fmt.Println("                    cmd110, live_clock, identity, per-command overrides.")
