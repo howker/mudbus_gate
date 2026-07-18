@@ -1,0 +1,122 @@
+package sqlite
+
+import (
+	"context"
+	"fmt"
+
+	"mbgw/internal/storage"
+)
+
+// This file adds the hourly-archive store to Repo. It lives in a separate
+// file (methods on *Repo, same package) so the existing repo.go does not
+// need to be edited — just drop this in alongside it.
+//
+// Why a new table and not readings_history: readings_history logs every
+// *current* poll sample (one row per poll, keyed by the poll instant),
+// whereas archive_hourly holds the device's own hourly ARCHIVE records —
+// one row per meter hour, with the meter's wall-clock timestamp. That is
+// exactly what the upstream carrier serves on Akron command 104, and what
+// lets Энергосфера back-fill (дозабрать) an ОИ debt after a link outage.
+
+// InitArchiveSchema creates the hourly-archive store. Call once at startup,
+// right after InitSchema:
+//
+//	if err := repo.InitSchema(ctx); err != nil { ... }
+//	if err := repo.InitArchiveSchema(ctx); err != nil { ... }
+func (r *Repo) InitArchiveSchema(ctx context.Context) error {
+	_, err := r.db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS archive_hourly (
+    device_id TEXT NOT NULL,
+    channel   TEXT NOT NULL DEFAULT '',
+    param     TEXT NOT NULL DEFAULT '',
+    ts_hour   DATETIME NOT NULL,
+    value     REAL NOT NULL,
+    unit      TEXT NOT NULL DEFAULT '',
+    quality   TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (device_id, channel, param, ts_hour)
+);
+CREATE INDEX IF NOT EXISTS idx_archive_hourly_lookup
+    ON archive_hourly (device_id, channel, param, ts_hour DESC);
+`)
+	if err != nil {
+		return fmt.Errorf("init archive schema: %w", err)
+	}
+	return nil
+}
+
+// SaveHourlyArchive upserts one hourly record. Re-collecting the same hour
+// overwrites the previous value (idempotent), so repeated archive sweeps
+// of overlapping ranges never create duplicates — the (device, channel,
+// param, ts_hour) tuple is the natural key of an hourly archive point.
+func (r *Repo) SaveHourlyArchive(ctx context.Context, rec storage.HourlyArchiveRecord) error {
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO archive_hourly (device_id, channel, param, ts_hour, value, unit, quality)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(device_id, channel, param, ts_hour) DO UPDATE SET
+    value   = excluded.value,
+    unit    = excluded.unit,
+    quality = excluded.quality
+`, rec.DeviceID, rec.Channel, rec.Param, rec.TsHour, rec.Value, rec.Unit, rec.Quality)
+	if err != nil {
+		return fmt.Errorf("save hourly archive: %w", err)
+	}
+	return nil
+}
+
+// GetHourlyArchiveDesc returns hourly records NEWEST-FIRST — exactly the
+// order the Akron archive indexes ("i=1 is the top/most recent row, i=M
+// the oldest"). A command-104 request for (i, n) maps directly to
+// offset=i-1, limit=n. channel/param select the stream (Akron: channel="",
+// param="V").
+//
+// The carrier stays in this package's 0-based world: pass offset=i-1. The
+// Akron-side 1-based "i" translation happens only where the request is
+// decoded, never here.
+func (r *Repo) GetHourlyArchiveDesc(ctx context.Context, deviceID, channel, param string, offset, limit int) ([]storage.HourlyArchiveRecord, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := r.db.QueryContext(ctx, `
+SELECT device_id, channel, param, ts_hour, value, unit, quality
+FROM archive_hourly
+WHERE device_id = ? AND channel = ? AND param = ?
+ORDER BY ts_hour DESC
+LIMIT ? OFFSET ?
+`, deviceID, channel, param, limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("get hourly archive: %w", err)
+	}
+	defer rows.Close()
+
+	var out []storage.HourlyArchiveRecord
+	for rows.Next() {
+		var rec storage.HourlyArchiveRecord
+		if err := rows.Scan(
+			&rec.DeviceID, &rec.Channel, &rec.Param,
+			&rec.TsHour, &rec.Value, &rec.Unit, &rec.Quality,
+		); err != nil {
+			return nil, fmt.Errorf("scan hourly archive: %w", err)
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// CountHourlyArchive returns how many hourly rows exist for the stream —
+// the effective archive depth "M" the carrier can expose, so it can clamp
+// or reject out-of-range indexes instead of returning short/empty reads
+// that would confuse the master.
+func (r *Repo) CountHourlyArchive(ctx context.Context, deviceID, channel, param string) (int, error) {
+	var n int
+	err := r.db.QueryRowContext(ctx, `
+SELECT COUNT(*) FROM archive_hourly
+WHERE device_id = ? AND channel = ? AND param = ?
+`, deviceID, channel, param).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count hourly archive: %w", err)
+	}
+	return n, nil
+}
