@@ -17,6 +17,7 @@ import (
 // paths the northbound server actually calls.
 type fakeRepo struct {
 	readings []storage.ReadingCurrent
+	hourly   []storage.HourlyArchiveRecord
 }
 
 func (f *fakeRepo) InitSchema(ctx context.Context) error { return nil }
@@ -34,6 +35,50 @@ func (f *fakeRepo) GetLatestReadings(ctx context.Context, deviceID string) ([]st
 		}
 	}
 	return out, nil
+}
+
+// --- M4 hourly-archive methods (in-memory, mirror the readings style) ---
+
+func (f *fakeRepo) InitArchiveSchema(ctx context.Context) error { return nil }
+
+func (f *fakeRepo) SaveHourlyArchive(ctx context.Context, rec storage.HourlyArchiveRecord) error {
+	f.hourly = append(f.hourly, rec)
+	return nil
+}
+
+// GetHourlyArchiveDesc returns matching rows newest-first (insertion order
+// is treated as chronological here), then applies offset/limit. Unlike the
+// real sqlite Repo it does not sort by TsHour, which is fine for tests that
+// insert rows in time order.
+func (f *fakeRepo) GetHourlyArchiveDesc(ctx context.Context, deviceID, channel, param string, offset, limit int) ([]storage.HourlyArchiveRecord, error) {
+	var match []storage.HourlyArchiveRecord
+	for i := len(f.hourly) - 1; i >= 0; i-- {
+		r := f.hourly[i]
+		if r.DeviceID == deviceID && r.Channel == channel && r.Param == param {
+			match = append(match, r)
+		}
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(match) {
+		return nil, nil
+	}
+	end := offset + limit
+	if limit <= 0 || end > len(match) {
+		end = len(match)
+	}
+	return match[offset:end], nil
+}
+
+func (f *fakeRepo) CountHourlyArchive(ctx context.Context, deviceID, channel, param string) (int, error) {
+	n := 0
+	for _, r := range f.hourly {
+		if r.DeviceID == deviceID && r.Channel == channel && r.Param == param {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // testUSPD is a small Akron-shaped logical UPD: V@0 and Q@2, both float,

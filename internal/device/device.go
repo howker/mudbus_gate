@@ -1,69 +1,71 @@
 package device
 
 import (
-    "context"
-    "fmt"
-    "log"
-    "time"
+	"context"
+	"fmt"
+	"log"
+	"time"
 
-    "mbgw/internal/archive"
-    "mbgw/internal/lease"
-    "mbgw/internal/codec"
-    "mbgw/internal/pointresolver"
-    "mbgw/internal/profile"
-    "mbgw/internal/protocol/modbus"
-    "mbgw/internal/quality"
-    "mbgw/internal/session"
-    "mbgw/internal/storage"
+	"mbgw/internal/archive"
+	"mbgw/internal/codec"
+	"mbgw/internal/lease"
+	"mbgw/internal/pointresolver"
+	"mbgw/internal/profile"
+	"mbgw/internal/protocol/modbus"
+	"mbgw/internal/quality"
+	"mbgw/internal/session"
+	"mbgw/internal/storage"
 )
 
 // PointClient is the minimal interface Device needs to read logical points
 // and send raw transactions to a device. *pollcore.Reader implements this.
 type PointClient interface {
-    ReadRaw(ctx context.Context, space string, addr int, dataType string) ([]byte, error)
-    Transact(ctx context.Context, req []byte) ([]byte, error)
+	ReadRaw(ctx context.Context, space string, addr int, dataType string) ([]byte, error)
+	Transact(ctx context.Context, req []byte) ([]byte, error)
 }
+
 // sessionAdapter adapts session.Session to archive.ArchiveSession (which
 // expects State() string), since session.Session.State() returns the
 // package-local session.State int-enum instead. This keeps
 // internal/archive from importing internal/session directly (see
 // archive.ArchiveSession's doc comment on the layering rule).
 type sessionAdapter struct {
-    sess session.Session
+	sess session.Session
 }
 
 func (a sessionAdapter) State() string {
-    switch a.sess.State() {
-    case session.StateClosed:
-        return "closed"
-    case session.StateInitializing:
-        return "initializing"
-    case session.StateReady:
-        return "ready"
-    case session.StateError:
-        return "error"
-    default:
-        return "unknown"
-    }
+	switch a.sess.State() {
+	case session.StateClosed:
+		return "closed"
+	case session.StateInitializing:
+		return "initializing"
+	case session.StateReady:
+		return "ready"
+	case session.StateError:
+		return "error"
+	default:
+		return "unknown"
+	}
 }
+
 type Device struct {
-    ID      string
-    Profile *profile.Profile
-    Client  PointClient
-    Sess    session.Session
-    Repo    storage.Repo
-    Lease   *lease.LocalLease
+	ID      string
+	Profile *profile.Profile
+	Client  PointClient
+	Sess    session.Session
+	Repo    storage.Repo
+	Lease   *lease.LocalLease
 }
 
 func New(id string, p *profile.Profile, cli PointClient, sess session.Session, repo storage.Repo, l *lease.LocalLease) *Device {
-    return &Device{
-        ID:      id,
-        Profile: p,
-        Client:  cli,
-        Sess:    sess,
-        Repo:    repo,
-        Lease:   l,
-    }
+	return &Device{
+		ID:      id,
+		Profile: p,
+		Client:  cli,
+		Sess:    sess,
+		Repo:    repo,
+		Lease:   l,
+	}
 }
 
 // Start runs two independent polling loops: current values (frequent,
@@ -72,33 +74,33 @@ func New(id string, p *profile.Profile, cli PointClient, sess session.Session, r
 // transactions with device-side collection delays and should not be
 // driven at the same cadence as simple register reads).
 func (d *Device) Start(ctx context.Context, pointInterval time.Duration, archiveInterval time.Duration) {
-    pointTicker := time.NewTicker(pointInterval)
-    defer pointTicker.Stop()
+	pointTicker := time.NewTicker(pointInterval)
+	defer pointTicker.Stop()
 
-    var archiveTicker *time.Ticker
-    var archiveChan <-chan time.Time
-    if archiveInterval > 0 && len(d.Profile.Archives) > 0 {
-        archiveTicker = time.NewTicker(archiveInterval)
-        defer archiveTicker.Stop()
-        archiveChan = archiveTicker.C
-    }
+	var archiveTicker *time.Ticker
+	var archiveChan <-chan time.Time
+	if archiveInterval > 0 && len(d.Profile.Archives) > 0 {
+		archiveTicker = time.NewTicker(archiveInterval)
+		defer archiveTicker.Stop()
+		archiveChan = archiveTicker.C
+	}
 
-    log.Printf("[%s] запуск цикла опроса (текущие: %v, архивы: %v)...\n", d.ID, pointInterval, archiveInterval)
+	log.Printf("[%s] запуск цикла опроса (текущие: %v, архивы: %v)...\n", d.ID, pointInterval, archiveInterval)
 
-    d.detectFirmwareVariant(ctx)
-    d.Poll(ctx)
+	d.detectFirmwareVariant(ctx)
+	d.Poll(ctx)
 
-    for {
-        select {
-        case <-ctx.Done():
-            log.Printf("[%s] остановка опроса\n", d.ID)
-            return
-        case <-pointTicker.C:
-            d.Poll(ctx)
-        case <-archiveChan:
-            d.PollArchives(ctx)
-        }
-    }
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[%s] остановка опроса\n", d.ID)
+			return
+		case <-pointTicker.C:
+			d.Poll(ctx)
+		case <-archiveChan:
+			d.PollArchives(ctx)
+		}
+	}
 }
 
 // detectFirmwareVariant queries function 17 (Report Slave ID) once at
@@ -109,67 +111,68 @@ func (d *Device) Start(ctx context.Context, pointInterval time.Duration, archive
 // actually branch archive decoding logic is a follow-up once a device
 // profile needs more than one record layout variant (see backlog).
 func (d *Device) detectFirmwareVariant(ctx context.Context) {
-    req := modbus.BuildReportSlaveIDPDU()
-    respPDU, err := d.Client.Transact(ctx, req)
-    if err != nil {
-        log.Printf("[%s] функция 17 (report slave id) недоступна: %v\n", d.ID, err)
-        return
-    }
+	req := modbus.BuildReportSlaveIDPDU()
+	respPDU, err := d.Client.Transact(ctx, req)
+	if err != nil {
+		log.Printf("[%s] функция 17 (report slave id) недоступна: %v\n", d.ID, err)
+		return
+	}
 
-    resp, err := modbus.ParseReportSlaveIDResponse(respPDU)
-    if err != nil {
-        log.Printf("[%s] ошибка разбора ответа функции 17: %v\n", d.ID, err)
-        return
-    }
+	resp, err := modbus.ParseReportSlaveIDResponse(respPDU)
+	if err != nil {
+		log.Printf("[%s] ошибка разбора ответа функции 17: %v\n", d.ID, err)
+		return
+	}
 
-    log.Printf("[%s] диагностика (func17): run_status=0x%02X raw_data=%q\n", d.ID, resp.RunStatus, string(resp.RawData))
+	log.Printf("[%s] диагностика (func17): run_status=0x%02X raw_data=%q\n", d.ID, resp.RunStatus, string(resp.RawData))
 }
+
 // Poll reads every current-value point declared in the device profile
 // (exported so internal/poller can drive it centrally; Device.Start
 // still exists for standalone/single-device use and calls this too).
 func (d *Device) Poll(ctx context.Context) {
-    statusValues := d.collectStatusValues(ctx)
+	statusValues := d.collectStatusValues(ctx)
 
-    for _, pt := range d.Profile.Points {
-        // Write-only points (e.g. VZLET's HR 0x8000 "time set" register)
-        // are not part of the regular read cycle - reading them back
-        // would just echo the last written value, not any live reading,
-        // and wastes a poll slot. Points not explicitly marked
-        // access:"write" (the common case: unset, "read", "readwrite")
-        // are polled as before.
-        if pt.Access == "write" {
-            continue
-        }
-        if pt.Instance == "" {
-            d.pollOnePoint(ctx, pt, pt.AddrOrZero(), "", statusValues)
-            continue
-        }
+	for _, pt := range d.Profile.Points {
+		// Write-only points (e.g. VZLET's HR 0x8000 "time set" register)
+		// are not part of the regular read cycle - reading them back
+		// would just echo the last written value, not any live reading,
+		// and wastes a poll slot. Points not explicitly marked
+		// access:"write" (the common case: unset, "read", "readwrite")
+		// are polled as before.
+		if pt.Access == "write" {
+			continue
+		}
+		if pt.Instance == "" {
+			d.pollOnePoint(ctx, pt, pt.AddrOrZero(), "", statusValues)
+			continue
+		}
 
-        inst, ok := d.Profile.Instances[pt.Instance]
-        if !ok {
-            log.Printf("[%s] точка %s: instance %q не описан в профиле\n", d.ID, pt.Name, pt.Instance)
-            continue
-        }
+		inst, ok := d.Profile.Instances[pt.Instance]
+		if !ok {
+			log.Printf("[%s] точка %s: instance %q не описан в профиле\n", d.ID, pt.Name, pt.Instance)
+			continue
+		}
 
-        count := inst.Count
-        if inst.Enumerate != "fixed_count" {
-            log.Printf("[%s] точка %s: enumerate %q пока не поддерживается (только fixed_count) - см. backlog\n", d.ID, pt.Name, inst.Enumerate)
-            continue
-        }
-        if count <= 0 {
-            log.Printf("[%s] точка %s: instance %q имеет count<=0\n", d.ID, pt.Name, pt.Instance)
-            continue
-        }
+		count := inst.Count
+		if inst.Enumerate != "fixed_count" {
+			log.Printf("[%s] точка %s: enumerate %q пока не поддерживается (только fixed_count) - см. backlog\n", d.ID, pt.Name, inst.Enumerate)
+			continue
+		}
+		if count <= 0 {
+			log.Printf("[%s] точка %s: instance %q имеет count<=0\n", d.ID, pt.Name, pt.Instance)
+			continue
+		}
 
-        for i := 1; i <= count; i++ {
-            addr, err := pointresolver.Resolve(pt.AddrFormula, pt.Instance, i)
-            if err != nil {
-                log.Printf("[%s] точка %s (instance %d): ошибка формулы адреса: %v\n", d.ID, pt.Name, i, err)
-                continue
-            }
-            d.pollOnePoint(ctx, pt, addr, fmt.Sprintf("%d", i), statusValues)
-        }
-    }
+		for i := 1; i <= count; i++ {
+			addr, err := pointresolver.Resolve(pt.AddrFormula, pt.Instance, i)
+			if err != nil {
+				log.Printf("[%s] точка %s (instance %d): ошибка формулы адреса: %v\n", d.ID, pt.Name, i, err)
+				continue
+			}
+			d.pollOnePoint(ctx, pt, addr, fmt.Sprintf("%d", i), statusValues)
+		}
+	}
 }
 
 // pollOnePoint reads, decodes, and saves a single point at a resolved
@@ -182,100 +185,100 @@ func (d *Device) Poll(ctx context.Context) {
 // with a parametric instance are not supported as quality sources in this
 // vertical slice (status words are assumed device-wide, not per-instance).
 func (d *Device) collectStatusValues(ctx context.Context) quality.StatusValues {
-    result := make(quality.StatusValues)
+	result := make(quality.StatusValues)
 
-    sourceNames := make(map[string]bool)
-    for _, rule := range d.Profile.QualityMap {
-        sourceNames[rule.Source] = true
-    }
-    if len(sourceNames) == 0 {
-        return result
-    }
+	sourceNames := make(map[string]bool)
+	for _, rule := range d.Profile.QualityMap {
+		sourceNames[rule.Source] = true
+	}
+	if len(sourceNames) == 0 {
+		return result
+	}
 
-    readOne := func(pt profile.Point, addr int, instance string) {
-        dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, addr, pt.Type)
-        if err != nil {
-            log.Printf("[%s] ошибка чтения статуса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
-            return
-        }
-        val, err := d.decodePoint(pt, dataBytes)
-        if err != nil {
-            log.Printf("[%s] ошибка декодирования статуса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
-            return
-        }
-        intVal, ok := val.(int64)
-        if !ok {
-            log.Printf("[%s] статус %s имеет нечисловой тип %T, пропускаю\n", d.ID, pt.Name, val)
-            return
-        }
-        if result[pt.Name] == nil {
-            result[pt.Name] = make(map[string]int64)
-        }
-        result[pt.Name][instance] = intVal
-    }
+	readOne := func(pt profile.Point, addr int, instance string) {
+		dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, addr, pt.Type)
+		if err != nil {
+			log.Printf("[%s] ошибка чтения статуса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+			return
+		}
+		val, err := d.decodePoint(pt, dataBytes)
+		if err != nil {
+			log.Printf("[%s] ошибка декодирования статуса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+			return
+		}
+		intVal, ok := val.(int64)
+		if !ok {
+			log.Printf("[%s] статус %s имеет нечисловой тип %T, пропускаю\n", d.ID, pt.Name, val)
+			return
+		}
+		if result[pt.Name] == nil {
+			result[pt.Name] = make(map[string]int64)
+		}
+		result[pt.Name][instance] = intVal
+	}
 
-    for _, pt := range d.Profile.Points {
-        if !sourceNames[pt.Name] {
-            continue
-        }
+	for _, pt := range d.Profile.Points {
+		if !sourceNames[pt.Name] {
+			continue
+		}
 
-        if pt.Instance == "" {
-            readOne(pt, pt.AddrOrZero(), "")
-            continue
-        }
+		if pt.Instance == "" {
+			readOne(pt, pt.AddrOrZero(), "")
+			continue
+		}
 
-        inst, ok := d.Profile.Instances[pt.Instance]
-        if !ok || inst.Enumerate != "fixed_count" || inst.Count <= 0 {
-            log.Printf("[%s] статус %s: instance %q не поддерживается для сбора статуса\n", d.ID, pt.Name, pt.Instance)
-            continue
-        }
-        for i := 1; i <= inst.Count; i++ {
-            addr, err := pointresolver.Resolve(pt.AddrFormula, pt.Instance, i)
-            if err != nil {
-                log.Printf("[%s] статус %s (instance %d): ошибка формулы адреса: %v\n", d.ID, pt.Name, i, err)
-                continue
-            }
-            readOne(pt, addr, fmt.Sprintf("%d", i))
-        }
-    }
+		inst, ok := d.Profile.Instances[pt.Instance]
+		if !ok || inst.Enumerate != "fixed_count" || inst.Count <= 0 {
+			log.Printf("[%s] статус %s: instance %q не поддерживается для сбора статуса\n", d.ID, pt.Name, pt.Instance)
+			continue
+		}
+		for i := 1; i <= inst.Count; i++ {
+			addr, err := pointresolver.Resolve(pt.AddrFormula, pt.Instance, i)
+			if err != nil {
+				log.Printf("[%s] статус %s (instance %d): ошибка формулы адреса: %v\n", d.ID, pt.Name, i, err)
+				continue
+			}
+			readOne(pt, addr, fmt.Sprintf("%d", i))
+		}
+	}
 
-    return result
+	return result
 }
 func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, instance string, statusValues quality.StatusValues) {
-    dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, addr, pt.Type)
-    if err != nil {
-        log.Printf("[%s] ошибка опроса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
-        return
-    }
+	dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, addr, pt.Type)
+	if err != nil {
+		log.Printf("[%s] ошибка опроса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+		return
+	}
 
-    val, err := d.decodePoint(pt, dataBytes)
-    if err != nil {
-        log.Printf("[%s] ошибка декодирования %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
-        return
-    }
+	val, err := d.decodePoint(pt, dataBytes)
+	if err != nil {
+		log.Printf("[%s] ошибка декодирования %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+		return
+	}
 
-    qTag, reason := quality.Evaluate(pt.Name, instance, d.Profile.QualityMap, statusValues)
+	qTag, reason := quality.Evaluate(pt.Name, instance, d.Profile.QualityMap, statusValues)
 
-    reading := storage.ReadingCurrent{
-        DeviceID:      d.ID,
-        PointID:       pt.Name,
-        Instance:      instance,
-        Value:         val,
-        Unit:          pt.Unit,
-        Quality:       string(qTag),
-        QualityReason: reason,
-        Timestamp:     time.Now(),
-    }
-    if err := d.Repo.SaveReadingCurrent(ctx, reading); err != nil {
-        log.Printf("[%s] ошибка сохранения: %v\n", d.ID, err)
-        return
-    }
+	reading := storage.ReadingCurrent{
+		DeviceID:      d.ID,
+		PointID:       pt.Name,
+		Instance:      instance,
+		Value:         val,
+		Unit:          pt.Unit,
+		Quality:       string(qTag),
+		QualityReason: reason,
+		Timestamp:     time.Now(),
+	}
+	if err := d.Repo.SaveReadingCurrent(ctx, reading); err != nil {
+		log.Printf("[%s] ошибка сохранения: %v\n", d.ID, err)
+		return
+	}
 
-    if instance != "" {
-        log.Printf("[%s] [SAVE] %s[%s] = %v %s\n", d.ID, pt.Name, instance, val, pt.Unit)
-    } else {
-        log.Printf("[%s] [SAVE] %s = %v %s\n", d.ID, pt.Name, val, pt.Unit)
-    }
+	if instance != "" {
+		log.Printf("[%s] [SAVE] %s[%s] = %v %s\n", d.ID, pt.Name, instance, val, pt.Unit)
+	} else {
+		log.Printf("[%s] [SAVE] %s = %v %s\n", d.ID, pt.Name, val, pt.Unit)
+	}
 }
 
 // pollArchives runs each archive strategy declared in the device profile.
@@ -290,56 +293,63 @@ func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, i
 // PollArchives runs each archive strategy declared in the device profile
 // (exported so internal/poller can drive it centrally).
 func (d *Device) PollArchives(ctx context.Context) {
-    for _, a := range d.Profile.Archives {
-        reader, ok := archive.Get(a.Strategy)
-        if !ok {
-            log.Printf("[%s] архив %s: неизвестная стратегия %s\n", d.ID, a.ID, a.Strategy)
-            continue
-        }
+	for _, a := range d.Profile.Archives {
+		reader, ok := archive.Get(a.Strategy)
+		if !ok {
+			log.Printf("[%s] архив %s: неизвестная стратегия %s\n", d.ID, a.ID, a.Strategy)
+			continue
+		}
 
-        layout := make([]archive.RecordLayoutField, 0, len(a.RecordLayout))
-        for _, f := range a.RecordLayout {
-            layout = append(layout, archive.RecordLayoutField{
-                Offset: f.Offset,
-                Name:   f.Name,
-                Type:   f.Type,
-                Unit:   f.Unit,
-                Scale:  f.Scale,
-                CRC:    f.CRC,
-                Epoch:  f.Epoch,
-            })
-        }
+		layout := make([]archive.RecordLayoutField, 0, len(a.RecordLayout))
+		for _, f := range a.RecordLayout {
+			layout = append(layout, archive.RecordLayoutField{
+				Offset: f.Offset,
+				Name:   f.Name,
+				Type:   f.Type,
+				Unit:   f.Unit,
+				Scale:  f.Scale,
+				CRC:    f.CRC,
+				Epoch:  f.Epoch,
+			})
+		}
 
-        q := archive.ArchiveQuery{
-            DeviceID:     d.ID,
-            ArchiveID:    a.ID,
-            Instance:     1,
-            From:         time.Now().Add(-24 * time.Hour),
-            To:           time.Now(),
-            RecordLayout: layout,
-            WordOrder32:  d.Profile.Codec.WordOrder32,
-            WordOrder64:  d.Profile.Codec.WordOrder64,
-            Params:       a.Params,
-        }
+		q := archive.ArchiveQuery{
+			DeviceID:     d.ID,
+			ArchiveID:    a.ID,
+			Instance:     1,
+			From:         time.Now().Add(-24 * time.Hour),
+			To:           time.Now(),
+			RecordLayout: layout,
+			WordOrder32:  d.Profile.Codec.WordOrder32,
+			WordOrder64:  d.Profile.Codec.WordOrder64,
+			Params:       a.Params,
+		}
 
-        release, leaseErr := d.Lease.Acquire(ctx, d.ID, a.ID, 30*time.Second)
-        if leaseErr != nil {
-            log.Printf("[%s] архив %s: не удалось занять lease: %v\n", d.ID, a.ID, leaseErr)
-            continue
-        }
+		release, leaseErr := d.Lease.Acquire(ctx, d.ID, a.ID, 30*time.Second)
+		if leaseErr != nil {
+			log.Printf("[%s] архив %s: не удалось занять lease: %v\n", d.ID, a.ID, leaseErr)
+			continue
+		}
 
-        records, err := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, q)
-        release()
-        if err != nil {
-            log.Printf("[%s] архив %s: ошибка чтения: %v\n", d.ID, a.ID, err)
-            continue
-        }
+		records, err := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, q)
+		release()
+		if err != nil {
+			log.Printf("[%s] архив %s: ошибка чтения: %v\n", d.ID, a.ID, err)
+			continue
+		}
 
-        log.Printf("[%s] архив %s: получено записей: %d\n", d.ID, a.ID, len(records))
-        for _, rec := range records {
-            log.Printf("[%s] архив %s: запись ts=%v поля=%v\n", d.ID, a.ID, rec.RecordTS, rec.Fields)
-        }
-    }
+		log.Printf("[%s] архив %s: получено записей: %d\n", d.ID, a.ID, len(records))
+		for _, rec := range records {
+			log.Printf("[%s] архив %s: запись ts=%v поля=%v\n", d.ID, a.ID, rec.RecordTS, rec.Fields)
+		}
+
+		if a.Strategy == "akron_archive" {
+			if kind, _ := a.Params["archive_kind"].(string); kind == "hourly" {
+				saved := persistAkronHourly(ctx, d.Repo, d.ID, a, records)
+				log.Printf("[%s] архив %s: сохранено часовок: %d/%d\n", d.ID, a.ID, saved, len(records))
+			}
+		}
+	}
 }
 
 // decodePoint decodes raw register bytes according to the point's declared
@@ -348,87 +358,87 @@ func (d *Device) PollArchives(ctx context.Context) {
 // (they require record_layout-aware decoding beyond a single point read) -
 // see backlog.
 func (d *Device) decodePoint(pt profile.Point, data []byte) (any, error) {
-    order32 := d.Profile.Codec.WordOrder32
-    order64 := d.Profile.Codec.WordOrder64
+	order32 := d.Profile.Codec.WordOrder32
+	order64 := d.Profile.Codec.WordOrder64
 
-    // ByteOffset lets a point read a sub-region of the raw register data,
-    // for devices that pack more than one logical field into a single
-    // register (e.g. Akron-01/02's clock register 0x0010 = [second, minute]).
-    // Zero (the common case) leaves data untouched.
-    if pt.ByteOffset > 0 {
-        if pt.ByteOffset >= len(data) {
-            return nil, fmt.Errorf("point %q: byte_offset %d is out of range for %d bytes read", pt.Name, pt.ByteOffset, len(data))
-        }
-        data = data[pt.ByteOffset:]
-    }
+	// ByteOffset lets a point read a sub-region of the raw register data,
+	// for devices that pack more than one logical field into a single
+	// register (e.g. Akron-01/02's clock register 0x0010 = [second, minute]).
+	// Zero (the common case) leaves data untouched.
+	if pt.ByteOffset > 0 {
+		if pt.ByteOffset >= len(data) {
+			return nil, fmt.Errorf("point %q: byte_offset %d is out of range for %d bytes read", pt.Name, pt.ByteOffset, len(data))
+		}
+		data = data[pt.ByteOffset:]
+	}
 
-    switch pt.Type {
-    case "float":
-        v, err := codec.DecodeFloat32(data, order32)
-        if err != nil {
-            return nil, err
-        }
-        return float64(v), nil
-    case "double":
-        return codec.DecodeFloat64(data, order64)
-    case "int32":
-        v, err := codec.DecodeInt32(data, order32)
-        if err != nil {
-            return nil, err
-        }
-        return int64(v), nil
-    case "uint32":
-        v, err := codec.DecodeUint32(data, order32)
-        if err != nil {
-            return nil, err
-        }
-        if pt.Epoch != "" {
-            return time.Unix(int64(v), 0).UTC(), nil
-        }
-        return int64(v), nil
-    case "int16":
-        v, err := codec.DecodeInt16(data)
-        if err != nil {
-            return nil, err
-        }
-        return int64(v), nil
-    case "uint16", "bitfield":
-        v, err := codec.DecodeUint16(data)
-        if err != nil {
-            return nil, err
-        }
-        return int64(v), nil
-    case "scaled_int":
-        v, err := codec.DecodeUint16(data)
-        if err != nil {
-            return nil, err
-        }
-        scale := pt.Scale
-        if scale == 0 {
-            scale = 1
-        }
-        return float64(v) * scale, nil
-    case "u32+float":
-        return codec.DecodeU32Float(data, order32)
-    case "long+float":
-        return codec.DecodeLongFloat(data, order32)
-    case "bcd":
-        // Decodes the first byte of data as a single BCD digit pair
-        // (0-99). This assumes one BCD field occupies its own register
-        // (RegisterCount("bcd")=1, i.e. 2 bytes read, first byte used) -
-        // a device that packs two BCD fields into one register (e.g.
-        // Akron-01/02's clock: second+minute sharing register 0x0010)
-        // cannot be modeled as two separate Points this way; that needs
-        // a sub-register field offset concept, deliberately not solved
-        // here (see backlog).
-        v, err := codec.DecodeBCDByte(data[0])
-        if err != nil {
-            return nil, err
-        }
-        return int64(v), nil
-    case "string", "asciiz":
-        return codec.DecodeString(data), nil
-    default:
-        return "", nil
-    }
+	switch pt.Type {
+	case "float":
+		v, err := codec.DecodeFloat32(data, order32)
+		if err != nil {
+			return nil, err
+		}
+		return float64(v), nil
+	case "double":
+		return codec.DecodeFloat64(data, order64)
+	case "int32":
+		v, err := codec.DecodeInt32(data, order32)
+		if err != nil {
+			return nil, err
+		}
+		return int64(v), nil
+	case "uint32":
+		v, err := codec.DecodeUint32(data, order32)
+		if err != nil {
+			return nil, err
+		}
+		if pt.Epoch != "" {
+			return time.Unix(int64(v), 0).UTC(), nil
+		}
+		return int64(v), nil
+	case "int16":
+		v, err := codec.DecodeInt16(data)
+		if err != nil {
+			return nil, err
+		}
+		return int64(v), nil
+	case "uint16", "bitfield":
+		v, err := codec.DecodeUint16(data)
+		if err != nil {
+			return nil, err
+		}
+		return int64(v), nil
+	case "scaled_int":
+		v, err := codec.DecodeUint16(data)
+		if err != nil {
+			return nil, err
+		}
+		scale := pt.Scale
+		if scale == 0 {
+			scale = 1
+		}
+		return float64(v) * scale, nil
+	case "u32+float":
+		return codec.DecodeU32Float(data, order32)
+	case "long+float":
+		return codec.DecodeLongFloat(data, order32)
+	case "bcd":
+		// Decodes the first byte of data as a single BCD digit pair
+		// (0-99). This assumes one BCD field occupies its own register
+		// (RegisterCount("bcd")=1, i.e. 2 bytes read, first byte used) -
+		// a device that packs two BCD fields into one register (e.g.
+		// Akron-01/02's clock: second+minute sharing register 0x0010)
+		// cannot be modeled as two separate Points this way; that needs
+		// a sub-register field offset concept, deliberately not solved
+		// here (see backlog).
+		v, err := codec.DecodeBCDByte(data[0])
+		if err != nil {
+			return nil, err
+		}
+		return int64(v), nil
+	case "string", "asciiz":
+		return codec.DecodeString(data), nil
+	default:
+		return "", nil
+	}
 }
