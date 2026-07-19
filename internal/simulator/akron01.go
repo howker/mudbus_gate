@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"log"
 	"net"
+	"time"
 
 	"mbgw/internal/protocol/modbus"
 )
@@ -36,7 +37,19 @@ var akron01Registers = map[int][]byte{
 // akron01HourlyRow is a fixed test hourly-archive row (9 bytes): the same
 // U=5827/Pu=2 (->582.7 m3) and 10:00 05.03.2008 values already verified
 // in archive/merkuriy_long_response_test.go's TestAkronArchive_HourlyRead.
-var akron01HourlyRow = []byte{0xC3, 0x16, 0x00, 0x00, 0x02, 0x10, 0x05, 0x03, 0x08}
+// akron01HourlyRow builds a fresh test row every time, with a timestamp
+// one hour ago — so the row always falls inside Энергосфера's ОИ debt
+// window regardless of when the simulator is started. The volume value
+// stays at the documented 582.7 m³ (U=5827, Pu=2) for golden-test
+// consistency.
+func akron01HourlyRow() []byte {
+	t := time.Now().Add(-1 * time.Hour)
+	bcd := func(v int) byte { v %= 100; return byte((v/10)<<4 | (v % 10)) }
+	return []byte{
+		0xC3, 0x16, 0x00, 0x00, 0x02, // U=5827 LE, Pu=2 → 582.7
+		bcd(t.Hour()), bcd(t.Day()), bcd(int(t.Month())), bcd(t.Year() % 100),
+	}
+}
 
 func RunAkron01(addr string) error {
 	ln, err := net.Listen("tcp", addr)
@@ -113,9 +126,9 @@ func buildAkron01Response(pdu []byte) []byte {
 		if n < 1 {
 			n = 1
 		}
-		data := make([]byte, 0, n*len(akron01HourlyRow))
+		data := make([]byte, 0, n*9)
 		for i := 0; i < n; i++ {
-			data = append(data, akron01HourlyRow...)
+			data = append(data, akron01HourlyRow()...)
 		}
 		return append([]byte{funcCode, byte(len(data))}, data...)
 	}

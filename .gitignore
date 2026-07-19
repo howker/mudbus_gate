@@ -31,3 +31,8 @@ discovery*.jsonl
 *.db
 *.db-wal
 *.db-shm
+akron_live.jsonl
+out.log
+err.log
+mbgw.exe
+*.db
