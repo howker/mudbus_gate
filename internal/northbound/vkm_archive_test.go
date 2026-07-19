@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"math"
 	"testing"
+	"time"
 )
 
 // --- helpers to build request PDUs ---
@@ -196,6 +197,42 @@ func TestVKM_HandshakeConstants_MatchDocument(t *testing.T) {
 	f := math.Float32frombits(binary.BigEndian.Uint32(resp[2:6]))
 	if diff := f - 123.4567; diff < -0.001 || diff > 0.001 {
 		t.Fatalf("112 (float) = %v, want ~123.4567", f)
+	}
+}
+
+// TestVKM_LiveClock_ReplacesExceptionLoop reproduces the EXACT request
+// captured from live Энергосфера traffic right after the identity block
+// succeeded (vkm_live.jsonl, 19.07.2026 19:15): 03 07 08 00 06 (addr=1800,
+// qty=6). This used to return ILLEGAL DATA ADDRESS, which she retried
+// rapidly before reconnecting — never reaching the archive protocol.
+func TestVKM_LiveClock_ReplacesExceptionLoop(t *testing.T) {
+	r := NewVKMArchiveResponder(FixedVKMSource{Result: testString})
+
+	resp := r.Respond([]byte{0x03, 0x07, 0x08, 0x00, 0x06})
+	if resp == nil || resp[0] == (0x03|0x80) {
+		t.Fatalf("clock read still exceptions/silences: % X", resp)
+	}
+	if resp[0] != 0x03 || resp[1] != 12 {
+		t.Fatalf("resp header = % X, want func=03 byteCount=12", resp[0:2])
+	}
+	data := resp[2:]
+	day := binary.BigEndian.Uint16(data[0:2])
+	month := binary.BigEndian.Uint16(data[2:4])
+	year := binary.BigEndian.Uint16(data[4:6])
+	hour := binary.BigEndian.Uint16(data[6:8])
+
+	now := time.Now()
+	if int(year) != now.Year() {
+		t.Fatalf("year = %d, want %d", year, now.Year())
+	}
+	if month < 1 || month > 12 {
+		t.Fatalf("month = %d, out of range", month)
+	}
+	if day < 1 || day > 31 {
+		t.Fatalf("day = %d, out of range", day)
+	}
+	if hour > 23 {
+		t.Fatalf("hour = %d, out of range", hour)
 	}
 }
 

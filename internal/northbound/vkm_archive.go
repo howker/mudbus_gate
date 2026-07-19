@@ -105,6 +105,7 @@ func defaultVKMIdentityRegs() map[int]uint16 {
 // УВП-280.01 archive register addresses and status codes.
 const (
 	vkmReqIDReg   = 7900
+	vkmClockReg   = 1800 // day,month,year,hour,minute,second (plain int16 each)
 	vkmPipeReg    = 7901
 	vkmStartReg   = 7902 // 7902..7907 = day,month,year,hour,min,sec (start)
 	vkmEndReg     = 7908 // 7908..7913 = day,month,year,hour,min,sec (end)
@@ -227,6 +228,20 @@ func (r *VKMArchiveResponder) read(pdu []byte) []byte {
 		return resp
 	}
 
+	// Live clock (1800-1805: day, month, year, hour, minute, second — plain
+	// decimal int16 each, NOT BCD like Akron's clock). Found by LIVE
+	// testing: right after the identity block (1806-1811), the driver
+	// reads this block and got ILLEGAL DATA ADDRESS, then retried it
+	// rapidly before eventually reconnecting and restarting the whole
+	// sequence — never reaching the archive protocol (vkm_live.jsonl,
+	// 19.07.2026 19:15). This mirrors the Akron finding that a device's
+	// clock must read as live/current before a driver proceeds (see
+	// M3_DISCOVERY_FINDINGS_akron.md §4) — same requirement, different
+	// device family.
+	if resp, ok := liveClockBlockVKM(fc, addr, qty); ok {
+		return resp
+	}
+
 	// A truly unhandled register gets a proper Modbus exception (ILLEGAL
 	// DATA ADDRESS) instead of silence. This matters operationally: a real
 	// device NACKs an unsupported register immediately and the connection
@@ -244,6 +259,30 @@ func (r *VKMArchiveResponder) read(pdu []byte) []byte {
 // [funcCode|0x80][exceptionCode].
 func exceptionResponse(funcCode, code byte) []byte {
 	return []byte{funcCode | 0x80, code}
+}
+
+// liveClockBlockVKM answers a read anchored at 1800 (day/month/year/
+// hour/minute/second, per modbus_uvp280_01.pdf "Встроенные часы реального
+// времени прибора") with the gateway's real current time. Only serves
+// reads starting exactly at 1800 with 1-6 registers, matching how a real
+// device's contiguous register block behaves; qty=6 covers the whole
+// block (the exact shape the driver was observed requesting).
+func liveClockBlockVKM(fc byte, addr, qty int) ([]byte, bool) {
+	if addr != vkmClockReg || qty < 1 || qty > 6 {
+		return nil, false
+	}
+	now := time.Now()
+	fields := [6]uint16{
+		uint16(now.Day()), uint16(now.Month()), uint16(now.Year()),
+		uint16(now.Hour()), uint16(now.Minute()), uint16(now.Second()),
+	}
+	data := make([]byte, 0, qty*2)
+	for i := 0; i < qty; i++ {
+		data = append(data, byte(fields[i]>>8), byte(fields[i]))
+	}
+	resp := make([]byte, 0, 2+len(data))
+	resp = append(resp, fc, byte(len(data)))
+	return append(resp, data...), true
 }
 
 // extraBlockResponse serves a contiguous multi-register read out of the
