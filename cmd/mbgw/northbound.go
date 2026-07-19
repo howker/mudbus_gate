@@ -25,6 +25,8 @@ func runNorthbound() {
 	raw := false
 	serveAkron := false
 	var deviceID string
+	serveVKM := false
+	var vkmString string
 
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
@@ -47,6 +49,13 @@ func runNorthbound() {
 		case "--device":
 			if i+1 < len(os.Args) {
 				deviceID = os.Args[i+1]
+				i++
+			}
+		case "--serve-vkm":
+			serveVKM = true
+		case "--vkm-string":
+			if i+1 < len(os.Args) {
+				vkmString = os.Args[i+1]
 				i++
 			}
 		case "--listen":
@@ -82,6 +91,11 @@ func runNorthbound() {
 
 	if serveAkron {
 		runAkronLiveMode(listenAddr, dbPath, deviceID, logPath)
+		return
+	}
+
+	if serveVKM {
+		runVKMLiveMode(listenAddr, vkmString)
 		return
 	}
 
@@ -213,6 +227,43 @@ func runAkronLiveMode(listenAddr, dbPath, deviceID, logPath string) {
 	log.Println("northbound --serve-akron: остановлен")
 }
 
+// runVKMLiveMode starts the MBAP (Modbus TCP) carrier that lets mbgw stand
+// in front of Энергосфера as a УВП-280А-shaped device serving ВКМ-360
+// archives (northbound.VKMServer). Confirmed against the live ЭС config:
+// this record uses plain Modbus TCP, not raw RTU — unlike the Akron
+// carrier.
+//
+// vkmString is a FIXED test archive string for the current smoke-testing
+// stage — a real per-device, per-request archive source (reading actual
+// collected ВКМ data) is a later step once we know the real device's
+// string format and have a live ВКМ to collect from. This flag exists so
+// the transport and protocol mechanics can be verified end-to-end on a
+// live Энергосфера today, without waiting on that.
+func runVKMLiveMode(listenAddr, vkmString string) {
+	if listenAddr == "" {
+		fmt.Println("northbound --serve-vkm: --listen обязателен")
+		os.Exit(1)
+	}
+	if vkmString == "" {
+		vkmString = "V01{Расход}=123.45 кг/с;V02{Масса}=678.90 кг;"
+	}
+
+	srv := northbound.NewVKMServer(listenAddr, func() northbound.VKMArchiveSource {
+		return northbound.FixedVKMSource{Result: vkmString}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	waitForShutdownSignal(cancel, "northbound --serve-vkm")
+
+	log.Printf("northbound --serve-vkm: слушаем %s (тестовая строка: %q)\n", listenAddr, vkmString)
+
+	if err := srv.Listen(ctx); err != nil {
+		log.Fatalf("[FATAL] northbound --serve-vkm: %v", err)
+	}
+	log.Println("northbound --serve-vkm: остановлен")
+}
+
 func runRawDiscoveryMode(listenAddr, logPath, simPath, cmd110 string) {
 	if listenAddr == "" {
 		fmt.Println("northbound --discovery --raw: --listen is required")
@@ -278,6 +329,7 @@ func printNorthboundUsage() {
 	fmt.Println()
 	fmt.Println("  mbgw northbound --discovery --raw --listen <addr> [--log <p.jsonl>] [--sim <s.yaml>] [--cmd110 <mode>]")
 	fmt.Println("  mbgw northbound --serve-akron --listen <addr> --db <path> --device <id> [--log <p.jsonl>]")
+	fmt.Println("  mbgw northbound --serve-vkm --listen <addr> [--vkm-string <s>]")
 	fmt.Println("      Raw-TCP discovery: log bare Modbus RTU and answer as an Akron (M3).")
 	fmt.Println("      --sim <file>  YAML controlling responder behaviour (edit on server, no rebuild):")
 	fmt.Println("                    cmd110, live_clock, identity, per-command overrides.")
