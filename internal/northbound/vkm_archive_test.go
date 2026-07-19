@@ -2,6 +2,7 @@ package northbound
 
 import (
 	"encoding/binary"
+	"math"
 	"testing"
 )
 
@@ -145,6 +146,73 @@ func TestVKM_NoRecords_Status3(t *testing.T) {
 	// Length must be 0 for an empty result.
 	if l := readU16(r.Respond(fc03(8002, 1)), t); l != 0 {
 		t.Fatalf("len = %d, want 0", l)
+	}
+}
+
+// TestVKM_IdentityBlock_LiveObservedRequest reproduces the EXACT request
+// captured from a live Энергосфера УВП-280А-driver probe (vkm_live.jsonl,
+// 19.07.2026): reading 6 registers from 1806 — the identification block
+// (pipe mask, firmware version, build date, serial). The carrier used to
+// answer with silence (nil), which made the connection look dead and ЭС
+// kept reconnecting every ~1s. This must now get a real answer.
+func TestVKM_IdentityBlock_LiveObservedRequest(t *testing.T) {
+	r := NewVKMArchiveResponder(FixedVKMSource{Result: testString})
+
+	// Exact bytes from the live log: 03 07 0e 00 06 (addr=0x070E=1806, qty=6).
+	resp := r.Respond([]byte{0x03, 0x07, 0x0E, 0x00, 0x06})
+	if resp == nil {
+		t.Fatal("identity block read returned nil (silence) — this is the live bug")
+	}
+	if resp[0] != 0x03 || resp[1] != 12 {
+		t.Fatalf("resp header = % X, want func=03 byteCount=12", resp[0:2])
+	}
+	data := resp[2:]
+	pipeMask := binary.BigEndian.Uint16(data[0:2])
+	fwVersion := binary.BigEndian.Uint16(data[2:4])
+	if pipeMask == 0 {
+		t.Fatal("pipe mask is zero — device would look unconfigured")
+	}
+	if fwVersion == 0 {
+		t.Fatal("firmware version is zero")
+	}
+}
+
+// TestVKM_HandshakeConstants_MatchDocument verifies the documented
+// control-constant registers (110/112) decode to the exact values
+// specified in modbus_uvp280_01.pdf — these are not guesses, they are
+// spec'd defaults a driver may use as a sanity check.
+func TestVKM_HandshakeConstants_MatchDocument(t *testing.T) {
+	r := NewVKMArchiveResponder(FixedVKMSource{Result: testString})
+
+	// 110HR, int32 = 1234567890
+	resp := r.Respond(fc03(110, 2))
+	got := int32(binary.BigEndian.Uint32(resp[2:6]))
+	if got != 1234567890 {
+		t.Fatalf("110 (int32) = %d, want 1234567890", got)
+	}
+
+	// 112HR, float = 123.4567
+	resp = r.Respond(fc03(112, 2))
+	f := math.Float32frombits(binary.BigEndian.Uint32(resp[2:6]))
+	if diff := f - 123.4567; diff < -0.001 || diff > 0.001 {
+		t.Fatalf("112 (float) = %v, want ~123.4567", f)
+	}
+}
+
+// TestVKM_UnknownRegister_GetsException confirms we don't fabricate data
+// for truly unknown addresses, but also don't stay silent (which looked
+// like a dead connection to a live Энергосфера — see
+// TestVKM_IdentityBlock_LiveObservedRequest doc). A real Modbus exception
+// (ILLEGAL DATA ADDRESS) keeps the connection alive with a fast, correct
+// NACK.
+func TestVKM_UnknownRegister_GetsException(t *testing.T) {
+	r := NewVKMArchiveResponder(FixedVKMSource{Result: testString})
+	resp := r.Respond(fc03(9500, 2))
+	if resp == nil {
+		t.Fatal("unknown register returned silence — should be a Modbus exception")
+	}
+	if len(resp) != 2 || resp[0] != (0x03|0x80) || resp[1] != 0x02 {
+		t.Fatalf("resp = % X, want exception func=83 code=02", resp)
 	}
 }
 

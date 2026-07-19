@@ -33,7 +33,8 @@ import (
 type VKMArchiveResponder struct {
 	src VKMArchiveSource
 
-	regs map[int]uint16 // captured 7900-7914 request registers
+	regs  map[int]uint16 // captured 7900-7914 request registers
+	extra map[int]uint16 // static identification/status register stubs (non-archive reads)
 
 	haveReq     bool
 	statusPolls int
@@ -61,7 +62,44 @@ func (f FixedVKMSource) Archive(pipe int, start, end time.Time) (string, bool) {
 }
 
 func NewVKMArchiveResponder(src VKMArchiveSource) *VKMArchiveResponder {
-	return &VKMArchiveResponder{src: src, regs: make(map[int]uint16)}
+	return &VKMArchiveResponder{src: src, regs: make(map[int]uint16), extra: defaultVKMIdentityRegs()}
+}
+
+// defaultVKMIdentityRegs stubs the УВП-280.01 registers a driver is likely
+// to check BEFORE it ever touches the archive protocol:
+//   - 100/101: byte-order registers, DOCUMENTED default values
+//     (0123h / 01234567h per modbus_uvp280_01.pdf "Настройки интерфейса").
+//   - 110/112/114: DOCUMENTED "control constant" registers — fixed,
+//     spec'd values (1234567890 / 123.4567 / 123.4567890123456) a driver
+//     can use as a handshake/sanity check that this really is a
+//     УВП-280.01-family device. These are not guesses: they are the exact
+//     values the document specifies.
+//   - 1806-1811: identification block (pipe mask, firmware version, build
+//     date, serial) — found necessary by LIVE testing against
+//     Энергосфера: she reads this before proceeding, and silence here
+//     made the connection look dead (see package notes / vkm_live.jsonl
+//     from 19.07.2026). This is the VKM analogue of Akron's command-101
+//     passport check.
+//
+// Everything here is either a documented constant or an explicitly-marked
+// stub (identification fields) — mechanism first, real identity data
+// plugged in once available. Extend this map as further live probing
+// reveals more registers the driver checks before proceeding.
+func defaultVKMIdentityRegs() map[int]uint16 {
+	return map[int]uint16{
+		100: 0x0123,              // byte order, 32-bit (documented default)
+		101: 0x0123, 102: 0x4567, // byte order, 64-bit (documented default 01234567h, hi/lo words)
+		110: 18838, 111: 722, // control constant int32 = 1234567890
+		112: 17142, 113: 59861, // control constant float = 123.4567
+		114: 16478, 115: 56636, 116: 2043, 117: 19603, // control constant double = 123.4567890123456
+
+		1806: 0x0001, // pipe mask: pipe 1 present
+		1807: 100,    // firmware version 1.00
+		1808: 715,    // build date: month*100+day = 15 July
+		1809: 2026,   // build year
+		1810: 9,      // serial (int32 high word): 654321 = 0x0009FCB1
+		1811: 64497,  // serial (int32 low word)
+	}
 }
 
 // УВП-280.01 archive register addresses and status codes.
@@ -181,7 +219,53 @@ func (r *VKMArchiveResponder) read(pdu []byte) []byte {
 	case vkmDataReg:
 		return r.dataResponse(fc, qty)
 	}
-	return nil
+
+	// Fall back to the static identification/status register map for any
+	// other address range the driver reads before/around the archive
+	// protocol (e.g. 1806-1811, 100-117 handshake constants).
+	if resp, ok := r.extraBlockResponse(fc, addr, qty); ok {
+		return resp
+	}
+
+	// A truly unhandled register gets a proper Modbus exception (ILLEGAL
+	// DATA ADDRESS) instead of silence. This matters operationally: a real
+	// device NACKs an unsupported register immediately and the connection
+	// stays open; staying silent makes a Modbus master TIME OUT and
+	// reconnect, which is exactly what was observed live against
+	// Энергосфера before any register handling existed here (see
+	// defaultVKMIdentityRegs doc comment / vkm_live.jsonl 19.07.2026).
+	// Returning a fast, correct NACK for registers we simply haven't
+	// enumerated yet is far more robust than trying to guess every
+	// register the driver might ever ask for.
+	return exceptionResponse(fc, 0x02) // ExceptionIllegalDataAddress
+}
+
+// exceptionResponse builds a standard Modbus exception PDU:
+// [funcCode|0x80][exceptionCode].
+func exceptionResponse(funcCode, code byte) []byte {
+	return []byte{funcCode | 0x80, code}
+}
+
+// extraBlockResponse serves a contiguous multi-register read out of the
+// extra map, only if EVERY requested register in [addr, addr+qty) is
+// declared — a partial/unknown range still returns ok=false (silence),
+// which is safer than fabricating data for registers we know nothing
+// about.
+func (r *VKMArchiveResponder) extraBlockResponse(fc byte, addr, qty int) ([]byte, bool) {
+	if qty <= 0 {
+		return nil, false
+	}
+	data := make([]byte, 0, qty*2)
+	for a := addr; a < addr+qty; a++ {
+		v, ok := r.extra[a]
+		if !ok {
+			return nil, false
+		}
+		data = append(data, byte(v>>8), byte(v))
+	}
+	resp := make([]byte, 0, 2+len(data))
+	resp = append(resp, fc, byte(len(data)))
+	return append(resp, data...), true
 }
 
 // statusResponse mirrors a real device's collect-then-ready timing: the
