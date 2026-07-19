@@ -3,6 +3,9 @@ package northbound
 import (
 	"context"
 	"encoding/binary"
+	"encoding/json"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -149,7 +152,84 @@ func TestVKMServer_TwoConnections_IndependentState(t *testing.T) {
 	}
 }
 
-// buildTCPWriteFrame assembles a full MBAP frame for an FC06/FC16 PDU.
+// TestVKMServer_LogsRequestAndResponse proves every frame is captured, so
+// `Get-Content vkm_live.jsonl` gives visibility into whether Энергосфера
+// even reaches the archive protocol (writes to 7900+) — the same
+// operational question the Akron carrier's log already answers.
+func TestVKMServer_LogsRequestAndResponse(t *testing.T) {
+	logPath := t.TempDir() + "/vkm_test.jsonl"
+	dlog, err := NewDiscoveryLog(logPath)
+	if err != nil {
+		t.Fatalf("NewDiscoveryLog: %v", err)
+	}
+	defer dlog.Close()
+
+	srv := NewVKMServer("127.0.0.1:0", func() VKMArchiveSource {
+		return FixedVKMSource{Result: "X=1;"}
+	})
+	srv.Log = dlog
+	srv.ReadTimeout = 2 * time.Second
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+	go func() {
+		go func() {
+			for i := 0; i < 100; i++ {
+				if srv.Addr() != nil {
+					close(ready)
+					return
+				}
+				time.Sleep(2 * time.Millisecond)
+			}
+		}()
+		_ = srv.Listen(ctx)
+	}()
+	<-ready
+	defer cancel()
+
+	conn := dial(t, srv.Addr().String())
+	defer conn.Close()
+
+	req := buildReadRequest(1, 1, 0x03, 8000, 1)
+	conn.Write(req)
+	_ = readResponse(t, conn)
+	conn.Close()
+	time.Sleep(50 * time.Millisecond) // let the write land before reading back
+
+	entries := readJSONLEntries(t, logPath)
+	if len(entries) < 2 {
+		t.Fatalf("want at least 2 log entries (request+response), got %d", len(entries))
+	}
+	if entries[0].Direction != "request" || entries[0].Function != 0x03 {
+		t.Fatalf("entry[0] = %+v, want request func=3", entries[0])
+	}
+	if entries[1].Direction != "response" || entries[1].Function != 0x03 {
+		t.Fatalf("entry[1] = %+v, want response func=3", entries[1])
+	}
+}
+
+// readJSONLEntries reads a DiscoveryLog file line by line — no shared
+// reader helper exists in the package (discovery_log.go only writes), so
+// tests that need to inspect log content parse it directly.
+func readJSONLEntries(t *testing.T, path string) []DiscoveryEntry {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log file: %v", err)
+	}
+	var out []DiscoveryEntry
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		var e DiscoveryEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		out = append(out, e)
+	}
+	return out
+}
 func buildTCPWriteFrame(t *testing.T, transID uint16, unitID, funcCode byte, pduData []byte) []byte {
 	t.Helper()
 	pdu := append([]byte{funcCode}, pduData...)

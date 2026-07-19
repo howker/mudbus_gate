@@ -95,7 +95,7 @@ func runNorthbound() {
 	}
 
 	if serveVKM {
-		runVKMLiveMode(listenAddr, vkmString)
+		runVKMLiveMode(listenAddr, vkmString, logPath)
 		return
 	}
 
@@ -239,7 +239,7 @@ func runAkronLiveMode(listenAddr, dbPath, deviceID, logPath string) {
 // string format and have a live ВКМ to collect from. This flag exists so
 // the transport and protocol mechanics can be verified end-to-end on a
 // live Энергосфера today, without waiting on that.
-func runVKMLiveMode(listenAddr, vkmString string) {
+func runVKMLiveMode(listenAddr, vkmString, logPath string) {
 	if listenAddr == "" {
 		fmt.Println("northbound --serve-vkm: --listen обязателен")
 		os.Exit(1)
@@ -247,16 +247,26 @@ func runVKMLiveMode(listenAddr, vkmString string) {
 	if vkmString == "" {
 		vkmString = "V01{Расход}=123.45 кг/с;V02{Масса}=678.90 кг;"
 	}
+	if logPath == "" {
+		logPath = "vkm_live.jsonl"
+	}
+
+	dlog, err := northbound.NewDiscoveryLog(logPath)
+	if err != nil {
+		log.Fatalf("[FATAL] northbound --serve-vkm: %v", err)
+	}
+	defer dlog.Close()
 
 	srv := northbound.NewVKMServer(listenAddr, func() northbound.VKMArchiveSource {
 		return northbound.FixedVKMSource{Result: vkmString}
 	})
+	srv.Log = dlog
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	waitForShutdownSignal(cancel, "northbound --serve-vkm")
 
-	log.Printf("northbound --serve-vkm: слушаем %s (тестовая строка: %q)\n", listenAddr, vkmString)
+	log.Printf("northbound --serve-vkm: слушаем %s (тестовая строка: %q, лог: %s)\n", listenAddr, vkmString, logPath)
 
 	if err := srv.Listen(ctx); err != nil {
 		log.Fatalf("[FATAL] northbound --serve-vkm: %v", err)
@@ -329,7 +339,7 @@ func printNorthboundUsage() {
 	fmt.Println()
 	fmt.Println("  mbgw northbound --discovery --raw --listen <addr> [--log <p.jsonl>] [--sim <s.yaml>] [--cmd110 <mode>]")
 	fmt.Println("  mbgw northbound --serve-akron --listen <addr> --db <path> --device <id> [--log <p.jsonl>]")
-	fmt.Println("  mbgw northbound --serve-vkm --listen <addr> [--vkm-string <s>]")
+	fmt.Println("  mbgw northbound --serve-vkm --listen <addr> [--vkm-string <s>] [--log <p.jsonl>]")
 	fmt.Println("      Raw-TCP discovery: log bare Modbus RTU and answer as an Akron (M3).")
 	fmt.Println("      --sim <file>  YAML controlling responder behaviour (edit on server, no rebuild):")
 	fmt.Println("                    cmd110, live_clock, identity, per-command overrides.")

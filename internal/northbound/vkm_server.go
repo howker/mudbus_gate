@@ -2,6 +2,7 @@ package northbound
 
 import (
 	"context"
+	"encoding/hex"
 	"log"
 	"net"
 	"sync"
@@ -28,6 +29,12 @@ import (
 type VKMServer struct {
 	listen string
 	newSrc func() VKMArchiveSource // factory: one source per connection
+
+	// Log, if set, records every request/response frame as a
+	// DiscoveryEntry (same JSONL shape the Akron carrier and discovery
+	// modes use) — so `Get-Content *.jsonl` works the same way for VKM
+	// as it already does for Akron. Optional: nil means no audit trail.
+	Log *DiscoveryLog
 
 	ReadTimeout time.Duration
 
@@ -146,14 +153,36 @@ func (s *VKMServer) handleConn(conn net.Conn) {
 			continue
 		}
 
+		s.writeLog(DiscoveryEntry{
+			RemoteAddr: remote,
+			Unit:       unitID,
+			Function:   pdu[0],
+			Direction:  "request",
+			PayloadHex: hex.EncodeToString(pdu),
+		})
+
 		respPDU := resp.Respond(pdu)
 		if respPDU == nil {
 			continue // no answer, e.g. unhandled function/address
 		}
 
+		s.writeLog(DiscoveryEntry{
+			RemoteAddr: remote,
+			Unit:       unitID,
+			Function:   pdu[0],
+			Direction:  "response",
+			PayloadHex: hex.EncodeToString(respPDU),
+		})
+
 		respFrame := modbus.BuildTCPFrame(txID, unitID, respPDU)
 		if _, werr := conn.Write(respFrame); werr != nil {
 			return
 		}
+	}
+}
+
+func (s *VKMServer) writeLog(e DiscoveryEntry) {
+	if s.Log != nil {
+		_ = s.Log.Write(e)
 	}
 }
