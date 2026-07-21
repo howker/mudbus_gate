@@ -236,7 +236,30 @@ func TestVKM_LiveClock_ReplacesExceptionLoop(t *testing.T) {
 	}
 }
 
-// TestVKM_UnknownRegister_GetsException confirms we don't fabricate data
+// TestVKM_CurrentBlock2020_NoExceptionLoop reproduces the EXACT request
+// that caused the enormous "Основные интервалы" time skew in the ЭС console
+// (vkm_live.jsonl, 21.07.2026): FC04 read of 2020 qty=4 (operating-time
+// counters). It used to return ILLEGAL DATA ADDRESS in a tight loop; now it
+// must return a valid block with a non-zero штатное время so the driver's
+// archive time base stays sane.
+func TestVKM_CurrentBlock2020_NoExceptionLoop(t *testing.T) {
+	r := NewVKMArchiveResponder(FixedVKMSource{Result: testString})
+
+	// 04 07 e4 00 04 = FC04 addr=0x07E4=2020 qty=4
+	resp := r.Respond([]byte{0x04, 0x07, 0xE4, 0x00, 0x04})
+	if resp == nil || resp[0] == (0x04|0x80) {
+		t.Fatalf("2020 block still exceptions/silences: % X", resp)
+	}
+	if resp[0] != 0x04 || resp[1] != 8 {
+		t.Fatalf("resp header = % X, want func=04 byteCount=8", resp[0:2])
+	}
+	// Operating time (2020:2021, int32) must be non-zero.
+	opTime := binary.BigEndian.Uint32(resp[2:6])
+	if opTime == 0 {
+		t.Fatal("operating time is zero — this is what skewed the archive time base")
+	}
+}
+
 // for truly unknown addresses, but also don't stay silent (which looked
 // like a dead connection to a live Энергосфера — see
 // TestVKM_IdentityBlock_LiveObservedRequest doc). A real Modbus exception

@@ -242,6 +242,21 @@ func (r *VKMArchiveResponder) read(pdu []byte) []byte {
 		return resp
 	}
 
+	// Current-parameter block for pipe 1 (2000 + (ТП-1)*100 + offset, read
+	// as Input registers via FC04, float each). Found by LIVE testing:
+	// after the identity block and clock, the driver reads 2020-2023 —
+	// offset +20/+22 = "время штатной работы" / "время нештатной работы"
+	// (operating-time counters, seconds, int32) per
+	// modbus_uvp280_01.pdf. Missing this made FC04 return ILLEGAL DATA
+	// ADDRESS in a tight loop, and — critically — the driver uses the
+	// operating-time counters as part of its ARCHIVE time base, so their
+	// absence is what drove the enormous "Основные интервалы" time skew
+	// seen in the ЭС console (−760M s), not the archive string content.
+	// Serving a valid, non-zero operating time keeps that time base sane.
+	if resp, ok := currentBlockVKM(fc, pdu[0], addr, qty); ok {
+		return resp
+	}
+
 	// A truly unhandled register gets a proper Modbus exception (ILLEGAL
 	// DATA ADDRESS) instead of silence. This matters operationally: a real
 	// device NACKs an unsupported register immediately and the connection
@@ -259,6 +274,58 @@ func (r *VKMArchiveResponder) read(pdu []byte) []byte {
 // [funcCode|0x80][exceptionCode].
 func exceptionResponse(funcCode, code byte) []byte {
 	return []byte{funcCode | 0x80, code}
+}
+
+// currentBlockVKM answers Input-register reads (FC04) inside the pipe-1
+// current-parameter block 2000-2043. Every 2-register (float) slot returns
+// 0 EXCEPT the operating-time counters, which are returned as real,
+// non-zero seconds so the driver's archive time base stays valid (see the
+// call-site comment: zero/absent operating time is what skewed
+// "Основные интервалы"). Offsets per modbus_uvp280_01.pdf, pipe 1 base
+// 2000:
+//
+//	+20 (2020) время штатной работы  — int32 seconds
+//	+22 (2022) время нештатной работы — int32 seconds
+//
+// Any read fully inside [2000, 2044) is served (zeros for unmodelled
+// slots) so the driver never hits an exception loop in this block again.
+func currentBlockVKM(fc, funcCode byte, addr, qty int) ([]byte, bool) {
+	if funcCode != 0x04 {
+		return nil, false
+	}
+	const base, end = 2000, 2044
+	if addr < base || addr+qty > end || qty < 1 {
+		return nil, false
+	}
+	// A steady, plainly-nonzero operating time (in seconds). Value is a
+	// stand-in until real device data is wired in — what matters for the
+	// time base is that it is non-zero and stable. 1_000_000 s split into
+	// its two 16-bit words (0x000F 0x4240) to avoid a uint16 overflow on
+	// the raw constant.
+	const opTimeHi uint16 = 15    // (1_000_000 >> 16) & 0xFFFF
+	const opTimeLo uint16 = 16960 // 1_000_000 & 0xFFFF
+
+	data := make([]byte, 0, qty*2)
+	for i := 0; i < qty; i++ {
+		reg := addr + i
+		var w uint16
+		switch reg {
+		case 2020: // штатное время, high word
+			w = opTimeHi
+		case 2021: // штатное время, low word
+			w = opTimeLo
+		case 2022: // нештатное время, high word
+			w = 0
+		case 2023: // нештатное время, low word
+			w = 0
+		default:
+			w = 0
+		}
+		data = append(data, byte(w>>8), byte(w))
+	}
+	resp := make([]byte, 0, 2+len(data))
+	resp = append(resp, fc, byte(len(data)))
+	return append(resp, data...), true
 }
 
 // liveClockBlockVKM answers a read anchored at 1800 (day/month/year/

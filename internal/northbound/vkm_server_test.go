@@ -241,3 +241,31 @@ func buildTCPWriteFrame(t *testing.T, transID uint16, unitID, funcCode byte, pdu
 	copy(frame[7:], pdu)
 	return frame
 }
+
+// TestDiscoveryLog_SizeCap proves the log stops growing once the cap is
+// reached — the safety net against a stuck master flooding the file (the
+// 3 MB VKM incident, 21.07.2026).
+func TestDiscoveryLog_SizeCap(t *testing.T) {
+	path := t.TempDir() + "/capped.jsonl"
+	lg, err := NewDiscoveryLogCapped(path, 512) // tiny cap for the test
+	if err != nil {
+		t.Fatalf("NewDiscoveryLogCapped: %v", err)
+	}
+	for i := 0; i < 1000; i++ {
+		_ = lg.Write(DiscoveryEntry{Direction: "request", Function: 3, PayloadHex: "03070e0006"})
+	}
+	_ = lg.Close()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	// Should be near the cap plus one entry and one marker line, not the
+	// tens of KB a thousand entries would otherwise produce.
+	if info.Size() > 512+300 {
+		t.Fatalf("log grew past cap: %d bytes", info.Size())
+	}
+	if info.Size() == 0 {
+		t.Fatal("log is empty — cap should still allow some writes")
+	}
+}
