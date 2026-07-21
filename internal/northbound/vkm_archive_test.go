@@ -236,27 +236,58 @@ func TestVKM_LiveClock_ReplacesExceptionLoop(t *testing.T) {
 	}
 }
 
-// TestVKM_CurrentBlock2020_NoExceptionLoop reproduces the EXACT request
-// that caused the enormous "Основные интервалы" time skew in the ЭС console
-// (vkm_live.jsonl, 21.07.2026): FC04 read of 2020 qty=4 (operating-time
-// counters). It used to return ILLEGAL DATA ADDRESS in a tight loop; now it
-// must return a valid block with a non-zero штатное время so the driver's
-// archive time base stays sane.
-func TestVKM_CurrentBlock2020_NoExceptionLoop(t *testing.T) {
+// TestVKM_TimeSyncRegisters verifies the registers ЭС uses to judge clock
+// synchronization against its polling server (per operator feedback, this
+// is the real source of the "разбежка времени"): 1008 must report zero
+// drift and 1007 must report a healthy time-sync status, per
+// modbus_uvp280_01.pdf. An exception here (as before) made ЭС treat the
+// clock as wildly skewed.
+func TestVKM_TimeSyncRegisters(t *testing.T) {
 	r := NewVKMArchiveResponder(FixedVKMSource{Result: testString})
 
-	// 04 07 e4 00 04 = FC04 addr=0x07E4=2020 qty=4
-	resp := r.Respond([]byte{0x04, 0x07, 0xE4, 0x00, 0x04})
-	if resp == nil || resp[0] == (0x04|0x80) {
-		t.Fatalf("2020 block still exceptions/silences: % X", resp)
+	// 1008 — difference in seconds vs reference; must be 0 (no drift).
+	resp := r.Respond(fc03(1008, 1))
+	if resp == nil || resp[0] == (0x03|0x80) {
+		t.Fatalf("1008 exceptions/silences: % X", resp)
 	}
-	if resp[0] != 0x04 || resp[1] != 8 {
-		t.Fatalf("resp header = % X, want func=04 byteCount=8", resp[0:2])
+	if diff := int16(binary.BigEndian.Uint16(resp[2:4])); diff != 0 {
+		t.Fatalf("1008 time drift = %d, want 0", diff)
 	}
-	// Operating time (2020:2021, int32) must be non-zero.
-	opTime := binary.BigEndian.Uint32(resp[2:6])
-	if opTime == 0 {
-		t.Fatal("operating time is zero — this is what skewed the archive time base")
+
+	// 1007 — reference-time status bits; bit1 (fresh accurate time) must be
+	// set, else ЭС considers the time stale.
+	resp = r.Respond(fc03(1007, 1))
+	if resp == nil || resp[0] == (0x03|0x80) {
+		t.Fatalf("1007 exceptions/silences: % X", resp)
+	}
+	status := binary.BigEndian.Uint16(resp[2:4])
+	if status&0x0002 == 0 {
+		t.Fatalf("1007 status = 0x%04X, bit1 (fresh time) not set", status)
+	}
+}
+
+// FC04 reads that blocked the driver from ever reaching the archive
+// protocol: ТП1 at 2020, then ТП2 at 2110 (vkm_live.jsonl, 21.07.2026).
+// Both must now return a valid (non-exception) block of the right length so
+// the driver progresses. Content is zeros by design (see currentBlockVKM).
+func TestVKM_CurrentBlock_AllPipes(t *testing.T) {
+	r := NewVKMArchiveResponder(FixedVKMSource{Result: testString})
+
+	cases := []struct {
+		name           string
+		addrHi, addrLo byte
+	}{
+		{"pipe1 2020", 0x07, 0xE4}, // 0x07E4 = 2020
+		{"pipe2 2110", 0x08, 0x3E}, // 0x083E = 2110
+	}
+	for _, c := range cases {
+		resp := r.Respond([]byte{0x04, c.addrHi, c.addrLo, 0x00, 0x04})
+		if resp == nil || resp[0] == (0x04|0x80) {
+			t.Fatalf("%s: still exceptions/silences: % X", c.name, resp)
+		}
+		if resp[0] != 0x04 || resp[1] != 8 || len(resp) != 10 {
+			t.Fatalf("%s: resp = % X, want func=04 byteCount=8 (4 regs)", c.name, resp)
+		}
 	}
 }
 

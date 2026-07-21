@@ -93,6 +93,20 @@ func defaultVKMIdentityRegs() map[int]uint16 {
 		112: 17142, 113: 59861, // control constant float = 123.4567
 		114: 16478, 115: 56636, 116: 2043, 117: 19603, // control constant double = 123.4567890123456
 
+		// Time-synchronization status/difference — THIS is what ЭС checks to
+		// decide the device clock matches the polling server (per operator:
+		// "on the device it must match the polling server"). Per
+		// modbus_uvp280_01.pdf:
+		//   1007 <read> reference-time-server status bits: bit0 NTP
+		//        connected, bit1 accurate time received <30s ago, bit2
+		//        auto-sync running. Report 0b111 = fully synced & fresh.
+		//   1008 difference in SECONDS between device clock and NTP
+		//        (positive = device ahead). Report 0 = no drift.
+		// Leaving 1008 unanswered (exception) made ЭС treat the clock as
+		// undefined/hugely skewed — the "разбежка времени" the operator saw.
+		1007: 0x0007, // NTP connected + fresh + auto-sync
+		1008: 0,      // zero drift vs reference time
+
 		1806: 0x0001, // pipe mask: pipe 1 present
 		1807: 100,    // firmware version 1.00
 		1808: 715,    // build date: month*100+day = 15 July
@@ -276,53 +290,31 @@ func exceptionResponse(funcCode, code byte) []byte {
 	return []byte{funcCode | 0x80, code}
 }
 
-// currentBlockVKM answers Input-register reads (FC04) inside the pipe-1
-// current-parameter block 2000-2043. Every 2-register (float) slot returns
-// 0 EXCEPT the operating-time counters, which are returned as real,
-// non-zero seconds so the driver's archive time base stays valid (see the
-// call-site comment: zero/absent operating time is what skewed
-// "Основные интервалы"). Offsets per modbus_uvp280_01.pdf, pipe 1 base
-// 2000:
+// currentBlockVKM answers Input-register reads (FC04) inside the
+// current-parameter area 2000-2599 (six pipe blocks of 100 registers each,
+// base 2000 + (ТП-1)*100). The driver reads several different per-pipe
+// slots here (e.g. ТП1 at 2020, ТП2 at 2110) and REQUIRES a successful
+// read of each before it will proceed to the archive protocol — an
+// exception just makes it retry the same register forever (observed live:
+// it looped on 2020, then 2110, never reaching archive; vkm_live.jsonl
+// 21.07.2026).
 //
-//	+20 (2020) время штатной работы  — int32 seconds
-//	+22 (2022) время нештатной работы — int32 seconds
-//
-// Any read fully inside [2000, 2044) is served (zeros for unmodelled
-// slots) so the driver never hits an exception loop in this block again.
+// So we answer the whole range with ZEROS — a valid reading (no flow → zero
+// mass/rate is exactly what a real device reports), enough to let the
+// driver progress. We deliberately do NOT fabricate specific values here:
+// the archive-period time base is carried by each archive RECORD's own
+// timestamp (in the result string), not by these current registers, so
+// guessing values for them would be noise. Real per-pipe current data can
+// be wired in later without changing this contract.
 func currentBlockVKM(fc, funcCode byte, addr, qty int) ([]byte, bool) {
 	if funcCode != 0x04 {
 		return nil, false
 	}
-	const base, end = 2000, 2044
-	if addr < base || addr+qty > end || qty < 1 {
+	const areaStart, areaEnd = 2000, 2600
+	if qty < 1 || addr < areaStart || addr+qty > areaEnd {
 		return nil, false
 	}
-	// A steady, plainly-nonzero operating time (in seconds). Value is a
-	// stand-in until real device data is wired in — what matters for the
-	// time base is that it is non-zero and stable. 1_000_000 s split into
-	// its two 16-bit words (0x000F 0x4240) to avoid a uint16 overflow on
-	// the raw constant.
-	const opTimeHi uint16 = 15    // (1_000_000 >> 16) & 0xFFFF
-	const opTimeLo uint16 = 16960 // 1_000_000 & 0xFFFF
-
-	data := make([]byte, 0, qty*2)
-	for i := 0; i < qty; i++ {
-		reg := addr + i
-		var w uint16
-		switch reg {
-		case 2020: // штатное время, high word
-			w = opTimeHi
-		case 2021: // штатное время, low word
-			w = opTimeLo
-		case 2022: // нештатное время, high word
-			w = 0
-		case 2023: // нештатное время, low word
-			w = 0
-		default:
-			w = 0
-		}
-		data = append(data, byte(w>>8), byte(w))
-	}
+	data := make([]byte, qty*2) // all zeros
 	resp := make([]byte, 0, 2+len(data))
 	resp = append(resp, fc, byte(len(data)))
 	return append(resp, data...), true
