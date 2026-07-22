@@ -3,6 +3,7 @@ package northbound
 import (
 	"encoding/binary"
 	"math"
+	"os"
 	"testing"
 	"time"
 )
@@ -236,7 +237,48 @@ func TestVKM_LiveClock_ReplacesExceptionLoop(t *testing.T) {
 	}
 }
 
-// TestVKM_TimeSyncRegisters verifies the registers ЭС uses to judge clock
+// TestVKM_YearModeEncoding verifies the config-file-selectable year
+// encodings used to diagnose the ЭС century-scale time skew without
+// rebuilds.
+func TestVKM_YearModeEncoding(t *testing.T) {
+	withVKMConfig(t, "year_mode = y2000\n")
+	if got := encodeYearVKM(2026); got != 26 {
+		t.Fatalf("y2000: got %d, want 26", got)
+	}
+	withVKMConfig(t, "year_mode = y1900\n")
+	if got := encodeYearVKM(2026); got != 126 {
+		t.Fatalf("y1900: got %d, want 126", got)
+	}
+	withVKMConfig(t, "year_mode = full\n")
+	if got := encodeYearVKM(2026); got != 2026 {
+		t.Fatalf("full: got %d, want 2026", got)
+	}
+}
+
+// withVKMConfig points the config loader at a temp file with the given
+// contents and forces a reload, restoring global state after the test.
+func withVKMConfig(t *testing.T, contents string) {
+	t.Helper()
+	path := t.TempDir() + "/vkm_config.txt"
+	if err := os.WriteFile(path, []byte(contents), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	vkmCfgMu.Lock()
+	vkmCfgPath = path
+	vkmCfgLoaded = false
+	vkmCfgChecked = time.Time{}
+	vkmCfgModTime = time.Time{}
+	vkmCfgMu.Unlock()
+	t.Cleanup(func() {
+		vkmCfgMu.Lock()
+		vkmCfgPath = vkmConfigFileName
+		vkmCfgLoaded = false
+		vkmCfgChecked = time.Time{}
+		vkmCfgModTime = time.Time{}
+		vkmCfgMu.Unlock()
+	})
+}
+
 // synchronization against its polling server (per operator feedback, this
 // is the real source of the "разбежка времени"): 1008 must report zero
 // drift and 1007 must report a healthy time-sync status, per

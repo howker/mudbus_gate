@@ -320,6 +320,38 @@ func currentBlockVKM(fc, funcCode byte, addr, qty int) ([]byte, bool) {
 	return append(resp, data...), true
 }
 
+// vkmNow returns the clock the carrier reports upward, optionally shifted
+// by clock_offset_sec from the config file (may be negative). Lets the
+// reported device time be nudged on the live server by editing a text file
+// — no rebuild, usually not even a restart — while diagnosing the ЭС
+// time-difference check.
+func vkmNow() time.Time {
+	return time.Now().Add(loadVKMConfig().clockOffset)
+}
+
+// encodeYearVKM encodes the clock year register per year_mode in the config
+// file:
+//
+//	"full" (default) -> 2026 (four-digit, the documented int16)
+//	"y2000"          -> 26   (year - 2000)
+//	"y1900"          -> 126  (year - 1900)
+//
+// Reason: Энергосфера's УВП-280А driver reports the device as ~2 centuries
+// off despite a byte-correct four-digit year — the signature of a year-
+// encoding mismatch. Selecting the encoding via the config file lets each
+// be tried on the live system by editing text, instead of a rebuild-and-
+// reupload per guess.
+func encodeYearVKM(year int) uint16 {
+	switch loadVKMConfig().yearMode {
+	case "y2000":
+		return uint16(year % 100)
+	case "y1900":
+		return uint16(year - 1900)
+	default:
+		return uint16(year)
+	}
+}
+
 // liveClockBlockVKM answers a read anchored at 1800 (day/month/year/
 // hour/minute/second, per modbus_uvp280_01.pdf "Встроенные часы реального
 // времени прибора") with the gateway's real current time. Only serves
@@ -330,9 +362,9 @@ func liveClockBlockVKM(fc byte, addr, qty int) ([]byte, bool) {
 	if addr != vkmClockReg || qty < 1 || qty > 6 {
 		return nil, false
 	}
-	now := time.Now()
+	now := vkmNow()
 	fields := [6]uint16{
-		uint16(now.Day()), uint16(now.Month()), uint16(now.Year()),
+		uint16(now.Day()), uint16(now.Month()), encodeYearVKM(now.Year()),
 		uint16(now.Hour()), uint16(now.Minute()), uint16(now.Second()),
 	}
 	data := make([]byte, 0, qty*2)
