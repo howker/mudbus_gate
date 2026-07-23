@@ -108,6 +108,52 @@ func TestVKM_HappyPath_FC06(t *testing.T) {
 	}
 }
 
+// TestVKM_StatusRead_TwoRegisters reproduces the EXACT status read the live
+// Энергосфера driver issues: 03 1f40 0002 — TWO registers (8000 status +
+// 8001 request-id echo), not one. Serving only the status register made the
+// reply malformed, so the driver never proceeded to read the result and
+// restarted the request cycle with a fresh id (vkm_live.jsonl 22-23.07.2026).
+func TestVKM_StatusRead_TwoRegisters(t *testing.T) {
+	withVKMConfig(t, "min_ready_ms = 0\n")
+	r := NewVKMArchiveResponder(FixedVKMSource{Result: testString})
+	writeFullRequestFC06(t, r) // writes id=42
+
+	// 03 1f40 0002 = read 2 registers from 8000
+	resp := r.Respond([]byte{0x03, 0x1F, 0x40, 0x00, 0x02})
+	if resp == nil || resp[0] == (0x03|0x80) {
+		t.Fatalf("status read exceptions/silences: % X", resp)
+	}
+	if resp[1] != 4 || len(resp) != 6 {
+		t.Fatalf("resp = % X, want byteCount=4 (2 registers)", resp)
+	}
+	// second register must echo the request id written at 7900 (42)
+	gotID := binary.BigEndian.Uint16(resp[4:6])
+	if gotID != 42 {
+		t.Fatalf("8001 request-id echo = %d, want 42", gotID)
+	}
+}
+
+func TestVKM_MinReadyDelay(t *testing.T) {
+	withVKMConfig(t, "min_ready_ms = 150\n")
+
+	r := NewVKMArchiveResponder(FixedVKMSource{Result: testString})
+	writeFullRequestFC06(t, r)
+
+	// Poll immediately — must still be "collecting" even past poll #1,
+	// because min_ready_ms hasn't elapsed yet.
+	if s := readU16(r.Respond(fc03(8000, 1)), t); s != vkmStatusCollecting {
+		t.Fatalf("poll 1 = %d, want collecting", s)
+	}
+	if s := readU16(r.Respond(fc03(8000, 1)), t); s != vkmStatusCollecting {
+		t.Fatalf("poll 2 (too soon) = %d, want still collecting", s)
+	}
+
+	time.Sleep(160 * time.Millisecond)
+	if s := readU16(r.Respond(fc03(8000, 1)), t); s != vkmStatusReady {
+		t.Fatalf("poll after delay = %d, want ready", s)
+	}
+}
+
 func TestVKM_HappyPath_FC16Block(t *testing.T) {
 	r := NewVKMArchiveResponder(FixedVKMSource{Result: testString})
 

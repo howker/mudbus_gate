@@ -36,10 +36,11 @@ type VKMArchiveResponder struct {
 	regs  map[int]uint16 // captured 7900-7914 request registers
 	extra map[int]uint16 // static identification/status register stubs (non-archive reads)
 
-	haveReq     bool
-	statusPolls int
-	haveResult  bool
-	result      string
+	haveReq        bool
+	collectStarted time.Time
+	statusPolls    int
+	haveResult     bool
+	result         string
 }
 
 // VKMArchiveSource yields the УВП-format result string for a pipe and time
@@ -200,6 +201,7 @@ func (r *VKMArchiveResponder) startCollection() {
 	r.haveResult = ok
 	r.haveReq = true
 	r.statusPolls = 0
+	r.collectStarted = time.Now()
 }
 
 // assembleTime builds a wall-clock time from six consecutive registers at
@@ -226,11 +228,11 @@ func (r *VKMArchiveResponder) read(pdu []byte) []byte {
 
 	switch addr {
 	case vkmStatusReg:
-		return r.statusResponse(fc)
+		return r.statusResponse(fc, qty)
 	case vkmReqEchoReg:
 		return word(fc, r.regs[vkmReqIDReg])
 	case vkmLenReg:
-		return word(fc, uint16(len(r.result)))
+		return r.lengthResponse(fc, qty)
 	case vkmDataReg:
 		return r.dataResponse(fc, qty)
 	}
@@ -290,7 +292,46 @@ func exceptionResponse(funcCode, code byte) []byte {
 	return []byte{funcCode | 0x80, code}
 }
 
-// currentBlockVKM answers Input-register reads (FC04) inside the
+// lengthResponse serves a read starting at 8002 (string length in bytes).
+// Honors qty: 8002 is immediately followed by the data string at 8003, so
+// a multi-register read anchored at 8002 continues into the string,
+// exactly like a real contiguous register block. Serving only one register
+// regardless of qty (as the status read originally did) yields a malformed
+// reply the driver rejects.
+//
+// Reports the RAW string length (matching exactly what dataResponse
+// serves) rather than length+1 for a NUL terminator: the doc says the
+// count includes a trailing NUL, but adding one here without also adding
+// it to dataResponse would make length and data disagree — a worse bug
+// than not implementing the NUL byte at all. If a real device is later
+// found to require the +1, both this and dataResponse need to change
+// together.
+func (r *VKMArchiveResponder) lengthResponse(fc byte, qty int) []byte {
+	if qty < 1 {
+		qty = 1
+	}
+	payload := []byte(r.result)
+	strLen := len(payload)
+
+	data := make([]byte, 0, qty*2)
+	data = append(data, byte(strLen>>8), byte(strLen))
+	for i := 1; i < qty; i++ { // remaining registers = the string itself
+		hi := 2 * (i - 1)
+		lo := hi + 1
+		var b1, b2 byte
+		if hi < len(payload) {
+			b1 = payload[hi]
+		}
+		if lo < len(payload) {
+			b2 = payload[lo]
+		}
+		data = append(data, b1, b2)
+	}
+	resp := make([]byte, 0, 2+len(data))
+	resp = append(resp, fc, byte(len(data)))
+	return append(resp, data...)
+}
+
 // current-parameter area 2000-2599 (six pipe blocks of 100 registers each,
 // base 2000 + (ТП-1)*100). The driver reads several different per-pipe
 // slots here (e.g. ТП1 at 2020, ТП2 at 2110) and REQUIRES a successful
@@ -398,16 +439,27 @@ func (r *VKMArchiveResponder) extraBlockResponse(fc byte, addr, qty int) ([]byte
 	return append(resp, data...), true
 }
 
-// statusResponse mirrors a real device's collect-then-ready timing: the
-// first poll after a request returns "collecting", subsequent polls return
-// "ready" (or "no records" if the period was empty). With no pending
-// request it reports ready (idle).
-func (r *VKMArchiveResponder) statusResponse(fc byte) []byte {
+// statusResponse serves a read starting at 8000. The driver reads TWO
+// registers here — 8000 (status) and 8001 (request id, "копируется из
+// запроса для контроля соответствия ответа запросу") — and validates that
+// the echoed id matches what it wrote. Returning only the status register
+// (ignoring qty, as this did originally) makes the reply malformed: the
+// driver kept polling status, never proceeded to read the result, and
+// restarted the whole request cycle with a fresh id (vkm_live.jsonl,
+// 22-23.07.2026). So the response must honor qty and carry the id echo.
+//
+// Timing: the first poll after a request returns "collecting", and later
+// polls return "ready" (or "no records" for an empty period) once
+// min_ready_ms (config, default 0) has elapsed — mimicking a real device's
+// processing latency. With no pending request it reports ready (idle).
+func (r *VKMArchiveResponder) statusResponse(fc byte, qty int) []byte {
 	status := uint16(vkmStatusReady)
 	if r.haveReq {
 		r.statusPolls++
+		minReady := loadVKMConfig().minReady
+		notYet := r.statusPolls == 1 || time.Since(r.collectStarted) < minReady
 		switch {
-		case r.statusPolls == 1:
+		case notYet:
 			status = vkmStatusCollecting
 		case r.haveResult:
 			status = vkmStatusReady
@@ -415,7 +467,22 @@ func (r *VKMArchiveResponder) statusResponse(fc byte) []byte {
 			status = vkmStatusNoRecords
 		}
 	}
-	return word(fc, status)
+
+	if qty < 1 {
+		qty = 1
+	}
+	regs := []uint16{status, r.regs[vkmReqIDReg]} // 8000, 8001
+	data := make([]byte, 0, qty*2)
+	for i := 0; i < qty; i++ {
+		var v uint16
+		if i < len(regs) {
+			v = regs[i]
+		}
+		data = append(data, byte(v>>8), byte(v))
+	}
+	resp := make([]byte, 0, 2+len(data))
+	resp = append(resp, fc, byte(len(data)))
+	return append(resp, data...)
 }
 
 // dataResponse returns the result string bytes, padded or truncated to the

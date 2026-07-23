@@ -18,6 +18,8 @@ import (
 //
 //	year_mode = full        # full | y2000 | y1900  — clock year register encoding
 //	clock_offset_sec = 0    # shift reported device clock by ±N seconds
+//	min_ready_ms = 0        # keep status "collecting" for at least N ms
+//	                        # after a request before reporting "ready"
 //	archive_string = V01{Расход}=123.45 кг/с;V02{Масса}=678.90 кг;
 //
 // Missing file or missing keys → documented defaults, so the carrier runs
@@ -27,6 +29,7 @@ const vkmConfigFileName = "vkm_config.txt"
 type vkmConfig struct {
 	yearMode      string
 	clockOffset   time.Duration
+	minReady      time.Duration
 	archiveString string
 }
 
@@ -34,6 +37,7 @@ func defaultVKMConfig() vkmConfig {
 	return vkmConfig{
 		yearMode:      "full",
 		clockOffset:   0,
+		minReady:      0,
 		archiveString: "V01{Расход}=123.45 кг/с;V02{Масса}=678.90 кг;",
 	}
 }
@@ -111,6 +115,10 @@ func parseVKMConfig(text string) vkmConfig {
 		case "clock_offset_sec":
 			if n, err := strconv.Atoi(stripInlineComment(val)); err == nil {
 				cfg.clockOffset = time.Duration(n) * time.Second
+			}
+		case "min_ready_ms":
+			if n, err := strconv.Atoi(stripInlineComment(val)); err == nil && n >= 0 {
+				cfg.minReady = time.Duration(n) * time.Millisecond
 			}
 		case "archive_string":
 			cfg.archiveString = val
