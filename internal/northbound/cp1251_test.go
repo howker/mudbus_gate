@@ -12,6 +12,7 @@ func TestCP1251Encode_KnownBytes(t *testing.T) {
 		{"V01", []byte{'V', '0', '1'}}, // ASCII passthrough
 		{"ё", []byte{0xB8}},
 		{"Ё", []byte{0xA8}},
+		{"45.6°C", []byte{'4', '5', '.', '6', 0xB0, 'C'}},
 	}
 	for _, c := range cases {
 		got := cp1251Encode(c.in)

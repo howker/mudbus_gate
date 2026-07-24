@@ -405,3 +405,35 @@ func TestVKM_IdleStatus_BeforeRequest(t *testing.T) {
 		t.Fatalf("idle status = %d, want 2", s)
 	}
 }
+
+// TestVKM_AssembleTime_DecodesYearWithSameMode reproduces the live bug: the
+// master mirrors back whatever year encoding it saw on our clock, so with
+// year_mode=y2000 she writes archive request years as 2-digit (26, not
+// 2026). Building the reply string with the raw value produced "0026"
+// (vkm_live.jsonl, 24.07.2026); decodeYearVKM must undo the same encoding
+// used for the outgoing clock.
+func TestVKM_AssembleTime_DecodesYearWithSameMode(t *testing.T) {
+	withVKMConfig(t, "year_mode = y2000\n")
+
+	r := NewVKMArchiveResponder(FixedVKMSource{})
+	// Write a request with year=26 (as the live master does), day=15,
+	// month=7 — mirroring the exact live scenario.
+	regs := []struct{ addr, val uint16 }{
+		{vkmReqIDReg, 1}, {vkmPipeReg, 1},
+		{vkmStartReg, 15}, {vkmStartReg + 1, 7}, {vkmStartReg + 2, 26},
+		{vkmStartReg + 3, 16}, {vkmStartReg + 4, 0}, {vkmStartReg + 5, 0},
+		{vkmEndReg, 15}, {vkmEndReg + 1, 7}, {vkmEndReg + 2, 26},
+		{vkmEndReg + 3, 16}, {vkmEndReg + 4, 30}, {vkmEndReg + 5, 0},
+	}
+	for _, reg := range regs {
+		r.regs[int(reg.addr)] = reg.val
+	}
+
+	got := r.assembleTime(vkmStartReg)
+	if got.Year() != 2026 {
+		t.Fatalf("assembleTime year = %d, want 2026 (raw register was 26)", got.Year())
+	}
+	if got.Month() != 7 || got.Day() != 15 || got.Hour() != 16 {
+		t.Fatalf("assembleTime = %v, want 15.07.2026 16:00", got)
+	}
+}

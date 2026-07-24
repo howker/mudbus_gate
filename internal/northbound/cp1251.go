@@ -25,6 +25,10 @@ func cp1251Encode(s string) []byte {
 			out = append(out, 0xA8)
 		case r == 0x451: // ё
 			out = append(out, 0xB8)
+		case r == 0xB0: // ° degree sign — cp1251 byte equals the Unicode
+			// code point (0xB0), found missing live: "45.6°C" became
+			// "45.6?C" in the archive string (vkm_live.jsonl, 24.07.2026).
+			out = append(out, 0xB0)
 		case r >= 0x410 && r <= 0x42F: // А-Я
 			out = append(out, byte(r-0x410+0xC0))
 		case r >= 0x430 && r <= 0x44F: // а-я

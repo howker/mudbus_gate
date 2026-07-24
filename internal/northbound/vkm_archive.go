@@ -208,10 +208,22 @@ func (r *VKMArchiveResponder) startCollection() {
 // base: day, month, year, hour, minute, second. Missing/zero registers
 // yield a zero-ish time — fine for the fixed source, refined for the DB
 // source later.
+// assembleTime builds a wall-clock time from six consecutive registers at
+// base: day, month, year, hour, minute, second.
+//
+// The year field is decoded with decodeYearVKM, the inverse of
+// encodeYearVKM. This matters: found by LIVE testing that the master
+// mirrors back whatever year encoding it observed on our OUTGOING clock
+// (1800-1805) when it writes the archive request's start/end year
+// (7904/7910) — with year_mode=y2000 configured, she wrote back a 2-digit
+// year (26), and treating that as an absolute year produced "0026" in the
+// built archive string (vkm_live.jsonl, 24.07.2026). Decoding must use the
+// SAME mode as encoding, not assume the register already holds a full
+// 4-digit year.
 func (r *VKMArchiveResponder) assembleTime(base int) time.Time {
 	day := int(r.regs[base])
 	month := int(r.regs[base+1])
-	year := int(r.regs[base+2])
+	year := decodeYearVKM(int(r.regs[base+2]))
 	hour := int(r.regs[base+3])
 	minute := int(r.regs[base+4])
 	sec := int(r.regs[base+5])
@@ -384,6 +396,28 @@ func encodeYearVKM(year int) uint16 {
 		return uint16(year - 1900)
 	default:
 		return uint16(year)
+	}
+}
+
+// decodeYearVKM is the inverse of encodeYearVKM: turns a raw year register
+// value BACK into a full calendar year, using the same year_mode. Needed
+// because the master echoes back whatever year encoding it observed on our
+// clock when it writes a date INTO a request (archive start/end year) —
+// see assembleTime's doc comment for the live evidence.
+func decodeYearVKM(raw int) int {
+	switch loadVKMConfig().yearMode {
+	case "y2000":
+		if raw < 100 {
+			return raw + 2000
+		}
+		return raw
+	case "y1900":
+		if raw < 100 {
+			return raw + 1900
+		}
+		return raw
+	default:
+		return raw
 	}
 }
 
