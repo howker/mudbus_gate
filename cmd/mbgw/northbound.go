@@ -244,9 +244,10 @@ func runVKMLiveMode(listenAddr, vkmString, logPath string) {
 		fmt.Println("northbound --serve-vkm: --listen обязателен")
 		os.Exit(1)
 	}
-	if vkmString == "" {
-		vkmString = "V01{Расход}=123.45 кг/с;V02{Масса}=678.90 кг;"
-	}
+	// No built-in default string: leaving it empty lets the carrier build a
+	// spec-compliant archive string (period + parameters + NUL, per the
+	// ЭЛЕМЕР-ВКМ-360 register map p.7). --vkm-string remains available to
+	// force a raw string for experiments.
 	if logPath == "" {
 		logPath = "vkm_live.jsonl"
 	}
@@ -257,8 +258,12 @@ func runVKMLiveMode(listenAddr, vkmString, logPath string) {
 	}
 	defer dlog.Close()
 
+	// Archive string comes from vkm_config.txt when present, falling back
+	// to --vkm-string (or the built-in default). This is what lets the
+	// string be changed on the Энергосфера server by editing a text file
+	// instead of rebuilding and re-uploading the binary.
 	srv := northbound.NewVKMServer(listenAddr, func() northbound.VKMArchiveSource {
-		return northbound.FixedVKMSource{Result: vkmString}
+		return northbound.ConfigArchiveSource{Fallback: vkmString}
 	})
 	srv.Log = dlog
 
@@ -266,7 +271,9 @@ func runVKMLiveMode(listenAddr, vkmString, logPath string) {
 	defer cancel()
 	waitForShutdownSignal(cancel, "northbound --serve-vkm")
 
-	log.Printf("northbound --serve-vkm: слушаем %s (тестовая строка: %q, лог: %s)\n", listenAddr, vkmString, logPath)
+	log.Printf("northbound --serve-vkm: слушаем %s (лог: %s)\n", listenAddr, logPath)
+	log.Printf("  строка архива строится по спецификации ВКМ-360 (период + параметры + NUL)\n")
+	log.Printf("  подстройка в vkm_config.txt: time_layout, archive_string — без пересборки\n")
 
 	if err := srv.Listen(ctx); err != nil {
 		log.Fatalf("[FATAL] northbound --serve-vkm: %v", err)
