@@ -103,19 +103,20 @@ func TestVKMServer_EndToEnd_FullArchiveCycle(t *testing.T) {
 	req = buildReadRequest(202, 1, 0x03, 8002, 1)
 	conn.Write(req)
 	resp = readResponse(t, conn)
-	wantLen := len([]byte(testString))
+	wantBytes := cp1251Encode(testString)
+	wantLen := len(wantBytes)
 	if l := binary.BigEndian.Uint16(resp[9:11]); int(l) != wantLen {
 		t.Fatalf("len = %d, want %d", l, wantLen)
 	}
 
-	// Data.
+	// Data — wire format is Windows-1251, not Go's native UTF-8.
 	qty := uint16((wantLen + 1) / 2)
 	req = buildReadRequest(203, 1, 0x03, 8003, qty)
 	conn.Write(req)
 	resp = readResponse(t, conn)
-	got := string(resp[9 : 9+wantLen])
-	if got != testString {
-		t.Fatalf("data = %q, want %q", got, testString)
+	got := resp[9 : 9+wantLen]
+	if string(got) != string(wantBytes) {
+		t.Fatalf("data = % X, want % X (cp1251 of %q)", got, wantBytes, testString)
 	}
 }
 

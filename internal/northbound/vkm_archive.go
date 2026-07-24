@@ -295,22 +295,16 @@ func exceptionResponse(funcCode, code byte) []byte {
 // lengthResponse serves a read starting at 8002 (string length in bytes).
 // Honors qty: 8002 is immediately followed by the data string at 8003, so
 // a multi-register read anchored at 8002 continues into the string,
-// exactly like a real contiguous register block. Serving only one register
-// regardless of qty (as the status read originally did) yields a malformed
-// reply the driver rejects.
-//
-// Reports the RAW string length (matching exactly what dataResponse
-// serves) rather than length+1 for a NUL terminator: the doc says the
-// count includes a trailing NUL, but adding one here without also adding
-// it to dataResponse would make length and data disagree — a worse bug
-// than not implementing the NUL byte at all. If a real device is later
-// found to require the +1, both this and dataResponse need to change
-// together.
+// exactly like a real contiguous register block — and a live capture
+// confirmed the driver DOES read both in one request (qty=120 covering
+// length + the whole string). The payload is Windows-1251-encoded (see
+// cp1251Encode), matching dataResponse, so the length and the inline data
+// tail always agree regardless of which path served them.
 func (r *VKMArchiveResponder) lengthResponse(fc byte, qty int) []byte {
 	if qty < 1 {
 		qty = 1
 	}
-	payload := []byte(r.result)
+	payload := cp1251Encode(r.result)
 	strLen := len(payload)
 
 	data := make([]byte, 0, qty*2)
@@ -488,8 +482,12 @@ func (r *VKMArchiveResponder) statusResponse(fc byte, qty int) []byte {
 // dataResponse returns the result string bytes, padded or truncated to the
 // requested register quantity (qty*2 bytes), matching how a Modbus string
 // block read behaves.
+// dataResponse returns the result string, encoded as Windows-1251 bytes
+// (see cp1251Encode) — the device/driver's expected ANSI encoding, not
+// Go's native UTF-8 — padded or truncated to the requested register
+// quantity (qty*2 bytes), matching how a Modbus string block read behaves.
 func (r *VKMArchiveResponder) dataResponse(fc byte, qty int) []byte {
-	payload := []byte(r.result)
+	payload := cp1251Encode(r.result)
 	maxBytes := qty * 2
 	if len(payload) > maxBytes {
 		payload = payload[:maxBytes]

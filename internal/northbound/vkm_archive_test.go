@@ -91,20 +91,23 @@ func TestVKM_HappyPath_FC06(t *testing.T) {
 	}
 
 	// Length at 8002.
+	wantBytes := cp1251Encode(testString)
 	gotLen := readU16(r.Respond(fc03(8002, 1)), t)
-	if int(gotLen) != len([]byte(testString)) {
-		t.Fatalf("len = %d, want %d", gotLen, len([]byte(testString)))
+	if int(gotLen) != len(wantBytes) {
+		t.Fatalf("len = %d, want %d", gotLen, len(wantBytes))
 	}
 
-	// Data at 8003: read enough registers to cover the string.
-	qty := uint16((len([]byte(testString)) + 1) / 2)
+	// Data at 8003: read enough registers to cover the string. The wire
+	// format is Windows-1251 (single byte per Cyrillic char), not Go's
+	// native UTF-8 — see cp1251Encode.
+	qty := uint16((len(wantBytes) + 1) / 2)
 	resp := r.Respond(fc03(8003, qty))
 	if resp[0] != 0x03 {
 		t.Fatalf("data resp fc = 0x%02X", resp[0])
 	}
-	got := string(resp[2 : 2+len([]byte(testString))])
-	if got != testString {
-		t.Fatalf("data = %q, want %q", got, testString)
+	got := resp[2 : 2+len(wantBytes)]
+	if string(got) != string(wantBytes) {
+		t.Fatalf("data = % X, want %X (cp1251 of %q)", got, wantBytes, testString)
 	}
 }
 
