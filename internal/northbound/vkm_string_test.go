@@ -24,9 +24,10 @@ func TestBuildVKMArchiveString_LiveOptions(t *testing.T) {
 	if strings.Contains(got, "{") || strings.Contains(got, "}") {
 		t.Fatalf("headers must be ABSENT when opts bit1 is clear: %q", got)
 	}
-	wantPeriod := fmt.Sprintf("T=%d-%d;", start.Unix(), end.Unix())
+	// Default period_format is "datetime": second-precision timestamps.
+	wantPeriod := "T=15.07.2026 16:00:00-15.07.2026 16:30:00;"
 	if !strings.HasPrefix(got, wantPeriod) {
-		t.Fatalf("period must be first and in seconds; got %q, want prefix %q", got, wantPeriod)
+		t.Fatalf("period must be first; got %q, want prefix %q", got, wantPeriod)
 	}
 	if !strings.Contains(got, "M=678.900000кг;") {
 		t.Errorf("mass must use tag, max digits, unit without space: %q", got)
@@ -84,8 +85,23 @@ func TestConfigArchiveSource_BuildsPeriodFromRequest(t *testing.T) {
 	if !ok {
 		t.Fatal("expected a result")
 	}
-	wantPeriod := fmt.Sprintf("T=%d-%d;", start.Unix(), end.Unix())
+	wantPeriod := "T=15.07.2026 16:00:00-15.07.2026 16:30:00;"
 	if !strings.HasPrefix(got, wantPeriod) {
 		t.Fatalf("period does not match the request/options: %q, want prefix %q", got, wantPeriod)
+	}
+}
+
+// TestBuildVKMArchiveString_UnixPeriodFormat covers the alternative reading
+// of opts bit3, selectable from vkm_config.txt without a rebuild.
+func TestBuildVKMArchiveString_UnixPeriodFormat(t *testing.T) {
+	withVKMConfig(t, "period_format = unix\n")
+
+	start := time.Date(2026, 7, 15, 16, 0, 0, 0, time.Local)
+	end := start.Add(30 * time.Minute)
+	got := BuildVKMArchiveString(start, end, "", defaultVKMParams(), liveOpts)
+
+	wantPeriod := fmt.Sprintf("T=%d-%d;", start.Unix(), end.Unix())
+	if !strings.HasPrefix(got, wantPeriod) {
+		t.Fatalf("got %q, want prefix %q", got, wantPeriod)
 	}
 }

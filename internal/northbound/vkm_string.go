@@ -71,13 +71,7 @@ func BuildVKMArchiveString(start, end time.Time, timeLayout string, params []VKM
 	}
 
 	if opts&vkmOptNoAbsTime == 0 {
-		var period string
-		if opts&vkmOptMaxDigits != 0 {
-			period = fmt.Sprintf("%d-%d", start.Unix(), end.Unix())
-		} else {
-			period = start.Format(timeLayout) + "-" + end.Format(timeLayout)
-		}
-		writeParam("T", "Период", period, "")
+		writeParam("T", "Период", vkmPeriodValue(start, end, timeLayout, opts), "")
 	}
 
 	for _, p := range params {
@@ -108,4 +102,27 @@ func defaultVKMParams() []VKMParam {
 		{Tag: "M", Header: "Масса", Value: "678.90", ValueFull: "678.900000", Unit: "кг"},
 		{Tag: "t", Header: "Температура", Value: "45.6", ValueFull: "45.600000", Unit: "°C"},
 	}
+}
+
+// vkmPeriodValue renders the period parameter's value.
+//
+// Option bit3 reads "выдавать максимальное количество знаков для значений
+// с плавающей запятой и время в секундах". That trailing clause is
+// ambiguous and the choice matters on the wire, so BOTH readings are
+// implemented and selectable from vkm_config.txt (period_format), letting
+// the alternative be tried on the live server without a rebuild:
+//
+//	period_format = datetime  (default) — timestamps to SECOND precision,
+//	                                      i.e. "и время в секундах" means
+//	                                      include the seconds field.
+//	period_format = unix                — timestamps as Unix epoch seconds.
+//
+// "datetime" is the default because, read in context alongside "максимальное
+// количество знаков", the clause most plausibly describes PRECISION rather
+// than a change of epoch.
+func vkmPeriodValue(start, end time.Time, timeLayout string, opts uint16) string {
+	if loadVKMConfig().periodFormat == "unix" && opts&vkmOptMaxDigits != 0 {
+		return fmt.Sprintf("%d-%d", start.Unix(), end.Unix())
+	}
+	return start.Format(timeLayout) + "-" + end.Format(timeLayout)
 }

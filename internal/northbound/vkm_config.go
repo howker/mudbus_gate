@@ -20,6 +20,7 @@ import (
 //	clock_offset_sec = 0    # shift reported device clock by ±N seconds
 //	min_ready_ms = 0        # keep status "collecting" for at least N ms
 //	                        # after a request before reporting "ready"
+//	period_format = datetime  # datetime | unix — period rendering (opts bit3)
 //	time_layout = 02.01.2006 15:04:05   # timestamp format inside the string
 //	archive_string = ...    # raw override; leave unset to auto-build a
 //	                        # spec-compliant string (period + parameters)
@@ -34,6 +35,7 @@ type vkmConfig struct {
 	minReady      time.Duration
 	archiveString string
 	timeLayout    string
+	periodFormat  string
 }
 
 func defaultVKMConfig() vkmConfig {
@@ -45,6 +47,7 @@ func defaultVKMConfig() vkmConfig {
 		// or ConfigArchiveSource.Fallback) is used unless the config file
 		// explicitly overrides it.
 		archiveString: "",
+		periodFormat:  "datetime",
 	}
 }
 
@@ -128,6 +131,13 @@ func parseVKMConfig(text string) vkmConfig {
 			}
 		case "archive_string":
 			cfg.archiveString = val
+		case "period_format":
+			// How the period parameter renders when opts bit3 is set:
+			// "datetime" (second-precision timestamps) or "unix" (epoch
+			// seconds). See vkmPeriodValue.
+			if v := stripInlineComment(val); v == "datetime" || v == "unix" {
+				cfg.periodFormat = v
+			}
 		case "time_layout":
 			// Go reference-time layout for timestamps inside the archive
 			// string, e.g. "02.01.2006 15:04:05" or "02.01.06 15:04".
