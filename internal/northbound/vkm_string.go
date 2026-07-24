@@ -11,40 +11,81 @@ import (
 type VKMParam struct {
 	Tag    string // short latin/digit identifier, e.g. "M"
 	Header string // archive form header text, goes in {curly braces}
-	Value  string // value as text
-	Unit   string // unit text; appended WITHOUT a space (per the doc)
+	Value  string // value as text (used when opts bit3 is clear)
+	// ValueFull is the max-precision rendering used when opts bit3
+	// ("максимальное количество знаков") is set; falls back to Value if
+	// empty.
+	ValueFull string
+	Unit      string // unit text; appended WITHOUT a space (per the doc)
 }
 
-// BuildVKMArchiveString assembles an archive result string exactly as the
-// ЭЛЕМЕР-ВКМ-360 register map specifies (p.7, "Чтение архивов"):
+// Option bits of request register 7914, per the ЭЛЕМЕР-ВКМ-360 register
+// map. The result string's shape depends on these — found live: ЭС
+// requests opts=12 (tags + max-precision/seconds, NO headers) and rejects
+// a string that includes {headers} it never asked for ("Неверный формат
+// пакета", vkm_live.jsonl 24.07.2026).
+const (
+	vkmOptUserUnits = 1 << 0 // 1: user-configured units; 0: standard units
+	vkmOptHeaders   = 1 << 1 // include {header} info from the archive form
+	vkmOptTags      = 1 << 2 // include parameter tags
+	vkmOptMaxDigits = 1 << 3 // max float digits AND times as seconds
+	vkmOptNoAbsTime = 1 << 4 // exclude absolute time marks
+)
+
+// BuildVKMArchiveString assembles an archive result string per the
+// ЭЛЕМЕР-ВКМ-360 register map (p.7, "Чтение архивов"), SHAPED BY the
+// options register (7914) from the master's own request:
 //
-//	[тэг 1]{шапка}=<start> - <end>;[тэг 2]{шапка}=<значение><ед.изм.>;…[NUL]
+//	[тэг][{шапка}]=<start>-<end>;[тэг][{шапка}]=<значение><ед.изм.>;…[NUL]
 //
-// Three rules from that spec that our earlier hand-written test string all
-// violated — and which are why Энергосфера read the string and rejected it:
-//
-//  1. The FIRST parameter is not data: it is the collection PERIOD, given
-//     as two timestamps separated by "-". This is the archive record's
-//     timestamp; without it the driver has no interval to file the data
-//     under, so the ОИ debt never closes.
-//  2. The unit follows the value with NO separating space.
-//  3. The string terminates with a NUL byte (ANSI string convention), and
-//     register 8002 counts that byte.
-//
-// The period is taken from the request the master actually wrote into
-// 7902-7913, so the reply always describes the window that was asked for.
-func BuildVKMArchiveString(start, end time.Time, timeLayout string, params []VKMParam) string {
+// Spec rules honored here:
+//   - The FIRST parameter is the collection PERIOD — two timestamps
+//     separated by "-". With opts bit3 set, timestamps are rendered as
+//     seconds (Unix epoch — the doc says "время в секундах" without
+//     pinning the epoch; overridable later if a real device shows
+//     otherwise).
+//   - {header} is included ONLY when opts bit1 requests it.
+//   - The tag is included ONLY when opts bit2 requests it.
+//   - Units follow the value with NO space.
+//   - opts bit4 drops the absolute-time (period) parameter entirely.
+//   - The string ends with a NUL byte, counted by register 8002.
+func BuildVKMArchiveString(start, end time.Time, timeLayout string, params []VKMParam, opts uint16) string {
 	if timeLayout == "" {
 		timeLayout = VKMDefaultTimeLayout
 	}
 	var b strings.Builder
 
-	// Parameter 1 — the period. Tag/header are conventional; what matters
-	// per the spec is that the value is "<time> - <time>".
-	fmt.Fprintf(&b, "T{Период}=%s-%s;", start.Format(timeLayout), end.Format(timeLayout))
+	writeParam := func(tag, header, value, unit string) {
+		if opts&vkmOptTags != 0 {
+			b.WriteString(tag)
+		}
+		if opts&vkmOptHeaders != 0 {
+			b.WriteString("{")
+			b.WriteString(header)
+			b.WriteString("}")
+		}
+		b.WriteString("=")
+		b.WriteString(value)
+		b.WriteString(unit)
+		b.WriteString(";")
+	}
+
+	if opts&vkmOptNoAbsTime == 0 {
+		var period string
+		if opts&vkmOptMaxDigits != 0 {
+			period = fmt.Sprintf("%d-%d", start.Unix(), end.Unix())
+		} else {
+			period = start.Format(timeLayout) + "-" + end.Format(timeLayout)
+		}
+		writeParam("T", "Период", period, "")
+	}
 
 	for _, p := range params {
-		fmt.Fprintf(&b, "%s{%s}=%s%s;", p.Tag, p.Header, p.Value, p.Unit)
+		v := p.Value
+		if opts&vkmOptMaxDigits != 0 && p.ValueFull != "" {
+			v = p.ValueFull
+		}
+		writeParam(p.Tag, p.Header, v, p.Unit)
 	}
 
 	b.WriteByte(0) // ANSI string terminator, counted in register 8002
@@ -52,10 +93,11 @@ func BuildVKMArchiveString(start, end time.Time, timeLayout string, params []VKM
 }
 
 // VKMDefaultTimeLayout is the timestamp format used inside the archive
-// string. The register map does not pin the exact layout ("две записи
-// времени"), so this Russian-conventional form is the default and is
-// overridable from vkm_config.txt (time_layout) — letting alternatives be
-// tried on the live server without a rebuild.
+// string when opts bit3 (seconds) is not set. The register map does not
+// pin the exact layout ("две записи времени"), so this Russian-
+// conventional form is the default and is overridable from vkm_config.txt
+// (time_layout) — letting alternatives be tried on the live server without
+// a rebuild.
 const VKMDefaultTimeLayout = "02.01.2006 15:04:05"
 
 // defaultVKMParams is the stand-in data payload used until a real ВКМ is
@@ -63,7 +105,7 @@ const VKMDefaultTimeLayout = "02.01.2006 15:04:05"
 // historically came through to Энергосфера from the real device.
 func defaultVKMParams() []VKMParam {
 	return []VKMParam{
-		{Tag: "M", Header: "Масса", Value: "678.90", Unit: "кг"},
-		{Tag: "t", Header: "Температура", Value: "45.6", Unit: "°C"},
+		{Tag: "M", Header: "Масса", Value: "678.90", ValueFull: "678.900000", Unit: "кг"},
+		{Tag: "t", Header: "Температура", Value: "45.6", ValueFull: "45.600000", Unit: "°C"},
 	}
 }

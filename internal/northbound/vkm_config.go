@@ -163,7 +163,7 @@ type ConfigArchiveSource struct {
 	Fallback string // used when the config file specifies no archive_string
 }
 
-func (c ConfigArchiveSource) Archive(pipe int, start, end time.Time) (string, bool) {
+func (c ConfigArchiveSource) Archive(pipe int, start, end time.Time, opts uint16) (string, bool) {
 	cfg := loadVKMConfig()
 
 	// A literal archive_string in the config wins outright — an escape
@@ -185,5 +185,5 @@ func (c ConfigArchiveSource) Archive(pipe int, start, end time.Time) (string, bo
 	if end.IsZero() {
 		end = start.Add(time.Hour)
 	}
-	return BuildVKMArchiveString(start, end, cfg.timeLayout, defaultVKMParams()), true
+	return BuildVKMArchiveString(start, end, cfg.timeLayout, defaultVKMParams(), opts), true
 }

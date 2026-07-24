@@ -48,14 +48,17 @@ type VKMArchiveResponder struct {
 // backed implementation comes later; FixedVKMSource covers the mechanism
 // build and tests.
 type VKMArchiveSource interface {
-	Archive(pipe int, start, end time.Time) (result string, ok bool)
+	// Archive returns the result string for the requested pipe, window and
+	// OPTIONS register (7914) value. The options shape the string format
+	// (tags/headers/precision/time-encoding) — see BuildVKMArchiveString.
+	Archive(pipe int, start, end time.Time, opts uint16) (result string, ok bool)
 }
 
 // FixedVKMSource returns one canned string regardless of pipe/time — the
 // stand-in until real ВКМ archives are wired in.
 type FixedVKMSource struct{ Result string }
 
-func (f FixedVKMSource) Archive(pipe int, start, end time.Time) (string, bool) {
+func (f FixedVKMSource) Archive(pipe int, start, end time.Time, opts uint16) (string, bool) {
 	if f.Result == "" {
 		return "", false
 	}
@@ -196,7 +199,7 @@ func (r *VKMArchiveResponder) startCollection() {
 	start := r.assembleTime(vkmStartReg)
 	end := r.assembleTime(vkmEndReg)
 
-	res, ok := r.src.Archive(pipe, start, end)
+	res, ok := r.src.Archive(pipe, start, end, r.regs[vkmOptsReg])
 	r.result = res
 	r.haveResult = ok
 	r.haveReq = true
