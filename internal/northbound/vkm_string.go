@@ -95,12 +95,17 @@ func BuildVKMArchiveString(start, end time.Time, timeLayout string, params []VKM
 const VKMDefaultTimeLayout = "02.01.2006 15:04:05"
 
 // defaultVKMParams is the stand-in data payload used until a real ВКМ is
-// available to read from: mass and temperature, the two values that
-// historically came through to Энергосфера from the real device.
+// available to read from. ONLY mass — not temperature. Found live: the
+// same УВП280А.01-МЭ driver's channel list (Console администратора ПК
+// Энергосфера, "Каналы" tab, another point using this exact driver type)
+// classifies "Масса" as a type-B (archive) channel but "Температура" as
+// type-G (CURRENT value, polled via FC04 on 2000+, not the archive
+// string). Putting temperature inside the archive string may itself have
+// been part of why the string was rejected — see currentBlockVKM for
+// where temperature is now served instead.
 func defaultVKMParams() []VKMParam {
 	return []VKMParam{
 		{Tag: "M", Header: "Масса", Value: "678.90", ValueFull: "678.900000", Unit: "кг"},
-		{Tag: "t", Header: "Температура", Value: "45.6", ValueFull: "45.600000", Unit: "°C"},
 	}
 }
 
