@@ -102,6 +102,16 @@ func loadVKMConfig() vkmConfig {
 }
 
 func parseVKMConfig(text string) vkmConfig {
+	// Strip a leading UTF-8 BOM: Windows PowerShell 5.1's
+	// `Set-Content -Encoding UTF8` writes one by default, which — left
+	// in place — glues onto the FIRST line's key (e.g. "\ufeffyear_mode")
+	// and silently fails to match, reverting that one setting to its
+	// default. Found live: re-saving vkm_config.txt as UTF-8 to fix
+	// Cyrillic encoding in archive_string silently disabled year_mode
+	// (first line in the file), which brought back the multi-billion-
+	// second clock skew that halts ЭС polling entirely (24.07.2026).
+	text = strings.TrimPrefix(text, "\uFEFF")
+
 	cfg := defaultVKMConfig()
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)

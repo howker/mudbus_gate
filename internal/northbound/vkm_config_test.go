@@ -37,3 +37,15 @@ func TestParseVKMConfig_DefaultsOnEmptyOrBad(t *testing.T) {
 		t.Errorf("invalid offset should stay 0, got %v", cfg.clockOffset)
 	}
 }
+
+// TestParseVKMConfig_StripsBOM reproduces the live regression: PowerShell's
+// `Set-Content -Encoding UTF8` writes a UTF-8 BOM, which glued onto the
+// first line's key and silently disabled year_mode, bringing back the
+// clock skew that halts ЭС polling (24.07.2026).
+func TestParseVKMConfig_StripsBOM(t *testing.T) {
+	text := "\uFEFFyear_mode = y2000\nclock_offset_sec = 0\n"
+	cfg := parseVKMConfig(text)
+	if cfg.yearMode != "y2000" {
+		t.Fatalf("BOM broke year_mode parsing: got %q, want y2000", cfg.yearMode)
+	}
+}
