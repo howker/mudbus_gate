@@ -41,6 +41,16 @@ type VKMArchiveResponder struct {
 	statusPolls    int
 	haveResult     bool
 	result         string
+
+	// paramMapIndex is the (pipe<<8 | row) code most recently written to
+	// 7600, per the ЭЛЕМЕР-ВКМ-360 "Чтение карты параметров" mechanism —
+	// a driver can enumerate a pipe's parameter NAMES (7700-7770) and
+	// VALUES (7800-7870) row by row before ever touching the archive
+	// protocol. This exists purely because the real ВКМ-360 register map
+	// documents it and we had implemented NOTHING for 7600/7700/7800 —
+	// any driver attempt to discover real tag names got silence. Answering
+	// it (even with placeholder names) is strictly better than that.
+	paramMapIndex uint16
 }
 
 // VKMArchiveSource yields the УВП-format result string for a pipe and time
@@ -122,16 +132,20 @@ func defaultVKMIdentityRegs() map[int]uint16 {
 
 // УВП-280.01 archive register addresses and status codes.
 const (
-	vkmReqIDReg   = 7900
-	vkmClockReg   = 1800 // day,month,year,hour,minute,second (plain int16 each)
-	vkmPipeReg    = 7901
-	vkmStartReg   = 7902 // 7902..7907 = day,month,year,hour,min,sec (start)
-	vkmEndReg     = 7908 // 7908..7913 = day,month,year,hour,min,sec (end)
-	vkmOptsReg    = 7914 // written LAST; triggers collection
-	vkmStatusReg  = 8000
-	vkmReqEchoReg = 8001
-	vkmLenReg     = 8002
-	vkmDataReg    = 8003
+	vkmReqIDReg = 7900
+	vkmClockReg = 1800 // day,month,year,hour,minute,second (plain int16 each)
+
+	vkmParamMapReg  = 7600 // write: (pipe<<8)|rowIndex, per the doc
+	vkmParamNameReg = 7700 // read: ANSI string[140], param name
+	vkmParamValReg  = 7800 // read: ANSI string[140], param value
+	vkmPipeReg      = 7901
+	vkmStartReg     = 7902 // 7902..7907 = day,month,year,hour,min,sec (start)
+	vkmEndReg       = 7908 // 7908..7913 = day,month,year,hour,min,sec (end)
+	vkmOptsReg      = 7914 // written LAST; triggers collection
+	vkmStatusReg    = 8000
+	vkmReqEchoReg   = 8001
+	vkmLenReg       = 8002
+	vkmDataReg      = 8003
 
 	vkmStatusCollecting = 1
 	vkmStatusReady      = 2
@@ -162,6 +176,9 @@ func (r *VKMArchiveResponder) writeSingle(pdu []byte) []byte {
 	r.regs[addr] = val
 	if addr == vkmOptsReg {
 		r.startCollection()
+	}
+	if addr == vkmParamMapReg {
+		r.paramMapIndex = val
 	}
 	// FC06 echoes the request (addr + value).
 	return append([]byte{0x06}, pdu[1:5]...)
@@ -250,6 +267,10 @@ func (r *VKMArchiveResponder) read(pdu []byte) []byte {
 		return r.lengthResponse(fc, qty)
 	case vkmDataReg:
 		return r.dataResponse(fc, qty)
+	case vkmParamNameReg:
+		return ansiStringResponse(fc, qty, r.paramMapName())
+	case vkmParamValReg:
+		return ansiStringResponse(fc, qty, r.paramMapValue())
 	}
 
 	// Fall back to the static identification/status register map for any
@@ -299,6 +320,57 @@ func (r *VKMArchiveResponder) read(pdu []byte) []byte {
 	// enumerated yet is far more robust than trying to guess every
 	// register the driver might ever ask for.
 	return exceptionResponse(fc, 0x02) // ExceptionIllegalDataAddress
+}
+
+// paramMapName returns the name for the row currently selected via 7600
+// (paramMapIndex = pipe<<8 | rowIndex), per the ЭЛЕМЕР-ВКМ-360 "Чтение
+// карты параметров" mechanism. Row 0 is the first parameter, and per the
+// same tag/header vocabulary the archive string uses (defaultVKMParams) —
+// this is deliberately the SAME source of truth, not a second invented
+// list, so a driver that cross-checks discovered names against archive
+// tags sees a consistent picture. An out-of-range row yields an empty
+// name (the doc: "если заказанный параметр отсутствует... строка будет
+// иметь нулевую длину").
+func (r *VKMArchiveResponder) paramMapName() string {
+	row := int(r.paramMapIndex & 0xFF)
+	params := defaultVKMParams()
+	if row < 0 || row >= len(params) {
+		return ""
+	}
+	return params[row].Header
+}
+
+// paramMapValue mirrors paramMapName for the VALUE side (7800+).
+func (r *VKMArchiveResponder) paramMapValue() string {
+	row := int(r.paramMapIndex & 0xFF)
+	params := defaultVKMParams()
+	if row < 0 || row >= len(params) {
+		return ""
+	}
+	return params[row].ValueFull
+}
+
+// ansiStringResponse serves an ANSI (Windows-1251) string block read,
+// padded/truncated to qty registers — the same wire shape as
+// dataResponse, reused here for the 7700/7800 parameter-map registers.
+func ansiStringResponse(fc byte, qty int, s string) []byte {
+	if qty < 1 {
+		qty = 1
+	}
+	payload := cp1251Encode(s)
+	maxBytes := qty * 2
+	if len(payload) > maxBytes {
+		payload = payload[:maxBytes]
+	} else {
+		padded := make([]byte, maxBytes)
+		copy(padded, payload)
+		payload = padded
+	}
+	resp := make([]byte, 2+len(payload))
+	resp[0] = fc
+	resp[1] = byte(len(payload))
+	copy(resp[2:], payload)
+	return resp
 }
 
 // exceptionResponse builds a standard Modbus exception PDU:
@@ -364,7 +436,46 @@ func currentBlockVKM(fc, funcCode byte, addr, qty int) ([]byte, bool) {
 	if qty < 1 || addr < areaStart || addr+qty > areaEnd {
 		return nil, false
 	}
-	data := make([]byte, qty*2) // all zeros
+	data := make([]byte, qty*2)
+	// Populate the documented current-parameter offsets within each pipe's
+	// block (2000+(ТП-1)*100+off, IR float, byte order 0123h) with real
+	// stand-in values. Per modbus_uvp280_01.pdf p.6-7 these are the type-G
+	// current registers the УВП-280 driver reads via FC04 — and the reason
+	// the operator could only get mass+temperature from the real device is
+	// that ЭS reads THESE registers, and anything we left at zero (pressure
+	// at +0/+2, ENERGY at +18) simply came through as absent. Filling them
+	// makes pressure and heat energy available too, which is the whole
+	// point of this milestone.
+	//
+	// Offsets (float32, big-endian words) per the doc:
+	//   +0  Избыточное давление (Па)   +2  Абсолютное давление (Па)
+	//   +4  Температура (°C)           +6  Энтальпия (Дж/кг)
+	//   +8  Массовый расход (кг/с)     +10 Масса (кг)
+	//   +16 Тепловая мощность (Вт)     +18 Тепловая энергия (Дж)
+	curVals := map[int][2]uint16{
+		0:  {0x4812, 0x7C00}, // 150000 Па изб. давление
+		2:  {0x4874, 0x2400}, // 250000 Па абс. давление
+		4:  {0x4236, 0x6666}, // 45.6 °C температура
+		6:  {0x4A18, 0x9680}, // 2.5e6 Дж/кг энтальпия
+		8:  {0x3EF8, 0x51EC}, // 0.485 кг/с массовый расход
+		10: {0x4429, 0xB99A}, // 678.9 кг масса
+		16: {0x463B, 0x8000}, // 12000 Вт тепловая мощность
+		18: {0x4FA3, 0xE9AC}, // 5.5e9 Дж тепловая энергия
+	}
+	for i := 0; i < qty; i++ {
+		off := (addr + i - areaStart) % 100
+		words, ok := curVals[off/2*2]
+		if !ok {
+			continue
+		}
+		var w uint16
+		if off%2 == 0 {
+			w = words[0] // high word at even offset
+		} else {
+			w = words[1] // low word at odd offset
+		}
+		data[i*2], data[i*2+1] = byte(w>>8), byte(w)
+	}
 	resp := make([]byte, 0, 2+len(data))
 	resp = append(resp, fc, byte(len(data)))
 	return append(resp, data...), true

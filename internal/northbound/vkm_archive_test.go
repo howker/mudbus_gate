@@ -437,3 +437,84 @@ func TestVKM_AssembleTime_DecodesYearWithSameMode(t *testing.T) {
 		t.Fatalf("assembleTime = %v, want 15.07.2026 16:00", got)
 	}
 }
+
+// TestVKM_CurrentBlock_KeyParameters verifies the documented current-value
+// offsets carry real values (not zero): pressure (+0), temperature (+4),
+// and — the whole point of this milestone — heat ENERGY (+18). The
+// operator could only read mass+temperature from the real device because
+// ЭS reads these current registers and anything left zero (energy,
+// pressure) came through absent.
+func TestVKM_CurrentBlock_KeyParameters(t *testing.T) {
+	r := NewVKMArchiveResponder(FixedVKMSource{})
+
+	readFloat := func(off int) float32 {
+		addr := 2000 + off
+		hi, lo := byte(addr>>8), byte(addr&0xFF)
+		resp := r.Respond([]byte{0x04, hi, lo, 0x00, 0x02})
+		if resp == nil || resp[0] == (0x04|0x80) {
+			t.Fatalf("offset +%d read failed: % X", off, resp)
+		}
+		return math.Float32frombits(binary.BigEndian.Uint32(resp[2:6]))
+	}
+
+	if v := readFloat(4); v < 45.5 || v > 45.7 {
+		t.Errorf("temperature (+4) = %v, want ~45.6", v)
+	}
+	if v := readFloat(0); v < 149000 || v > 151000 {
+		t.Errorf("pressure (+0) = %v, want ~150000", v)
+	}
+	if v := readFloat(18); v < 5.4e9 || v > 5.6e9 {
+		t.Errorf("heat energy (+18) = %v, want ~5.5e9 J", v)
+	}
+	if v := readFloat(10); v < 678 || v > 679 {
+		t.Errorf("mass (+10) = %v, want ~678.9", v)
+	}
+}
+
+// TestVKM_ParameterMap_NameAndValue covers the ЭЛЕМЕР-ВКМ-360 "Чтение
+// карты параметров" mechanism (7600 write → 7700 name / 7800 value read),
+// found in the real ВКМ-360 register map — a driver can enumerate a
+// pipe's real parameter names/tags BEFORE building an archive request.
+// We had implemented NOTHING for this before; any driver attempt got
+// silence.
+func TestVKM_ParameterMap_NameAndValue(t *testing.T) {
+	r := NewVKMArchiveResponder(FixedVKMSource{})
+
+	// Write 7600 = (pipe=1)<<8 | row=0 → select the first parameter (Масса).
+	resp := r.Respond(fc06(7600, (1<<8)|0))
+	if resp == nil {
+		t.Fatal("7600 write got no response")
+	}
+
+	// Read name at 7700 — enough registers to cover "Масса" in cp1251.
+	nameResp := r.Respond(fc03(7700, 10))
+	name := nameResp[2 : 2+len(cp1251Encode("Масса"))]
+	if string(name) != string(cp1251Encode("Масса")) {
+		t.Fatalf("param name = % X, want cp1251(%q) = % X", name, "Масса", cp1251Encode("Масса"))
+	}
+
+	// Read value at 7800.
+	valResp := r.Respond(fc03(7800, 10))
+	wantVal := cp1251Encode("678.900000")
+	val := valResp[2 : 2+len(wantVal)]
+	if string(val) != string(wantVal) {
+		t.Fatalf("param value = % X, want % X", val, wantVal)
+	}
+}
+
+// TestVKM_ParameterMap_OutOfRangeRow verifies an unavailable row yields a
+// zero-length STRING (first byte 0x00, "конец строки" per the doc) — the
+// response still carries the full qty*2 bytes requested (a valid Modbus
+// read can't return fewer registers than asked), just zero-padded.
+func TestVKM_ParameterMap_OutOfRangeRow(t *testing.T) {
+	r := NewVKMArchiveResponder(FixedVKMSource{})
+	r.Respond(fc06(7600, (1<<8)|99)) // row 99 doesn't exist
+
+	nameResp := r.Respond(fc03(7700, 5))
+	if nameResp[1] != 10 {
+		t.Fatalf("byteCount = %d, want 10 (qty*2, full read)", nameResp[1])
+	}
+	if nameResp[2] != 0 {
+		t.Fatalf("first byte = 0x%02X, want 0x00 (empty C-string)", nameResp[2])
+	}
+}
