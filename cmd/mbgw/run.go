@@ -54,6 +54,16 @@ func run() {
 	if err := repo.InitSchema(context.Background()); err != nil {
 		log.Fatalf("[FATAL] ошибка инициализации схемы: %v", err)
 	}
+	// InitArchiveSchema creates archive_hourly (see
+	// internal/storage/sqlite/repo_archive.go) — separate from InitSchema
+	// because it was added later, alongside the M4 Akron work. Missing
+	// this call worked by accident so far only because mbgw.db already
+	// had the table from earlier seedakron/testing use of the same file;
+	// on a genuinely fresh database, PollArchives' SaveHourlyArchive call
+	// would fail with "no such table: archive_hourly".
+	if err := repo.InitArchiveSchema(context.Background()); err != nil {
+		log.Fatalf("[FATAL] ошибка инициализации схемы архива: %v", err)
+	}
 	log.Printf("[OK] Хранилище инициализировано (%s)\n", cfg.App.StoragePath)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
