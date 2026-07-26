@@ -15,20 +15,42 @@ type Repo struct {
 }
 
 func New(path string) (*Repo, error) {
-	// _busy_timeout makes SQLite wait and retry internally instead of
-	// immediately returning SQLITE_BUSY when another writer holds the lock.
-	// journal_mode=WAL reduces reader/writer contention. SetMaxOpenConns(1)
-	// serializes all access through a single connection, which is the
-	// simplest correct way to avoid concurrent-writer lock errors when
-	// multiple device goroutines write to the same SQLite file from one
-	// process (see: two devices polling in parallel caused
-	// "database is locked (SQLITE_BUSY)" once a second device was added).
-	dsn := path + "?_busy_timeout=5000&_journal_mode=WAL"
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+
+	// PRAGMAs are set via an explicit exec, not DSN query parameters
+	// (`?_busy_timeout=...&_journal_mode=...`), because that DSN syntax
+	// is mattn/go-sqlite3's convention — this project uses
+	// modernc.org/sqlite (pure Go, no cgo), which does not necessarily
+	// recognize the same query-parameter names, and unrecognized DSN
+	// keys are typically ignored rather than erroring. That silent
+	// ignoring is exactly what caused "database is locked (SQLITE_BUSY)"
+	// errors to appear IMMEDIATELY (no retry delay) once a second
+	// process (the northbound carrier) started reading the same file
+	// while the southbound poller was writing to it — the busy_timeout
+	// was never actually taking effect. Executing PRAGMA statements
+	// directly against the open connection works reliably regardless of
+	// driver-specific DSN parsing quirks.
+	//
+	// journal_mode=WAL lets readers and a writer proceed concurrently
+	// (the normal DELETE journal mode locks the whole file for any
+	// write); busy_timeout makes a connection that DOES hit a lock wait
+	// and retry internally for up to 5s instead of failing immediately.
+	// SetMaxOpenConns(1) above still serializes access WITHIN this one
+	// process (matters when multiple devices poll in parallel); WAL +
+	// busy_timeout is what makes two SEPARATE mbgw.exe processes (e.g.
+	// `mbgw run` and `mbgw northbound --serve-akron`) sharing one
+	// mbgw.db file work correctly together.
+	if _, err := db.ExecContext(context.Background(), "PRAGMA journal_mode=WAL;"); err != nil {
+		return nil, fmt.Errorf("set journal_mode=WAL: %w", err)
+	}
+	if _, err := db.ExecContext(context.Background(), "PRAGMA busy_timeout=5000;"); err != nil {
+		return nil, fmt.Errorf("set busy_timeout: %w", err)
+	}
+
 	return &Repo{db: db}, nil
 }
 

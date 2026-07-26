@@ -41,6 +41,8 @@ import (
 	"mbgw/internal/codec"
 	"mbgw/internal/protocol/akron"
 	"mbgw/internal/protocol/modbus"
+	"mbgw/internal/storage"
+	sqliterepo "mbgw/internal/storage/sqlite"
 	"mbgw/internal/transport"
 )
 
@@ -59,6 +61,9 @@ func main() {
 	timeout := flag.Duration("timeout", time.Second, "response timeout")
 	retries := flag.Int("retries", 3, "transport retries")
 	hourly := flag.Int("hourly", 0, "if >0, also read that many hourly-archive rows (raw hex)")
+	savePassport := flag.Bool("save-passport", false, "persist the real device passport (101 response) into SQLite, so the northbound carrier can answer identification (101) — see internal/storage.SaveDevicePassport")
+	dbPath := flag.String("db", "", "SQLite path (required with --save-passport) — MUST be the same file the southbound poller (mbgw run) and northbound carrier use")
+	deviceID := flag.String("device", "", "device id in the database (required with --save-passport) — MUST match config.yaml's devices[].id")
 	flag.Parse()
 
 	var params transport.Params
@@ -107,10 +112,19 @@ func main() {
 	}
 
 	// --- Command 101: identification ---
+	var ident akronIdentity
+	var identOK bool
 	if data, err := transact(ctx, tr, uint8(*unit), akron.BuildIdentificationPDU(), akron.CmdIdentification); err != nil {
 		fmt.Printf("101 идентификация: ОШИБКА: %v\n", err)
+	} else if ident, identOK = decodeIdentification(data); identOK {
+		printIdentification(ident)
 	} else {
-		printIdentification(data)
+		fmt.Printf("101 идентификация: короткий ответ (% X)\n", data)
+	}
+
+	if *savePassport {
+		fmt.Println()
+		savePassportToDB(ctx, ident, identOK, *dbPath, *deviceID)
 	}
 
 	fmt.Println()
@@ -252,19 +266,74 @@ func transact(ctx context.Context, tr transport.Transport, unit uint8, reqPDU []
 	return data, nil
 }
 
-func printIdentification(data []byte) {
-	// [type 1B][version 1B BCD][serial 4B word], per the document.
+// akronIdentity is the decoded command-101 response.
+type akronIdentity struct {
+	DeviceType byte
+	VerBCD     byte
+	Serial     uint32
+}
+
+func decodeIdentification(data []byte) (akronIdentity, bool) {
+	// [type 1B][version 1B BCD][serial 4B LE word], per the document.
 	if len(data) < 6 {
-		fmt.Printf("101 идентификация: короткий ответ (% X)\n", data)
-		return
+		return akronIdentity{}, false
 	}
-	devType := data[0]
-	verBCD := data[1]
-	serial := binary.LittleEndian.Uint32(data[2:6])
+	return akronIdentity{
+		DeviceType: data[0],
+		VerBCD:     data[1],
+		Serial:     binary.LittleEndian.Uint32(data[2:6]),
+	}, true
+}
+
+func printIdentification(id akronIdentity) {
 	fmt.Println("101 идентификация:")
-	fmt.Printf("  тип прибора:     0x%02X\n", devType)
-	fmt.Printf("  версия ПО:       %d.%d\n", verBCD>>4, verBCD&0x0F)
-	fmt.Printf("  заводской номер: %d\n", serial)
+	fmt.Printf("  тип прибора:     0x%02X\n", id.DeviceType)
+	fmt.Printf("  версия ПО:       %d.%d\n", id.VerBCD>>4, id.VerBCD&0x0F)
+	fmt.Printf("  заводской номер: %d\n", id.Serial)
+}
+
+// savePassportToDB writes the REAL, just-read device identity into the
+// SAME SQLite database the southbound poller (mbgw run) and northbound
+// carrier (mbgw northbound --serve-akron) both use, via
+// storage.SaveDevicePassport — the exact call tools/seedakron uses for its
+// fake test values, but here with values read live off the actual device
+// instead of hand-picked ones.
+//
+// Why this is needed at all: the northbound carrier stays SILENT on
+// command 101 until a passport row exists ("паспорт ещё не собран — на
+// 101 молчим", internal/northbound/akron_live.go) — the southbound poller
+// (mbgw run) never writes one on its own, since identification is a
+// one-off static fact about the device, not a per-cycle reading. This is
+// a manual, run-once (or run-when-it-changes) step, not part of the
+// regular poll loop.
+func savePassportToDB(ctx context.Context, id akronIdentity, identOK bool, dbPath, deviceID string) {
+	if dbPath == "" || deviceID == "" {
+		fmt.Println("--save-passport требует --db <путь> и --device <id>")
+		os.Exit(2)
+	}
+	if !identOK {
+		fmt.Println("--save-passport: идентификация не получена, паспорт не сохранён")
+		os.Exit(1)
+	}
+
+	repo, err := sqliterepo.New(dbPath)
+	if err != nil {
+		fatal("открытие БД для сохранения паспорта", err)
+	}
+	defer repo.Close()
+
+	fw := fmt.Sprintf("%d.%d", id.VerBCD>>4, id.VerBCD&0x0F)
+	err = repo.SaveDevicePassport(ctx, storage.DevicePassport{
+		DeviceID:   deviceID,
+		DeviceType: id.DeviceType,
+		Firmware:   fw,
+		Serial:     id.Serial,
+	})
+	if err != nil {
+		fatal("сохранение паспорта", err)
+	}
+	fmt.Printf("паспорт сохранён: device=%s type=0x%02X fw=%s serial=%d (%s)\n",
+		deviceID, id.DeviceType, fw, id.Serial, dbPath)
 }
 
 func printCurrent(data []byte) {
