@@ -78,6 +78,22 @@ func persistAkronHourly(ctx context.Context, repo storage.Repo, deviceID string,
 // row's BCD calendar fields. Returns ok=false if any field is missing or
 // out of the valid calendar range, so filler/garbage rows are dropped
 // instead of producing a plausible-but-wrong time.
+//
+// A field-by-field range check (hour 0-23, day 1-31, etc.) is not enough:
+// a corrupted/misaligned read (e.g. a serial timeout mid-frame) can still
+// produce bytes that are individually in-range but jointly nonsense — a
+// real incident produced "07.06.2044" this way, which then sat forever as
+// the "newest" archive row for GetHourlyArchiveDesc's ORDER BY ts_hour
+// DESC, silently shadowing every real row collected afterwards. The extra
+// sanity window below (future/past bounds against wall-clock now) is a
+// cheap backstop against exactly that class of bug: any BCD combination
+// that decodes to a date outside a plausible operating window is treated
+// the same as an out-of-range field — dropped, not stored.
+const (
+	akronMaxFutureSkew = 24 * time.Hour       // clock drift/timezone slop allowance
+	akronMaxPastSkew   = 400 * 24 * time.Hour // > Akron's own ~80-day (1925h) ring buffer, with margin
+)
+
 func akronRowTime(fields map[string]any) (time.Time, bool) {
 	hour, ok1 := fieldInt(fields, "hour")
 	day, ok2 := fieldInt(fields, "day")
@@ -90,7 +106,13 @@ func akronRowTime(fields map[string]any) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	year := 2000 + yy
-	return time.Date(year, time.Month(month), day, hour, 0, 0, 0, time.Local), true
+	ts := time.Date(year, time.Month(month), day, hour, 0, 0, 0, time.Local)
+
+	now := time.Now()
+	if ts.After(now.Add(akronMaxFutureSkew)) || ts.Before(now.Add(-akronMaxPastSkew)) {
+		return time.Time{}, false
+	}
+	return ts, true
 }
 
 // fieldInt/fieldFloat read a decoded record_layout field with the concrete

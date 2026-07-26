@@ -209,6 +209,18 @@ func readHourlyArchive(ctx context.Context, tr transport.Transport, unit uint8, 
 // exactly (kept in sync deliberately — this tool exists to validate that
 // same production decode path against real device bytes). "year" is
 // year-2000 (two BCD digits), matching the device's own convention.
+//
+// Includes the same future/past sanity bound as the other two copies — a
+// corrupted-but-field-valid BCD decode once produced "07.06.2044", which
+// then permanently shadowed real archive rows (see akron_hourly.go's doc
+// comment). This diagnostic tool prints such rows as "не декодировано"
+// instead of a wrong-but-plausible-looking date, matching what production
+// now does with them (dropped, not stored).
+const (
+	akronMaxFutureSkew = 24 * time.Hour
+	akronMaxPastSkew   = 400 * 24 * time.Hour
+)
+
 func akronRowTime(fields map[string]any) (time.Time, bool) {
 	hour, ok1 := fieldInt(fields, "hour")
 	day, ok2 := fieldInt(fields, "day")
@@ -220,7 +232,13 @@ func akronRowTime(fields map[string]any) (time.Time, bool) {
 	if hour < 0 || hour > 23 || day < 1 || day > 31 || month < 1 || month > 12 || yy < 0 || yy > 99 {
 		return time.Time{}, false
 	}
-	return time.Date(2000+yy, time.Month(month), day, hour, 0, 0, 0, time.Local), true
+	ts := time.Date(2000+yy, time.Month(month), day, hour, 0, 0, 0, time.Local)
+
+	now := time.Now()
+	if ts.After(now.Add(akronMaxFutureSkew)) || ts.Before(now.Add(-akronMaxPastSkew)) {
+		return time.Time{}, false
+	}
+	return ts, true
 }
 
 func fieldInt(fields map[string]any, key string) (int, bool) {

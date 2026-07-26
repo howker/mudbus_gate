@@ -191,7 +191,15 @@ func (a akronTransactor) Transact(ctx context.Context, req []byte) ([]byte, erro
 
 // akronRowTime mirrors internal/device/akron_hourly.go's akronRowTime and
 // tools/akronread/main.go's copy of the same logic — kept in sync
-// deliberately across all three call sites.
+// deliberately across all three call sites, including the future/past
+// sanity bound (a corrupted-but-field-valid BCD decode once produced
+// "07.06.2044", which then permanently shadowed real archive rows —
+// see akron_hourly.go's doc comment for the full story).
+const (
+	akronMaxFutureSkew = 24 * time.Hour
+	akronMaxPastSkew   = 400 * 24 * time.Hour
+)
+
 func akronRowTime(fields map[string]any) (time.Time, bool) {
 	hour, ok1 := fieldInt(fields, "hour")
 	day, ok2 := fieldInt(fields, "day")
@@ -203,7 +211,13 @@ func akronRowTime(fields map[string]any) (time.Time, bool) {
 	if hour < 0 || hour > 23 || day < 1 || day > 31 || month < 1 || month > 12 || yy < 0 || yy > 99 {
 		return time.Time{}, false
 	}
-	return time.Date(2000+yy, time.Month(month), day, hour, 0, 0, 0, time.Local), true
+	ts := time.Date(2000+yy, time.Month(month), day, hour, 0, 0, 0, time.Local)
+
+	now := time.Now()
+	if ts.After(now.Add(akronMaxFutureSkew)) || ts.Before(now.Add(-akronMaxPastSkew)) {
+		return time.Time{}, false
+	}
+	return ts, true
 }
 
 func fieldInt(fields map[string]any, key string) (int, bool) {

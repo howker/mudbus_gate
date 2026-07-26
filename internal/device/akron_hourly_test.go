@@ -44,6 +44,41 @@ func TestAkronRowTime_RejectsGarbage(t *testing.T) {
 	}
 }
 
+// TestAkronRowTime_RejectsImplausibleDates is a regression test for a real
+// production incident: a corrupted single-row archive read decoded to
+// hour=4, day=7, month=6, year=44 — every field individually within its
+// valid BCD range, so TestAkronRowTime_RejectsGarbage's checks let it
+// through. The row (07.06.2044) was then stored and, being later than any
+// real row, permanently won GetHourlyArchiveDesc's "ORDER BY ts_hour DESC
+// LIMIT 1", hiding all genuine archive data collected afterwards. Dates
+// computed relative to time.Now() (not hardcoded) so this test keeps
+// working regardless of when it's actually run.
+func TestAkronRowTime_RejectsImplausibleDates(t *testing.T) {
+	now := time.Now()
+
+	farFuture := now.AddDate(0, 0, 2) // 2 days ahead — past the 24h future bound
+	future := map[string]any{
+		"hour":  int64(farFuture.Hour()),
+		"day":   int64(farFuture.Day()),
+		"month": int64(int(farFuture.Month())),
+		"year":  int64(farFuture.Year() % 100),
+	}
+	if _, ok := akronRowTime(future); ok {
+		t.Fatal("far-future date should be rejected — this is the exact bug class that produced 07.06.2044 in production")
+	}
+
+	farPast := now.AddDate(-2, 0, 0) // 2 years back — past the 400-day past bound
+	past := map[string]any{
+		"hour":  int64(farPast.Hour()),
+		"day":   int64(farPast.Day()),
+		"month": int64(int(farPast.Month())),
+		"year":  int64(farPast.Year() % 100),
+	}
+	if _, ok := akronRowTime(past); ok {
+		t.Fatal("far-past date should be rejected")
+	}
+}
+
 func TestFieldFloat_Types(t *testing.T) {
 	if v, ok := fieldFloat(map[string]any{"volume": float64(582.7)}, "volume"); !ok || v != 582.7 {
 		t.Fatalf("float64 volume: got %v ok=%v", v, ok)
