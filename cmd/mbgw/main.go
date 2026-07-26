@@ -14,6 +14,8 @@ func main() {
 	switch cmd {
 	case "run":
 		run()
+	case "serve":
+		serve()
 	case "cli":
 		cli()
 	case "simulate":
@@ -35,7 +37,9 @@ func printHelp() {
 	fmt.Println("Modbus-Shlyuz (mbgw)")
 	fmt.Println("Usage: mbgw <command> [args]")
 	fmt.Println("Commands:")
-	fmt.Println("  run              Start the gateway server")
+	fmt.Println("  run              Start the gateway server (southbound only)")
+	fmt.Println("  serve            Start southbound + northbound Akron carrier in one process")
+	fmt.Println("                   (needs northbound_akron: section in --config; see config.akron_real.yaml)")
 	fmt.Println("  cli              Run CLI command")
 	fmt.Println("  simulate         Run device simulator")
 	fmt.Println("  northbound       Start the northbound Modbus TCP slave")

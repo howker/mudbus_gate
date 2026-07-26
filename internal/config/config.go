@@ -13,6 +13,24 @@ type AppConfig struct {
 		WebPort     int    `yaml:"web_port"`
 	} `yaml:"app"`
 	Devices []DeviceConfig `yaml:"devices"`
+
+	// NorthboundAkron is optional and only read by `mbgw serve` (the
+	// merged single-process southbound+northbound command). When present,
+	// serve also starts the Akron raw-RTU carrier in-process, sharing the
+	// same *sqliterepo.Repo the poller writes through, instead of the
+	// separate `mbgw northbound --serve-akron` process. `mbgw run` never
+	// reads this field, so existing config.yaml files keep working
+	// unchanged whether or not this section is present.
+	NorthboundAkron *NorthboundAkronConfig `yaml:"northbound_akron,omitempty"`
+}
+
+// NorthboundAkronConfig mirrors the flags `mbgw northbound --serve-akron`
+// used to take on the command line (--listen/--device/--log), now sourced
+// from config.yaml instead so `mbgw serve` needs only --config.
+type NorthboundAkronConfig struct {
+	Listen   string `yaml:"listen"`
+	DeviceID string `yaml:"device_id"`
+	Log      string `yaml:"log"` // default: akron_carrier_live.jsonl
 }
 
 type DeviceConfig struct {

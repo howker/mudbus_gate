@@ -17,3 +17,14 @@ devices:
       stopbits: 1
       timeout_ms: 1000
       unit_id: 1 # confirmed live via tools/akronread --unit 1
+
+# Only read by `mbgw serve` (merged single-process southbound+northbound).
+# Same values as the standalone `mbgw northbound --serve-akron --listen
+# 127.0.0.1:15021 --db mbgw.db --device akron_real --log
+# akron_carrier_live.jsonl` invocation used until now — `mbgw run` ignores
+# this section, so nothing changes for the old two-process setup if you
+# keep using `run` + `northbound` instead of `serve`.
+northbound_akron:
+  listen: "127.0.0.1:15021"
+  device_id: "akron_real"
+  log: "akron_carrier_live.jsonl"
