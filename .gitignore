@@ -37,3 +37,6 @@ err.log
 mbgw.exe
 *.db
 mbgw.rar
+*.rar
+*-shm
+*-wal
