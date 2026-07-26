@@ -4,6 +4,11 @@ import (
 	"context"
 	"io"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
 	"mbgw/internal/config"
 	"mbgw/internal/device"
 	"mbgw/internal/lease"
@@ -16,22 +21,31 @@ import (
 	sqliterepo "mbgw/internal/storage/sqlite"
 	"mbgw/internal/transport"
 	"mbgw/internal/web"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
 )
 
+// run starts the gateway. --config <path> selects the config file
+// (default "config.yaml"). Added because a config.yaml already exists in
+// the project for the 4-mock-device smoke-test setup (TEST_STRATEGY.md
+// S3/S6) — a real deployment (e.g. our real Акрон-01 on COM105) needs its
+// own config file without overwriting or conflicting with that one.
 func run() {
+	cfgPath := "config.yaml"
+	for i := 2; i < len(os.Args); i++ {
+		if os.Args[i] == "--config" && i+1 < len(os.Args) {
+			cfgPath = os.Args[i+1]
+			i++
+		}
+	}
+
 	logFile, _ := os.OpenFile("mbgw.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	defer logFile.Close()
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(multiWriter)
 	log.SetFlags(log.Ldate | log.Ltime)
 	log.Println("=== запуск шлюза mbgw ===")
-	cfg, err := config.Load("config.yaml")
+	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		log.Fatalf("[FATAL] ошибка конфигурации: %v", err)
+		log.Fatalf("[FATAL] ошибка конфигурации (%s): %v", cfgPath, err)
 	}
 	repo, err := sqliterepo.New(cfg.App.StoragePath)
 	if err != nil {
@@ -78,10 +92,21 @@ func run() {
 			log.Printf("[ERROR] неизвестный тип сессии %s: %v\n", p.Session.Type, err)
 			continue
 		}
+
+		// Transport parameters: COM/Baudrate/Parity/StopBits matter for
+		// rtu_serial and tcp_serial (a real or converter-emulated COM
+		// port, e.g. our real Акрон-01 on COM105) - Host/Port matter for
+		// modbus_tcp. Building both sets unconditionally is harmless:
+		// transport.New only reads the fields relevant to Kind (see
+		// internal/transport/serial.go / tcp.go).
 		trParams := transport.Params{
 			Kind:            transport.Kind(devCfg.Transport.Kind),
 			Host:            devCfg.Transport.Host,
 			Port:            devCfg.Transport.Port,
+			COM:             devCfg.Transport.COM,
+			Baudrate:        devCfg.Transport.Baudrate,
+			Parity:          devCfg.Transport.Parity,
+			StopBits:        devCfg.Transport.StopBits,
 			ResponseTimeout: time.Duration(devCfg.Transport.TimeoutMs) * time.Millisecond,
 		}
 		tr, err := transport.New(trParams)
@@ -98,16 +123,17 @@ func run() {
 			continue
 		}
 		isTCP := devCfg.Transport.Kind == "modbus_tcp"
-		reader := pollcore.New(tr, isTCP, 1)
+
+		// Modbus slave/bus address - configurable per device now
+		// (previously hardcoded to 1 for every device); defaults to 1
+		// when unset in config.yaml, matching the old behaviour.
+		unitID := devCfg.Transport.UnitID
+		if unitID == 0 {
+			unitID = 1
+		}
+		reader := pollcore.New(tr, isTCP, unitID)
 		dev := device.New(devCfg.ID, p, reader, sess, repo, leaseMgr)
 		devices[devCfg.ID] = dev
-
-		// One-time static identity read (Akron command 101) so the
-		// upstream carrier can answer 101 with the real serial. Gated to
-		// Akron devices inside DetectPassport; non-fatal. Lives here (not
-		// in Device.Start) because the poll path uses internal/poller and
-		// never calls Start.
-		dev.DetectPassport(ctx)
 
 		archiveInterval := time.Duration(0)
 		if len(p.Archives) > 0 {

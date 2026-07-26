@@ -1,39 +1,55 @@
 package config
 
 import (
-"fmt"
-"os"
+	"fmt"
+	"os"
 
-"gopkg.in/yaml.v3"
+	"gopkg.in/yaml.v3"
 )
 
 type AppConfig struct {
-App struct {
-StoragePath string `yaml:"storage_path"`
-WebPort     int    `yaml:"web_port"` // <--- от это поле мы забыли!
-} `yaml:"app"`
-Devices []DeviceConfig `yaml:"devices"`
+	App struct {
+		StoragePath string `yaml:"storage_path"`
+		WebPort     int    `yaml:"web_port"`
+	} `yaml:"app"`
+	Devices []DeviceConfig `yaml:"devices"`
 }
 
 type DeviceConfig struct {
-ID        string `yaml:"id"`
-Profile   string `yaml:"profile"`
-Transport struct {
-Kind      string `yaml:"kind"`
-Host      string `yaml:"host"`
-Port      int    `yaml:"port"`
-TimeoutMs int    `yaml:"timeout_ms"`
-} `yaml:"transport"`
+	ID        string `yaml:"id"`
+	Profile   string `yaml:"profile"`
+	Transport struct {
+		Kind string `yaml:"kind"`
+		Host string `yaml:"host"`
+		Port int    `yaml:"port"`
+		// COM/Baudrate/Parity/StopBits are for kind: rtu_serial or
+		// tcp_serial (a real or converter-emulated COM port) — added
+		// because the config previously only supported TCP-addressed
+		// devices (Host/Port), leaving no way to describe a device
+		// like our real Акрон-01, which is reached via a virtual COM
+		// port (COM105) emulated by an Ethernet/RS-485 converter's
+		// own driver software, not a raw TCP socket.
+		COM       string `yaml:"com"`
+		Baudrate  int    `yaml:"baudrate"`
+		Parity    string `yaml:"parity"`   // "none"|"even"|"odd"
+		StopBits  int    `yaml:"stopbits"` // 1|2
+		TimeoutMs int    `yaml:"timeout_ms"`
+		// UnitID is the Modbus slave/bus address. Previously hardcoded
+		// to 1 for every device in cmd/mbgw/run.go; now configurable
+		// per device (still defaults to 1 if unset/zero — see run.go —
+		// so existing configs without this field keep working).
+		UnitID uint8 `yaml:"unit_id"`
+	} `yaml:"transport"`
 }
 
 func Load(path string) (*AppConfig, error) {
-data, err := os.ReadFile(path)
-if err != nil {
-return nil, fmt.Errorf("ошибка чтения конфига: %w", err)
-}
-var cfg AppConfig
-if err := yaml.Unmarshal(data, &cfg); err != nil {
-return nil, fmt.Errorf("ошибка парсинга YAML: %w", err)
-}
-return &cfg, nil
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("ошибка чтения конфига: %w", err)
+	}
+	var cfg AppConfig
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("ошибка парсинга YAML: %w", err)
+	}
+	return &cfg, nil
 }

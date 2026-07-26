@@ -1,0 +1,19 @@
+app:
+  # Same SQLite file the northbound carrier reads from (--db flag on
+  # `mbgw northbound --serve-akron ... --db <path>`). Point BOTH at this
+  # exact file so the poller writes what the carrier serves — that's the
+  # whole point of this config.
+  storage_path: "mbgw.db"
+  web_port: 8080 # dashboard: http://127.0.0.1:8080/
+
+devices:
+  - id: "akron_real"
+    profile: "profiles/acron-01.yaml"
+    transport:
+      kind: "rtu_serial" # real/virtual COM port (not a raw TCP socket)
+      com: "COM105" # the converter-emulated port, per the operator
+      baudrate: 9600
+      parity: "none"
+      stopbits: 1
+      timeout_ms: 1000
+      unit_id: 1 # confirmed live via tools/akronread --unit 1
