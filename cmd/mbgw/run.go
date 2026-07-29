@@ -143,7 +143,20 @@ func run() {
 		}
 		reader := pollcore.New(tr, isTCP, unitID)
 		dev := device.New(devCfg.ID, p, reader, sess, repo, leaseMgr)
+		dev.GapScanWindowHours = devCfg.Backfill.GapScanWindowOrDefault()
 		devices[devCfg.ID] = dev
+
+		// Startup archive catch-up: pull whatever history the device holds
+		// that we don't have yet (variant "В"), or down to a configured
+		// depth (variant "Б"). Runs once, before the periodic poller takes
+		// over, so a gateway that was off for hours/days/weeks fills its
+		// gap from the device's ring buffer at startup. Non-blocking so a
+		// slow deep sweep doesn't hold up the rest of bring-up.
+		if len(p.Archives) > 0 {
+			go dev.BackfillArchives(ctx, device.BackfillOptions{
+				MaxDepthHours: devCfg.Backfill.MaxDepthHours,
+			})
+		}
 
 		archiveInterval := time.Duration(0)
 		if len(p.Archives) > 0 {

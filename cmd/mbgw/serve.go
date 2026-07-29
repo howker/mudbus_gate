@@ -134,7 +134,14 @@ func serve() {
 		}
 		reader := pollcore.New(tr, isTCP, unitID)
 		dev := device.New(devCfg.ID, p, reader, sess, repo, leaseMgr)
+		dev.GapScanWindowHours = devCfg.Backfill.GapScanWindowOrDefault()
 		devices[devCfg.ID] = dev
+
+		if len(p.Archives) > 0 {
+			go dev.BackfillArchives(ctx, device.BackfillOptions{
+				MaxDepthHours: devCfg.Backfill.MaxDepthHours,
+			})
+		}
 
 		archiveInterval := time.Duration(0)
 		if len(p.Archives) > 0 {

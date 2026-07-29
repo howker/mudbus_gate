@@ -82,6 +82,36 @@ func (f *fakeRepo) CountHourlyArchive(ctx context.Context, deviceID, channel, pa
 	return n, nil
 }
 
+func (f *fakeRepo) LatestHourlyArchiveTS(ctx context.Context, deviceID, channel, param string) (time.Time, bool, error) {
+	var newest time.Time
+	found := false
+	for _, r := range f.hourly {
+		if r.DeviceID == deviceID && r.Channel == channel && r.Param == param {
+			if !found || r.TsHour.After(newest) {
+				newest = r.TsHour
+				found = true
+			}
+		}
+	}
+	return newest, found, nil
+}
+
+func (f *fakeRepo) MissingHours(ctx context.Context, deviceID, channel, param string, fromHour, toHour time.Time) ([]time.Time, error) {
+	present := make(map[int64]bool)
+	for _, r := range f.hourly {
+		if r.DeviceID == deviceID && r.Channel == channel && r.Param == param {
+			present[r.TsHour.Truncate(time.Hour).Unix()] = true
+		}
+	}
+	var missing []time.Time
+	for h := fromHour.Truncate(time.Hour); !h.After(toHour); h = h.Add(time.Hour) {
+		if !present[h.Unix()] {
+			missing = append(missing, h)
+		}
+	}
+	return missing, nil
+}
+
 // --- M4.3a device-passport methods ---
 
 func (f *fakeRepo) InitPassportSchema(ctx context.Context) error { return nil }

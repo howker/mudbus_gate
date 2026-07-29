@@ -156,3 +156,67 @@ func TestHourlyArchive_StreamIsolation(t *testing.T) {
 		t.Fatalf("zero-limit want 0 rows, got %d", len(got))
 	}
 }
+
+// TestLatestHourlyArchiveTS covers the empty-store case (found=false, the
+// freshly-installed-meter path backfill must not treat as an error) and the
+// populated case (returns the newest hour, which variant "В" uses as its
+// "don't reach past this" mark).
+func TestLatestHourlyArchiveTS(t *testing.T) {
+	ctx := context.Background()
+	r := newTestRepo(t)
+
+	if _, found, err := r.LatestHourlyArchiveTS(ctx, "akron1", "", "V"); err != nil || found {
+		t.Fatalf("empty store: want found=false nil err, got found=%v err=%v", found, err)
+	}
+
+	base := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	seedHours(t, r, base) // 5 hours, base..base+4h
+
+	ts, found, err := r.LatestHourlyArchiveTS(ctx, "akron1", "", "V")
+	if err != nil || !found {
+		t.Fatalf("populated: want found=true nil err, got found=%v err=%v", found, err)
+	}
+	want := base.Add(4 * time.Hour)
+	if !ts.Equal(want) {
+		t.Fatalf("latest ts = %v, want %v", ts, want)
+	}
+}
+
+// TestMissingHours verifies the gap list a periodic gap-scan drives from:
+// hours with no row inside the inclusive window are returned, present ones
+// are not.
+func TestMissingHours(t *testing.T) {
+	ctx := context.Background()
+	r := newTestRepo(t)
+
+	base := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	// Seed hours 0..4, then deliberately leave 5 and 6 missing, add 7.
+	seedHours(t, r, base)
+	rec := storage.HourlyArchiveRecord{
+		DeviceID: "akron1", Channel: "", Param: "V",
+		TsHour: base.Add(7 * time.Hour), Value: 999, Unit: "m3",
+	}
+	if err := r.SaveHourlyArchive(ctx, rec); err != nil {
+		t.Fatalf("seed hour 7: %v", err)
+	}
+
+	missing, err := r.MissingHours(ctx, "akron1", "", "V", base, base.Add(7*time.Hour))
+	if err != nil {
+		t.Fatalf("MissingHours: %v", err)
+	}
+	if len(missing) != 2 {
+		t.Fatalf("want 2 missing hours (5,6), got %d: %v", len(missing), missing)
+	}
+	if !missing[0].Equal(base.Add(5*time.Hour)) || !missing[1].Equal(base.Add(6*time.Hour)) {
+		t.Fatalf("missing hours = %v, want [%v %v]", missing, base.Add(5*time.Hour), base.Add(6*time.Hour))
+	}
+
+	// A fully-covered sub-window yields nothing.
+	none, err := r.MissingHours(ctx, "akron1", "", "V", base, base.Add(4*time.Hour))
+	if err != nil {
+		t.Fatalf("MissingHours covered: %v", err)
+	}
+	if len(none) != 0 {
+		t.Fatalf("covered window want 0 missing, got %d: %v", len(none), none)
+	}
+}

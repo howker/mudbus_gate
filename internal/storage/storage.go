@@ -1,6 +1,9 @@
 package storage
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // Repo is the storage contract used by the polling core. It was extended
 // for M4 (the upstream Akron carrier) with:
@@ -24,6 +27,16 @@ type Repo interface {
 	// maps a command-104 (i, n) request directly).
 	GetHourlyArchiveDesc(ctx context.Context, deviceID, channel, param string, offset, limit int) ([]HourlyArchiveRecord, error)
 	CountHourlyArchive(ctx context.Context, deviceID, channel, param string) (int, error)
+	// LatestHourlyArchiveTS reports the newest ts_hour stored for the
+	// stream (found=false, nil error when the store holds nothing yet).
+	// Backfill uses it to decide how far back to reach in variant "В":
+	// grab everything newer than what we already have.
+	LatestHourlyArchiveTS(ctx context.Context, deviceID, channel, param string) (ts time.Time, found bool, err error)
+	// MissingHours returns the whole-hour timestamps in [fromHour, toHour]
+	// that have NO row for the stream — the gaps a periodic gap-scan
+	// should patch. Both bounds are inclusive and must already be
+	// truncated to the hour by the caller.
+	MissingHours(ctx context.Context, deviceID, channel, param string, fromHour, toHour time.Time) ([]time.Time, error)
 
 	// Device passport store (M4). Static identity read once at startup and
 	// served upstream on command 101. GetDevicePassport reports found=false

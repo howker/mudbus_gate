@@ -55,6 +55,12 @@ type Device struct {
 	Sess    session.Session
 	Repo    storage.Repo
 	Lease   *lease.LocalLease
+
+	// GapScanWindowHours, when > 0, makes each archive poll finish by
+	// patching any missing hours in the last N hours (see GapScan). 0
+	// disables it. Set from config (DeviceConfig.Backfill); left 0 by the
+	// plain New() constructor so existing callers are unaffected.
+	GapScanWindowHours int
 }
 
 func New(id string, p *profile.Profile, cli PointClient, sess session.Session, repo storage.Repo, l *lease.LocalLease) *Device {
@@ -300,18 +306,7 @@ func (d *Device) PollArchives(ctx context.Context) {
 			continue
 		}
 
-		layout := make([]archive.RecordLayoutField, 0, len(a.RecordLayout))
-		for _, f := range a.RecordLayout {
-			layout = append(layout, archive.RecordLayoutField{
-				Offset: f.Offset,
-				Name:   f.Name,
-				Type:   f.Type,
-				Unit:   f.Unit,
-				Scale:  f.Scale,
-				CRC:    f.CRC,
-				Epoch:  f.Epoch,
-			})
-		}
+		layout := layoutFromProfile(a)
 
 		q := archive.ArchiveQuery{
 			DeviceID:     d.ID,
@@ -349,6 +344,13 @@ func (d *Device) PollArchives(ctx context.Context) {
 				log.Printf("[%s] архив %s: сохранено часовок: %d/%d\n", d.ID, a.ID, saved, len(records))
 			}
 		}
+	}
+
+	// After the regular sweep, patch any recent holes (single failed hours
+	// that the contiguous sweep above may not cover). No-op when
+	// GapScanWindowHours is 0 or when there are no gaps.
+	if d.GapScanWindowHours > 0 {
+		d.GapScan(ctx, d.GapScanWindowHours)
 	}
 }
 

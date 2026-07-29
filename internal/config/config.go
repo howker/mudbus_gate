@@ -58,6 +58,36 @@ type DeviceConfig struct {
 		// so existing configs without this field keep working).
 		UnitID uint8 `yaml:"unit_id"`
 	} `yaml:"transport"`
+
+	// Backfill is optional. It controls the archive-history catch-up that
+	// runs at startup and the periodic gap-scan. Absent section = default
+	// behaviour (variant "В": pull everything the DB is missing, bounded
+	// only by the profile's buffer_depth_hours). See BACKFILL_DESIGN.md.
+	Backfill BackfillConfig `yaml:"backfill"`
+}
+
+// BackfillConfig configures archive-history catch-up per device.
+type BackfillConfig struct {
+	// MaxDepthHours bounds how far back a startup backfill will reach.
+	//   0  → variant "В": grab everything not already in the DB, capped
+	//        only by the device's physical buffer_depth_hours (profile).
+	//   >0 → variant "Б": never reach further back than this many hours,
+	//        even if the device still holds older rows.
+	MaxDepthHours int `yaml:"max_depth_hours"`
+
+	// GapScanWindowHours is how far back each periodic gap-scan looks for
+	// missing hours to patch. 0 → GapScanDefault.
+	GapScanWindowHours int `yaml:"gap_scan_window_hours"`
+}
+
+const GapScanDefault = 72 // hours
+
+// GapScanWindowOrDefault returns the configured window, or the default.
+func (b BackfillConfig) GapScanWindowOrDefault() int {
+	if b.GapScanWindowHours <= 0 {
+		return GapScanDefault
+	}
+	return b.GapScanWindowHours
 }
 
 func Load(path string) (*AppConfig, error) {

@@ -2,7 +2,9 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"time"
 
 	"mbgw/internal/storage"
 )
@@ -119,4 +121,74 @@ WHERE device_id = ? AND channel = ? AND param = ?
 		return 0, fmt.Errorf("count hourly archive: %w", err)
 	}
 	return n, nil
+}
+
+// LatestHourlyArchiveTS returns the newest ts_hour stored for the stream.
+// found=false (nil error) when the store holds nothing yet — the
+// empty-database / freshly-installed-meter case the backfill must handle
+// without treating it as an error.
+//
+// Deliberately ORDER BY + LIMIT 1 rather than SELECT MAX(ts_hour): under
+// modernc.org/sqlite, an aggregate result loses the column's declared
+// type (comes back as a plain string, and Scan into time.Time fails),
+// whereas a direct column read applies the same DATETIME conversion
+// GetHourlyArchiveDesc already relies on above.
+func (r *Repo) LatestHourlyArchiveTS(ctx context.Context, deviceID, channel, param string) (time.Time, bool, error) {
+	var ts time.Time
+	err := r.db.QueryRowContext(ctx, `
+SELECT ts_hour FROM archive_hourly
+WHERE device_id = ? AND channel = ? AND param = ?
+ORDER BY ts_hour DESC
+LIMIT 1
+`, deviceID, channel, param).Scan(&ts)
+	if err == sql.ErrNoRows {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("latest hourly archive ts: %w", err)
+	}
+	return ts, true, nil
+}
+
+// MissingHours lists the whole-hour timestamps in [fromHour, toHour] that
+// have no row for the stream. The expected set of hours is generated in Go
+// and the present ones subtracted, rather than relying on a SQL recursive
+// CTE — the ts_hour column's on-disk format under modernc.org/sqlite is
+// not guaranteed identical to a CTE-generated datetime string, so an
+// in-Go set difference is the reliable comparison. Bounds are inclusive
+// and assumed already hour-truncated by the caller.
+func (r *Repo) MissingHours(ctx context.Context, deviceID, channel, param string, fromHour, toHour time.Time) ([]time.Time, error) {
+	if toHour.Before(fromHour) {
+		return nil, nil
+	}
+
+	rows, err := r.db.QueryContext(ctx, `
+SELECT ts_hour FROM archive_hourly
+WHERE device_id = ? AND channel = ? AND param = ?
+  AND ts_hour >= ? AND ts_hour <= ?
+`, deviceID, channel, param, fromHour, toHour)
+	if err != nil {
+		return nil, fmt.Errorf("missing hours query: %w", err)
+	}
+	defer rows.Close()
+
+	present := make(map[int64]bool)
+	for rows.Next() {
+		var t time.Time
+		if err := rows.Scan(&t); err != nil {
+			return nil, fmt.Errorf("missing hours scan: %w", err)
+		}
+		present[t.Truncate(time.Hour).Unix()] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	var missing []time.Time
+	for h := fromHour.Truncate(time.Hour); !h.After(toHour); h = h.Add(time.Hour) {
+		if !present[h.Unix()] {
+			missing = append(missing, h)
+		}
+	}
+	return missing, nil
 }

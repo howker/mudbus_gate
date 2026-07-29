@@ -112,10 +112,25 @@ archives:
   - id: "hourly"
     strategy: "akron_archive"
     index_access: true
+    # max_rows_per_request: confirmed live for THIS unit/firmware (fw 6.6).
+    # The datasheet says 31; in practice 28+ is rejected with modbus
+    # exception 0xFC and 27 works. Was a hardcoded 27 / akronbackfill's
+    # --page-size; now a profile field so a different unit/firmware in the
+    # "зоопарк приборов" can override it.
+    max_rows_per_request: 27
+    # buffer_depth_hours: safety cap for the startup backfill loop only —
+    # NOT the real end-of-archive marker (an empty page from the device
+    # is). The note below cites M=1925 rows (~80 days) from the protocol
+    # doc; field experience suggested closer to ~27 days. Set to 648h
+    # (~27 days) as the conservative loop guard; raise toward 1925 if the
+    # device is confirmed to retain more. Either way the real end is
+    # detected by the first empty page, so this only bounds a pathological
+    # never-empty device.
+    buffer_depth_hours: 648
     params:
       addr: 1
       archive_kind: "hourly"
-    note: "Akron-01 hourly archive via User-Defined command 104. Row format U(4B)+Pu(1B)+H/D/M/Y(BCD), per section 2 table 1. N<=31 rows per request, M=1925 total rows in the ring buffer."
+    note: "Akron-01 hourly archive via User-Defined command 104. Row format U(4B)+Pu(1B)+H/D/M/Y(BCD), per section 2 table 1. N<=31 rows per request (real: 27), M=1925 total rows in the ring buffer per doc."
     record_layout:
       - { offset: 0, name: "volume", type: "akron_volume" }
       - { offset: 5, name: "hour", type: "bcd" }
