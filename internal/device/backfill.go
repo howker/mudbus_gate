@@ -29,8 +29,13 @@ type BackfillOptions struct {
 //   - an empty/short page  → the device's archive ends here (also the
 //     empty/freshly-installed-meter case: first page returns nothing, we
 //     log "архив прибора пуст" and return without writing anything);
-//   - reaching a row at-or-older-than what the DB already has (variant "В"),
-//     so re-runs only fetch genuinely new history and overlap is cheap;
+//   - every hour the DB was missing in the candidate window has now been
+//     covered (variant "В") — computed as an explicit missing-hours set
+//     up front, NOT inferred from "older than the previously-newest row":
+//     that inference breaks whenever a gap sits BEHIND fresher data (a
+//     live poll can keep the newest hour current while a multi-day outage
+//     leaves a hole further back — the exact 27.07–29.07 incident this
+//     fixes), so it must not be used as the stop signal;
 //   - reaching opts.MaxDepthHours back (variant "Б", when configured);
 //   - the profile's buffer_depth_hours safety cap (prevents an endless
 //     loop if a device keeps answering past its real buffer).
@@ -64,26 +69,47 @@ func (d *Device) backfillAkronHourly(ctx context.Context, a profile.Archive, opt
 
 	// Depth limit in hours: the tighter of the physical buffer cap and the
 	// configured variant-"Б" cap (if any). Variant "В" (opts.MaxDepthHours
-	// == 0) leaves it at the buffer cap and relies on the "already have it"
-	// stop below.
+	// == 0) leaves it at the buffer cap.
 	depthLimit := bufferDepth
 	if opts.MaxDepthHours > 0 && opts.MaxDepthHours < depthLimit {
 		depthLimit = opts.MaxDepthHours
 	}
 
-	// Variant "В": don't reach past what we already stored. A row whose
-	// hour is <= newestHave means we (and everything older) already have
-	// it, so we can stop.
-	newestHave, haveAny, err := d.Repo.LatestHourlyArchiveTS(ctx, d.ID, "", "V")
+	// What's actually missing across the whole candidate window, computed
+	// ONCE up front. This is the correct stop signal for variant "В" — NOT
+	// "we paged past the previously-newest row", which breaks as soon as
+	// there's a gap OLDER than data that's already fresh (exactly the
+	// 27.07–29.07 outage case: the newest row is fresh from live polling,
+	// but there's a multi-day hole behind it that a single page never
+	// reaches if we stop at "older than newest"). See PROJECT log
+	// 2026-07-29 for the incident this fixes.
+	// fromBoundary/toBoundary must span exactly depthLimit hourly slots —
+	// indices 0..depthLimit-1, the same set the paging loop below can
+	// actually reach (from < depthLimit). Using -depthLimit hours here
+	// would make the range inclusive of depthLimit+1 slots (a fencepost
+	// mismatch caught by TestBackfillArchives_ReachesGapBehindFreshData:
+	// the oldest hour in that wider range is never fetchable, so it always
+	// shows up as a permanently "missing" hour even on a fully successful
+	// run).
+	now := time.Now()
+	fromBoundary := now.Add(-time.Duration(depthLimit-1) * time.Hour).Truncate(time.Hour)
+	toBoundary := now.Truncate(time.Hour)
+	missingList, err := d.Repo.MissingHours(ctx, d.ID, "", "V", fromBoundary, toBoundary)
 	if err != nil {
-		log.Printf("[%s] дозабор %s: не удалось узнать последнюю сохранённую строку: %v\n", d.ID, a.ID, err)
-		// Non-fatal: fall through and just use the depth cap.
-		haveAny = false
+		log.Printf("[%s] дозабор %s: не удалось вычислить пропуски: %v — иду вглубь до предела/пустой страницы\n", d.ID, a.ID, err)
+	}
+	missing := make(map[int64]bool, len(missingList))
+	for _, t := range missingList {
+		missing[t.Unix()] = true
 	}
 
-	log.Printf("[%s] дозабор %s: старт (страница=%d строк, предел=%dч, %s)\n",
-		d.ID, a.ID, pageSize, depthLimit,
-		map[bool]string{true: "добираем новее последней сохранённой", false: "база пуста — тянем всё до конца буфера"}[haveAny])
+	if err == nil && len(missing) == 0 {
+		log.Printf("[%s] дозабор %s: пропусков в пределах %dч нет — добирать нечего\n", d.ID, a.ID, depthLimit)
+		return
+	}
+
+	log.Printf("[%s] дозабор %s: старт (страница=%d строк, предел=%dч, известно пропущенных часов: %d)\n",
+		d.ID, a.ID, pageSize, depthLimit, len(missing))
 
 	totalSaved := 0
 	reachedEnd := false
@@ -130,20 +156,27 @@ func (d *Device) backfillAkronHourly(ctx context.Context, a profile.Archive, opt
 		log.Printf("[%s] дозабор %s: страница i=%d..%d: получено %d, сохранено %d\n",
 			d.ID, a.ID, from+1, to+1, len(records), saved)
 
-		// Variant "В" stop: if the OLDEST row on this page is already
-		// at-or-older-than what we had before this run, everything deeper
-		// is already stored — stop paging.
-		if haveAny && oldestReachedOrOlder(records, newestHave) {
-			log.Printf("[%s] дозабор %s: дошли до уже сохранённых данных (<= %s) — остановка\n",
-				d.ID, a.ID, newestHave.Format("02.01.2006 15:00"))
+		// Cross off every hour this page actually covered — including
+		// hours outside the original missing-set (harmless, upsert is
+		// idempotent) so a re-check below only cares about what's left.
+		for _, rec := range records {
+			ts, ok := akronRowTime(rec.Fields)
+			if !ok {
+				continue
+			}
+			delete(missing, ts.Truncate(time.Hour).Unix())
+		}
+
+		if len(missing) == 0 {
+			log.Printf("[%s] дозабор %s: все известные пропуски закрыты — остановка\n", d.ID, a.ID)
 			reachedEnd = true
 			break
 		}
 	}
 
 	if !reachedEnd {
-		log.Printf("[%s] дозабор %s: достигнут предел глубины %dч — остановка по лимиту\n",
-			d.ID, a.ID, depthLimit)
+		log.Printf("[%s] дозабор %s: достигнут предел глубины %dч, ещё не закрыто пропусков: %d\n",
+			d.ID, a.ID, depthLimit, len(missing))
 	}
 	log.Printf("[%s] дозабор %s: готово, сохранено строк: %d\n", d.ID, a.ID, totalSaved)
 }
@@ -165,7 +198,7 @@ func (d *Device) GapScan(ctx context.Context, windowHours int) {
 		return
 	}
 	now := time.Now()
-	fromHour := now.Add(-time.Duration(windowHours) * time.Hour).Truncate(time.Hour)
+	fromHour := now.Add(-time.Duration(windowHours-1) * time.Hour).Truncate(time.Hour)
 	toHour := now.Truncate(time.Hour)
 
 	missing, err := d.Repo.MissingHours(ctx, d.ID, "", "V", fromHour, toHour)
@@ -183,21 +216,6 @@ func (d *Device) GapScan(ctx context.Context, windowHours int) {
 	// cheap. +2 pages of slack so a gap right at the window edge is still
 	// reachable given index granularity.
 	d.BackfillArchives(ctx, BackfillOptions{MaxDepthHours: windowHours + 2})
-}
-
-// oldestReachedOrOlder reports whether the oldest record in the page is at
-// or older than the given timestamp — the variant-"В" stop condition.
-func oldestReachedOrOlder(records []archive.ArchiveRecord, newestHave time.Time) bool {
-	for _, rec := range records {
-		ts, ok := akronRowTime(rec.Fields)
-		if !ok {
-			continue
-		}
-		if !ts.After(newestHave) {
-			return true
-		}
-	}
-	return false
 }
 
 // layoutFromProfile converts a profile Archive's record layout into the
