@@ -136,17 +136,27 @@ func (s *ModbusByteOrderAuth) nextTxID() uint16 {
 	return s.txID
 }
 
-// readInputRegisters reads one logical VKM control value through Modbus function 04
-// and returns only the response payload bytes (without function code / byte count).
+// readControlRegister reads one VKM control/golden-constant value through
+// Modbus function 03 (Holding Registers) and returns only the response
+// payload bytes (without function code / byte count).
 //
-// Expected response shape for function 04:
-// response PDU = [0x04][byteCount][data...]
-func (s *ModbusByteOrderAuth) readInputRegisters(ctx context.Context, addr int, dataType string) ([]byte, error) {
+// CONFIRMED against a real ВКМ-360 (2026-07-29, tools/vkmprobe
+// --probe-control-regs): register 110 answers Modbus exception 0x02
+// (illegal data address) on function 04 (Input Registers) — the space
+// this code originally assumed — but function 03 (Holding Registers) at
+// the same address 110 returns exactly the documented golden constant
+// (int32 1234567890, byte order "0123"). The CONTRACTS.md contract text
+// itself doesn't specify the register space explicitly; this was an
+// unverified assumption baked into the "staged skeleton" implementation,
+// caught only once real hardware was available to probe.
+//
+// Expected response shape for function 03: response PDU = [0x03][byteCount][data...]
+func (s *ModbusByteOrderAuth) readControlRegister(ctx context.Context, addr int, dataType string) ([]byte, error) {
 	if s.tr == nil {
 		return nil, fmt.Errorf("transport is not initialized")
 	}
 
-	reqPDU, err := modbus.BuildReadPDU("IR", addr, dataType)
+	reqPDU, err := modbus.BuildReadPDU("HR", addr, dataType)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +169,7 @@ func (s *ModbusByteOrderAuth) readInputRegisters(ctx context.Context, addr int, 
 	if len(respPDU) < 2 {
 		return nil, fmt.Errorf("modbus response too short: %d", len(respPDU))
 	}
-	if respPDU[0] != 0x04 {
+	if respPDU[0] != 0x03 {
 		return nil, fmt.Errorf("unexpected modbus function in response: 0x%02X", respPDU[0])
 	}
 
@@ -282,17 +292,17 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 //     the matched 32-bit order.
 //  5. Return the agreed 32-bit order.
 func (s *ModbusByteOrderAuth) detectByteOrder(ctx context.Context) (string, error) {
-	raw110, err := s.readInputRegisters(ctx, vkmControlRegister110, "int32")
+	raw110, err := s.readControlRegister(ctx, vkmControlRegister110, "int32")
 	if err != nil {
 		return "", fmt.Errorf("read VKM control register 110: %w", err)
 	}
 
-	raw112, err := s.readInputRegisters(ctx, vkmControlRegister112, "float")
+	raw112, err := s.readControlRegister(ctx, vkmControlRegister112, "float")
 	if err != nil {
 		return "", fmt.Errorf("read VKM control register 112: %w", err)
 	}
 
-	raw114, err := s.readInputRegisters(ctx, vkmControlRegister114, "double")
+	raw114, err := s.readControlRegister(ctx, vkmControlRegister114, "double")
 	if err != nil {
 		return "", fmt.Errorf("read VKM control register 114: %w", err)
 	}

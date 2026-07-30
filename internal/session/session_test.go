@@ -1,46 +1,46 @@
 package session
 
 import (
-    "bytes"
-    "context"
-    "testing"
-    "time"
+	"bytes"
+	"context"
+	"testing"
+	"time"
 
-    "mbgw/internal/protocol/modbus"
-    "mbgw/internal/transport"
+	"mbgw/internal/protocol/modbus"
+	"mbgw/internal/transport"
 )
 
 type stubTransport struct {
-    responses [][]byte
-    requests  [][]byte
-    readErr   error
+	responses [][]byte
+	requests  [][]byte
+	readErr   error
 }
 
 func (s *stubTransport) Open(ctx context.Context) error { return nil }
 
 func (s *stubTransport) Send(ctx context.Context, frame []byte) error {
-    s.requests = append(s.requests, append([]byte(nil), frame...))
-    return nil
+	s.requests = append(s.requests, append([]byte(nil), frame...))
+	return nil
 }
 
 func (s *stubTransport) Receive(ctx context.Context, timeout time.Duration) ([]byte, error) {
-    if s.readErr != nil {
-        return nil, s.readErr
-    }
-    if len(s.responses) == 0 {
-        return nil, context.DeadlineExceeded
-    }
-    resp := s.responses[0]
-    s.responses = s.responses[1:]
-    return append([]byte(nil), resp...), nil
+	if s.readErr != nil {
+		return nil, s.readErr
+	}
+	if len(s.responses) == 0 {
+		return nil, context.DeadlineExceeded
+	}
+	resp := s.responses[0]
+	s.responses = s.responses[1:]
+	return append([]byte(nil), resp...), nil
 }
 
 func (s *stubTransport) Close() error {
-    return nil
+	return nil
 }
 
 func (s *stubTransport) Info() transport.Params {
-    return transport.Params{Retries: 1}
+	return transport.Params{Retries: 1}
 }
 
 func newVKMTransportForOrder(order string) *stubTransport {
@@ -73,9 +73,9 @@ func newVKMTransportForOrder(order string) *stubTransport {
 
 	return &stubTransport{
 		responses: [][]byte{
-			modbus.BuildTCPFrame(1, 1, append([]byte{0x04, 0x04}, raw110...)),
-			modbus.BuildTCPFrame(2, 1, append([]byte{0x04, 0x04}, raw112...)),
-			modbus.BuildTCPFrame(3, 1, append([]byte{0x04, 0x08}, raw114...)),
+			modbus.BuildTCPFrame(1, 1, append([]byte{0x03, 0x04}, raw110...)),
+			modbus.BuildTCPFrame(2, 1, append([]byte{0x03, 0x04}, raw112...)),
+			modbus.BuildTCPFrame(3, 1, append([]byte{0x03, 0x08}, raw114...)),
 		},
 	}
 }
@@ -87,9 +87,9 @@ func newVKMHappyTransport() *stubTransport {
 func newVKMHappyTransportWithAuth() *stubTransport {
 	return &stubTransport{
 		responses: [][]byte{
-			modbus.BuildTCPFrame(1, 1, []byte{0x04, 0x04, 0x49, 0x96, 0x02, 0xD2}),
-			modbus.BuildTCPFrame(2, 1, []byte{0x04, 0x04, 0x42, 0xF6, 0xE9, 0xD5}),
-			modbus.BuildTCPFrame(3, 1, []byte{0x04, 0x08, 0x40, 0x5E, 0xDD, 0x3C, 0x07, 0xFB, 0x4C, 0x93}),
+			modbus.BuildTCPFrame(1, 1, []byte{0x03, 0x04, 0x49, 0x96, 0x02, 0xD2}),
+			modbus.BuildTCPFrame(2, 1, []byte{0x03, 0x04, 0x42, 0xF6, 0xE9, 0xD5}),
+			modbus.BuildTCPFrame(3, 1, []byte{0x03, 0x08, 0x40, 0x5E, 0xDD, 0x3C, 0x07, 0xFB, 0x4C, 0x93}),
 			modbus.BuildTCPFrame(4, 1, []byte{0x10, 0x00, 0xC8, 0x00, 0x02}),
 		},
 	}
@@ -193,19 +193,19 @@ func TestModbusByteOrderAuth_VKMDetectionAnchors(t *testing.T) {
 	}
 }
 
-func TestModbusByteOrderAuth_ReadInputRegisters(t *testing.T) {
+func TestModbusByteOrderAuth_ReadControlRegister(t *testing.T) {
 	st := &stubTransport{
 		responses: [][]byte{
-			modbus.BuildTCPFrame(1, 1, []byte{0x04, 0x04, 0x42, 0xF6, 0xE9, 0xD5}),
+			modbus.BuildTCPFrame(1, 1, []byte{0x03, 0x04, 0x42, 0xF6, 0xE9, 0xD5}),
 		},
 	}
 
 	sess := NewModbusByteOrderAuth()
 	sess.tr = st
 
-	got, err := sess.readInputRegisters(context.Background(), vkmControlRegister112, "float")
+	got, err := sess.readControlRegister(context.Background(), vkmControlRegister112, "float")
 	if err != nil {
-		t.Fatalf("unexpected readInputRegisters error: %v", err)
+		t.Fatalf("unexpected readControlRegister error: %v", err)
 	}
 
 	want := []byte{0x42, 0xF6, 0xE9, 0xD5}
@@ -217,7 +217,7 @@ func TestModbusByteOrderAuth_ReadInputRegisters(t *testing.T) {
 		t.Fatalf("expected exactly 1 request, got %d", len(st.requests))
 	}
 
-	wantReqPDU, err := modbus.BuildReadPDU("IR", vkmControlRegister112, "float")
+	wantReqPDU, err := modbus.BuildReadPDU("HR", vkmControlRegister112, "float")
 	if err != nil {
 		t.Fatalf("unexpected BuildReadPDU error: %v", err)
 	}
@@ -228,17 +228,17 @@ func TestModbusByteOrderAuth_ReadInputRegisters(t *testing.T) {
 	}
 }
 
-func TestModbusByteOrderAuth_ReadInputRegisters_BadByteCount(t *testing.T) {
+func TestModbusByteOrderAuth_ReadControlRegister_BadByteCount(t *testing.T) {
 	st := &stubTransport{
 		responses: [][]byte{
-			modbus.BuildTCPFrame(1, 1, []byte{0x04, 0x04, 0x42, 0xF6}),
+			modbus.BuildTCPFrame(1, 1, []byte{0x03, 0x04, 0x42, 0xF6}),
 		},
 	}
 
 	sess := NewModbusByteOrderAuth()
 	sess.tr = st
 
-	_, err := sess.readInputRegisters(context.Background(), vkmControlRegister112, "float")
+	_, err := sess.readControlRegister(context.Background(), vkmControlRegister112, "float")
 	if err == nil {
 		t.Fatal("expected byte count mismatch error, got nil")
 	}
@@ -262,9 +262,9 @@ func TestModbusByteOrderAuth_DetectByteOrder_StagedReads(t *testing.T) {
 		t.Fatalf("expected 3 staged requests, got %d", len(st.requests))
 	}
 
-	want1PDU, _ := modbus.BuildReadPDU("IR", vkmControlRegister110, "int32")
-	want2PDU, _ := modbus.BuildReadPDU("IR", vkmControlRegister112, "float")
-	want3PDU, _ := modbus.BuildReadPDU("IR", vkmControlRegister114, "double")
+	want1PDU, _ := modbus.BuildReadPDU("HR", vkmControlRegister110, "int32")
+	want2PDU, _ := modbus.BuildReadPDU("HR", vkmControlRegister112, "float")
+	want3PDU, _ := modbus.BuildReadPDU("HR", vkmControlRegister114, "double")
 
 	want1 := modbus.BuildTCPFrame(1, 1, want1PDU)
 	want2 := modbus.BuildTCPFrame(2, 1, want2PDU)
@@ -299,9 +299,9 @@ func TestModbusByteOrderAuth_DetectByteOrder_Selects1032(t *testing.T) {
 func TestModbusByteOrderAuth_DetectByteOrder_NoMatch(t *testing.T) {
 	st := &stubTransport{
 		responses: [][]byte{
-			modbus.BuildTCPFrame(1, 1, []byte{0x04, 0x04, 0x00, 0x00, 0x00, 0x00}),
-			modbus.BuildTCPFrame(2, 1, []byte{0x04, 0x04, 0x00, 0x00, 0x00, 0x00}),
-			modbus.BuildTCPFrame(3, 1, []byte{0x04, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}),
+			modbus.BuildTCPFrame(1, 1, []byte{0x03, 0x04, 0x00, 0x00, 0x00, 0x00}),
+			modbus.BuildTCPFrame(2, 1, []byte{0x03, 0x04, 0x00, 0x00, 0x00, 0x00}),
+			modbus.BuildTCPFrame(3, 1, []byte{0x03, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}),
 		},
 	}
 
