@@ -33,9 +33,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"time"
 
@@ -276,14 +278,14 @@ func readArchive(ctx context.Context, r *pollcore.Reader, pipe int, from, to tim
 // raw bytes plus a few byte-order decodes, so the answer comes from the
 // device instead of another guess.
 func probeControlRegisters(ctx context.Context, tr transport.Transport, isTCP bool, unit uint8) {
-	fmt.Println("\n--- диагностика: control-константа (ожидаем int32=1234567890 где-то рядом с рег.110) ---")
+	fmt.Println("\n--- диагностика: control-константа int32 (ожидаем 1234567890, рег.110) ---")
 
-	spaces := []string{"IR", "HR"}
-	addrs := []int{110, 109}
-	orders := []string{"0123", "1032", "2301", "3210"}
+	spaces := []string{"HR", "IR"}
+	addrs110 := []int{110, 109}
+	orders32 := []string{"0123", "1032", "2301", "3210"}
 
 	for _, space := range spaces {
-		for _, addr := range addrs {
+		for _, addr := range addrs110 {
 			funcName := map[string]string{"IR": "04 (Input Registers)", "HR": "03 (Holding Registers)"}[space]
 			data, err := modbus.ReadPoint(ctx, tr, isTCP, unit, space, addr, "int32")
 			if err != nil {
@@ -291,7 +293,7 @@ func probeControlRegisters(ctx context.Context, tr transport.Transport, isTCP bo
 				continue
 			}
 			fmt.Printf("%s, регистр %d, функция %s: сырые байты = % X\n", space, addr, funcName, data)
-			for _, order := range orders {
+			for _, order := range orders32 {
 				v, err := codec.DecodeInt32(data, order)
 				if err != nil {
 					continue
@@ -304,11 +306,46 @@ func probeControlRegisters(ctx context.Context, tr transport.Transport, isTCP bo
 			}
 		}
 	}
+
+	fmt.Println("\n--- диагностика: control-константа double (ожидаем 123.4567890123456, рег.114) ---")
+	fmt.Println("(ожидаемые сырые байты в порядке 01234567: 40 5E DD 3C 07 FB 4C 93)")
+
+	golden114 := []byte{0x40, 0x5E, 0xDD, 0x3C, 0x07, 0xFB, 0x4C, 0x93}
+	orders64 := []string{"01234567", "10325476", "76543210"}
+	addrs114 := []int{114, 113}
+
+	for _, space := range spaces {
+		for _, addr := range addrs114 {
+			funcName := map[string]string{"IR": "04 (Input Registers)", "HR": "03 (Holding Registers)"}[space]
+			data, err := modbus.ReadPoint(ctx, tr, isTCP, unit, space, addr, "double")
+			if err != nil {
+				fmt.Printf("%s, регистр %d, функция %s: ошибка: %v\n", space, addr, funcName, err)
+				continue
+			}
+			exactMatch := ""
+			if bytes.Equal(data, golden114) {
+				exactMatch = "  <-- РОВНО совпадает с ожидаемыми сырыми байтами!"
+			}
+			fmt.Printf("%s, регистр %d, функция %s: сырые байты = % X%s\n", space, addr, funcName, data, exactMatch)
+			for _, order := range orders64 {
+				v, err := codec.DecodeFloat64(data, order)
+				if err != nil {
+					continue
+				}
+				mark := ""
+				if math.Abs(v-123.4567890123456) <= 1e-9 {
+					mark = "  <-- СОВПАДЕНИЕ с золотой константой!"
+				}
+				fmt.Printf("    как double, порядок байт %s: %v%s\n", order, v, mark)
+			}
+		}
+	}
+
 	fmt.Println("\nЕсли выше нигде нет пометки «СОВПАДЕНИЕ» — значит эта прошивка не отдаёт золотую")
 	fmt.Println("константу так, как описано в CONTRACTS.md, ни в одном из проверенных вариантов.")
-	fmt.Println("Тогда byte-order-детект придётся либо перепроверить по актуальной документации")
-	fmt.Println("на конкретно эту прошивку ВКМ-360, либо задавать порядок байт в конфиге вручную,")
-	fmt.Println("а не автоопределением через эту самопроверку.")
+	fmt.Println("Сравни сырые байты double вручную с ожидаемыми (40 5E DD 3C 07 FB 4C 93) — если это")
+	fmt.Println("такие же байты, но в другом порядке (не 4-байтовыми парами, а иначе перемешаны),")
+	fmt.Println("порядок придётся добавить в internal/codec/codec.go:Reorder64 отдельным случаем.")
 }
 
 func archiveWindow(minutesBack int, fromStr, toStr string) (time.Time, time.Time, error) {

@@ -100,9 +100,31 @@ type BackfillConfig struct {
 	// GapScanWindowHours is how far back each periodic gap-scan looks for
 	// missing hours to patch. 0 → GapScanDefault.
 	GapScanWindowHours int `yaml:"gap_scan_window_hours"`
+
+	// ArchiveAtMinute anchors the hourly archive poll to a fixed minute
+	// past each hour (e.g. 5 → HH:05) instead of drifting with the process
+	// start time. A negative value disables anchoring (legacy interval
+	// behaviour). Unset (nil) → ArchiveAtMinuteDefault. See
+	// scheduler.deviceSchedule.archiveAtMinute for the production bug this
+	// fixes (ЭС reading the "newest" row before the current hour had been
+	// collected, recording zero-delta hours).
+	ArchiveAtMinute *int `yaml:"archive_at_minute"`
 }
 
-const GapScanDefault = 72 // hours
+const (
+	GapScanDefault         = 72 // hours
+	ArchiveAtMinuteDefault = 5  // minutes past the hour
+)
+
+// ArchiveAtMinuteOrDefault returns the configured anchor minute, or the
+// default (5). A negative configured value is preserved (disables
+// anchoring on purpose).
+func (b BackfillConfig) ArchiveAtMinuteOrDefault() int {
+	if b.ArchiveAtMinute == nil {
+		return ArchiveAtMinuteDefault
+	}
+	return *b.ArchiveAtMinute
+}
 
 // GapScanWindowOrDefault returns the configured window, or the default.
 func (b BackfillConfig) GapScanWindowOrDefault() int {

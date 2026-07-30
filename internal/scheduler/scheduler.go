@@ -134,6 +134,30 @@ type deviceSchedule struct {
 	nextCurrentDue  time.Time
 	nextArchiveDue  time.Time
 	archiveWindow   *Window
+
+	// archiveAtMinute, when >= 0, anchors the hourly archive poll to a
+	// fixed minute past each hour (e.g. 5 → always HH:05) instead of
+	// "start time + N*interval", which drifts to an arbitrary minute
+	// depending on when the process happened to start. That drift caused
+	// a real production bug (2026-07-30): the process started at ~10:15,
+	// so archive polls landed at HH:40, but ЭС reads the "newest" archive
+	// row at ~HH:08 — before HH:40 the freshest stored hour was still the
+	// PREVIOUS hour, so ЭС got the same row twice and recorded a zero
+	// delta for that hour. Anchoring to HH:05 means the current hour is
+	// collected well before ЭС's ~HH:08 read. -1 = disabled (legacy
+	// interval-only behaviour, kept for tests and non-Akron devices).
+	archiveAtMinute int
+}
+
+// nextArchiveAnchored returns the next wall-clock time strictly after
+// `now` that falls on archiveAtMinute past some hour. E.g. atMinute=5 and
+// now=13:07 → 14:05; now=13:02 → 13:05.
+func nextArchiveAnchored(now time.Time, atMinute int) time.Time {
+	candidate := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), atMinute, 0, 0, now.Location())
+	if !candidate.After(now) {
+		candidate = candidate.Add(time.Hour)
+	}
+	return candidate
 }
 
 // Scheduler produces polling Tasks from per-device schedules, plus
@@ -167,6 +191,15 @@ func New(events EventRecorder) *Scheduler {
 // so Register/Tick stay fully decoupled from wall-clock time, keeping
 // the whole schedule deterministic and testable via Tick(now) alone.
 func (s *Scheduler) Register(deviceID string, currentInterval, archiveInterval time.Duration, archiveWindow *Window) {
+	s.RegisterWithArchiveAnchor(deviceID, currentInterval, archiveInterval, archiveWindow, -1)
+}
+
+// RegisterWithArchiveAnchor is Register plus archiveAtMinute: when >= 0,
+// the hourly archive poll fires at that fixed minute past each hour
+// (HH:archiveAtMinute) instead of drifting with the process start time.
+// See deviceSchedule.archiveAtMinute for why this matters. archiveAtMinute
+// < 0 preserves the legacy interval-only behaviour.
+func (s *Scheduler) RegisterWithArchiveAnchor(deviceID string, currentInterval, archiveInterval time.Duration, archiveWindow *Window, archiveAtMinute int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.devices[deviceID] = &deviceSchedule{
@@ -176,6 +209,7 @@ func (s *Scheduler) Register(deviceID string, currentInterval, archiveInterval t
 		nextCurrentDue:  time.Time{},
 		nextArchiveDue:  time.Time{},
 		archiveWindow:   archiveWindow,
+		archiveAtMinute: archiveAtMinute,
 	}
 }
 
@@ -198,7 +232,15 @@ func (s *Scheduler) Tick(now time.Time) {
 		if ds.archiveInterval > 0 && !now.Before(ds.nextArchiveDue) {
 			if ds.archiveWindow == nil || ds.archiveWindow.contains(now) {
 				s.enqueueLocked(&Task{DeviceID: ds.deviceID, Kind: KindArchive, Priority: PriorityNormal})
-				ds.nextArchiveDue = now.Add(ds.archiveInterval)
+				// Anchored mode: next poll at the fixed minute past the
+				// next hour, so the schedule never drifts with process
+				// start time. Interval mode (archiveAtMinute < 0): legacy
+				// now+interval.
+				if ds.archiveAtMinute >= 0 {
+					ds.nextArchiveDue = nextArchiveAnchored(now, ds.archiveAtMinute)
+				} else {
+					ds.nextArchiveDue = now.Add(ds.archiveInterval)
+				}
 			} else {
 				// Outside the configured window - defer until it next
 				// opens, rather than enqueueing now or re-checking every

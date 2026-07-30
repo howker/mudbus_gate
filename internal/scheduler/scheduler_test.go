@@ -237,3 +237,56 @@ func TestScheduler_Next_EmptyQueue(t *testing.T) {
 		t.Fatal("expected ok=false for an empty queue")
 	}
 }
+
+// TestNextArchiveAnchored verifies the hour-anchored next-due calculation
+// used to stop the archive poll from drifting with process start time
+// (the 2026-07-30 zero-delta-hour bug).
+func TestNextArchiveAnchored(t *testing.T) {
+	loc := time.UTC
+	cases := []struct {
+		now      time.Time
+		atMinute int
+		want     time.Time
+	}{
+		// Before the anchor minute this hour → same hour's anchor.
+		{time.Date(2026, 7, 30, 13, 2, 0, 0, loc), 5, time.Date(2026, 7, 30, 13, 5, 0, 0, loc)},
+		// Exactly on the anchor → next hour (strictly after now).
+		{time.Date(2026, 7, 30, 13, 5, 0, 0, loc), 5, time.Date(2026, 7, 30, 14, 5, 0, 0, loc)},
+		// After the anchor minute → next hour's anchor.
+		{time.Date(2026, 7, 30, 13, 40, 0, 0, loc), 5, time.Date(2026, 7, 30, 14, 5, 0, 0, loc)},
+		// Anchor 0 (top of hour) from mid-hour → next hour :00.
+		{time.Date(2026, 7, 30, 13, 30, 0, 0, loc), 0, time.Date(2026, 7, 30, 14, 0, 0, 0, loc)},
+		// Wraps across midnight.
+		{time.Date(2026, 7, 30, 23, 50, 0, 0, loc), 5, time.Date(2026, 7, 31, 0, 5, 0, 0, loc)},
+	}
+	for i, c := range cases {
+		got := nextArchiveAnchored(c.now, c.atMinute)
+		if !got.Equal(c.want) {
+			t.Errorf("case %d: nextArchiveAnchored(%v, %d) = %v, want %v", i, c.now, c.atMinute, got, c.want)
+		}
+	}
+}
+
+// TestScheduler_ArchiveAnchor_DoesNotDrift confirms that with an anchor
+// set, consecutive archive due-times land on the fixed minute regardless
+// of the (arbitrary) minute at which polling actually happens.
+func TestScheduler_ArchiveAnchor_DoesNotDrift(t *testing.T) {
+	s := New(nil)
+	// current disabled, archive hourly, anchored to HH:05.
+	s.RegisterWithArchiveAnchor("dev1", 0, time.Hour, nil, 5)
+
+	// First tick at an arbitrary minute (13:47) — first poll is due
+	// immediately (nextArchiveDue starts at zero time).
+	s.Tick(time.Date(2026, 7, 30, 13, 47, 0, 0, time.UTC))
+	task, ok := s.Next()
+	if !ok || task.Kind != KindArchive {
+		t.Fatalf("expected an archive task on first tick, got ok=%v task=%+v", ok, task)
+	}
+
+	// Next due must be 14:05, NOT 14:47 (would be interval-drift).
+	ds := s.devices["dev1"]
+	want := time.Date(2026, 7, 30, 14, 5, 0, 0, time.UTC)
+	if !ds.nextArchiveDue.Equal(want) {
+		t.Fatalf("nextArchiveDue = %v, want %v (anchored, not drifted to :47)", ds.nextArchiveDue, want)
+	}
+}

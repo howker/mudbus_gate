@@ -180,9 +180,10 @@ func run() {
 		// current values every few seconds. The meter-clock read shares
 		// this cycle, which is why it's a long interval and not disabled.
 		currentInterval := devCfg.CurrentPollInterval()
-		sched.Register(devCfg.ID, currentInterval, archiveInterval, nil)
-		log.Printf("[OK] прибор %s зарегистрирован (текущие каждые %s, архив каждые %s)\n",
-			devCfg.ID, currentInterval, archiveInterval)
+		archiveAtMinute := devCfg.Backfill.ArchiveAtMinuteOrDefault()
+		sched.RegisterWithArchiveAnchor(devCfg.ID, currentInterval, archiveInterval, nil, archiveAtMinute)
+		log.Printf("[OK] прибор %s зарегистрирован (текущие каждые %s, архив каждые %s в HH:%02d)\n",
+			devCfg.ID, currentInterval, archiveInterval, archiveAtMinute)
 	}
 
 	// Wire the dashboard "Опросить сейчас" button (POST /api/poll). Both

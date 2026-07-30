@@ -16,6 +16,13 @@ devices:
     # code; the archive poll is a separate hourly cycle and a manual
     # "Опросить сейчас" (dashboard / POST /api/poll) can force both anytime.
     current_poll_seconds: 3600
+    # archive_at_minute: poll the hourly archive at this fixed minute past
+    # each hour (HH:05), so the current hour is in our DB before ЭС reads
+    # the "newest" row (~HH:08). Without this the poll drifted to whatever
+    # minute the process happened to start at (e.g. HH:40), and ЭС would
+    # read the same row twice and record a zero for that hour.
+    backfill:
+      archive_at_minute: 5
     transport:
       kind: "rtu_serial" # real/virtual COM port (not a raw TCP socket)
       com: "COM105" # the converter-emulated port, per the operator

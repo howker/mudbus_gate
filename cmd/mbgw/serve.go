@@ -153,9 +153,10 @@ func serve() {
 			archiveInterval = 1 * time.Hour
 		}
 		currentInterval := devCfg.CurrentPollInterval()
-		sched.Register(devCfg.ID, currentInterval, archiveInterval, nil)
-		log.Printf("[OK] прибор %s зарегистрирован (текущие каждые %s, архив каждые %s)\n",
-			devCfg.ID, currentInterval, archiveInterval)
+		archiveAtMinute := devCfg.Backfill.ArchiveAtMinuteOrDefault()
+		sched.RegisterWithArchiveAnchor(devCfg.ID, currentInterval, archiveInterval, nil, archiveAtMinute)
+		log.Printf("[OK] прибор %s зарегистрирован (текущие каждые %s, архив каждые %s в HH:%02d)\n",
+			devCfg.ID, currentInterval, archiveInterval, archiveAtMinute)
 	}
 
 	// See cmd/mbgw/run.go's identical block for why this must go through
