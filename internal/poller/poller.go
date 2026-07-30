@@ -101,6 +101,13 @@ func (p *Poller) dispatch(ctx context.Context, task scheduler.Task) {
 		dev.Poll(ctx)
 	case scheduler.KindArchive:
 		dev.PollArchives(ctx)
+	case scheduler.KindBackfill:
+		// Deep catch-up (device.BackfillArchives), same call the startup
+		// sweep makes — but dispatched here, in-queue, so it can never
+		// run concurrently with a current-value or regular-archive poll
+		// for the same device's transport. See scheduler.KindBackfill's
+		// doc comment for the incident this prevents.
+		dev.BackfillArchives(ctx, device.BackfillOptions{})
 	default:
 		log.Printf("[poller] неизвестный тип задачи %q для %q\n", task.Kind, task.DeviceID)
 	}

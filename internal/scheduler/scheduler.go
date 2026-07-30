@@ -21,6 +21,19 @@ type Kind string
 const (
 	KindCurrent Kind = "current"
 	KindArchive Kind = "archive"
+	// KindBackfill is a deep archive catch-up (device.BackfillArchives),
+	// as opposed to KindArchive's regular near-term read
+	// (device.PollArchives). Routed through the same single-threaded
+	// poller dispatch as everything else — a device's transport is not
+	// safe for concurrent use (see internal/poller's package doc), so
+	// this must NEVER be run in a standalone goroutine alongside a
+	// current-value or regular-archive poll. That happened for real on
+	// 2026-07-30: the manual "poll now" button spawned `go
+	// dev.BackfillArchives(...)` next to the scheduler's own concurrent
+	// KindCurrent dispatch, and two simultaneous reads on the same COM
+	// port produced garbled bytes on both sides (invalid CRC, invalid
+	// BCD, "rtu frame too short").
+	KindBackfill Kind = "backfill"
 )
 
 // Priority determines queue ordering; higher values are served first.

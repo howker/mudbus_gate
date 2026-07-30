@@ -185,22 +185,23 @@ func run() {
 			devCfg.ID, currentInterval, archiveInterval)
 	}
 
-	// Wire the dashboard "Опросить сейчас" button (POST /api/poll). A
-	// manual poll does two things: a deep archive backfill (same catch-up
-	// as startup, so an operator can force history collection on demand)
-	// and a high-priority current-values read. The backfill runs in a
-	// background goroutine so the HTTP handler returns immediately; the
-	// current read goes through the scheduler's PriorityManual path. An
-	// operator can also use this right after startup to force collection
-	// without waiting for the (now hourly) regular cycle.
+	// Wire the dashboard "Опросить сейчас" button (POST /api/poll). Both
+	// the deep archive backfill and the current-values read go through
+	// sched.RequestManualPoll — i.e. the SAME single-threaded poller
+	// dispatch every regular/scheduled task uses. Do not spawn a
+	// standalone goroutine touching the device here: a device's
+	// transport is not safe for concurrent access (see internal/poller's
+	// package doc), and an earlier version of this callback did exactly
+	// that (`go d.BackfillArchives(...)` next to the scheduler's own
+	// concurrent KindCurrent dispatch) — confirmed live 2026-07-30 to
+	// corrupt both reads (invalid CRC / invalid BCD / short RTU frames)
+	// when they collided on the same COM port.
 	webServer.SetManualPoll(func() {
 		log.Printf("[WEB] ручной опрос запрошен для %d прибор(ов)\n", len(devices))
 		for id, d := range devices {
 			sched.RequestManualPoll(id, scheduler.KindCurrent)
 			if len(d.Profile.Archives) > 0 {
-				go d.BackfillArchives(ctx, device.BackfillOptions{
-					MaxDepthHours: 0, // variant "В": everything missing, up to buffer depth
-				})
+				sched.RequestManualPoll(id, scheduler.KindBackfill)
 			}
 		}
 	})

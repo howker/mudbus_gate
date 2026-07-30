@@ -158,12 +158,17 @@ func serve() {
 			devCfg.ID, currentInterval, archiveInterval)
 	}
 
+	// See cmd/mbgw/run.go's identical block for why this must go through
+	// sched.RequestManualPoll (single-threaded poller dispatch) and not a
+	// standalone goroutine — confirmed live 2026-07-30 to corrupt reads
+	// when a backfill goroutine collided with a concurrent current-value
+	// poll on the same COM port.
 	webServer.SetManualPoll(func() {
 		log.Printf("[WEB] ручной опрос запрошен для %d прибор(ов)\n", len(devices))
 		for id, d := range devices {
 			sched.RequestManualPoll(id, scheduler.KindCurrent)
 			if len(d.Profile.Archives) > 0 {
-				go d.BackfillArchives(ctx, device.BackfillOptions{MaxDepthHours: 0})
+				sched.RequestManualPoll(id, scheduler.KindBackfill)
 			}
 		}
 	})
