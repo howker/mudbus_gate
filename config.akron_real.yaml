@@ -9,6 +9,13 @@ app:
 devices:
   - id: "akron_real"
     profile: "profiles/acron-01.yaml"
+    # current_poll_seconds: how often to poll current values (V/Q/meter
+    # clock). This gateway collects ARCHIVES, not real-time telemetry —
+    # current values were previously hammered every 3s for no reason.
+    # 3600 = once an hour during setup. Raise/lower here without touching
+    # code; the archive poll is a separate hourly cycle and a manual
+    # "Опросить сейчас" (dashboard / POST /api/poll) can force both anytime.
+    current_poll_seconds: 3600
     transport:
       kind: "rtu_serial" # real/virtual COM port (not a raw TCP socket)
       com: "COM105" # the converter-emulated port, per the operator

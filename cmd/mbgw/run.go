@@ -72,7 +72,9 @@ func run() {
 		port = 8080
 	}
 	webServer := web.NewServer(repo, port)
-	go webServer.Start(ctx)
+	// webServer.Start is deferred to after the scheduler and devices are
+	// built (below), so SetManualPoll can be wired first — otherwise the
+	// "Опросить сейчас" button could arrive before onManualPoll is set.
 	leaseMgr := lease.New()
 
 	// eventBus feeds the future SSE /monitor/stream endpoint (T13) and
@@ -148,12 +150,22 @@ func run() {
 
 		// Startup archive catch-up: pull whatever history the device holds
 		// that we don't have yet (variant "В"), or down to a configured
-		// depth (variant "Б"). Runs once, before the periodic poller takes
-		// over, so a gateway that was off for hours/days/weeks fills its
-		// gap from the device's ring buffer at startup. Non-blocking so a
-		// slow deep sweep doesn't hold up the rest of bring-up.
+		// depth (variant "Б"). Runs to completion HERE, before
+		// sched.Register below — deliberately blocking, not `go
+		// dev.BackfillArchives(...)`. Register() marks the archive task
+		// "due immediately" (nextArchiveDue starts at the zero time), so
+		// running backfill in parallel raced the very first regular
+		// archive poll for the same per-device lease: whichever lost got
+		// "lease held by another owner" and, since a failed archive poll
+		// isn't retried until a full archiveInterval later, effectively
+		// skipped an hour of collection right at startup (observed live
+		// 2026-07-29: this cost the 23:00 hour). Blocking here costs
+		// startup time proportional to how much history needs fetching
+		// (a few seconds on a caught-up DB, up to ~20s for a full
+		// buffer_depth_hours sweep) but that's strictly safer than a
+		// silent, hour-long gap.
 		if len(p.Archives) > 0 {
-			go dev.BackfillArchives(ctx, device.BackfillOptions{
+			dev.BackfillArchives(ctx, device.BackfillOptions{
 				MaxDepthHours: devCfg.Backfill.MaxDepthHours,
 			})
 		}
@@ -162,8 +174,37 @@ func run() {
 		if len(p.Archives) > 0 {
 			archiveInterval = 1 * time.Hour
 		}
-		sched.Register(devCfg.ID, 3*time.Second, archiveInterval, nil)
+		// Current-values interval now comes from config (default 3600s =
+		// once an hour), not a hardcoded 3s. This gateway archives; it
+		// does not do real-time telemetry, so there's no reason to poll
+		// current values every few seconds. The meter-clock read shares
+		// this cycle, which is why it's a long interval and not disabled.
+		currentInterval := devCfg.CurrentPollInterval()
+		sched.Register(devCfg.ID, currentInterval, archiveInterval, nil)
+		log.Printf("[OK] прибор %s зарегистрирован (текущие каждые %s, архив каждые %s)\n",
+			devCfg.ID, currentInterval, archiveInterval)
 	}
+
+	// Wire the dashboard "Опросить сейчас" button (POST /api/poll). A
+	// manual poll does two things: a deep archive backfill (same catch-up
+	// as startup, so an operator can force history collection on demand)
+	// and a high-priority current-values read. The backfill runs in a
+	// background goroutine so the HTTP handler returns immediately; the
+	// current read goes through the scheduler's PriorityManual path. An
+	// operator can also use this right after startup to force collection
+	// without waiting for the (now hourly) regular cycle.
+	webServer.SetManualPoll(func() {
+		log.Printf("[WEB] ручной опрос запрошен для %d прибор(ов)\n", len(devices))
+		for id, d := range devices {
+			sched.RequestManualPoll(id, scheduler.KindCurrent)
+			if len(d.Profile.Archives) > 0 {
+				go d.BackfillArchives(ctx, device.BackfillOptions{
+					MaxDepthHours: 0, // variant "В": everything missing, up to buffer depth
+				})
+			}
+		}
+	})
+	go webServer.Start(ctx)
 
 	p := poller.New(sched, devices, 1*time.Second)
 	go p.Run(ctx)

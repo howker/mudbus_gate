@@ -14,15 +14,30 @@ import (
 type Server struct {
 	repo storage.Repo
 	port int
+	// onManualPoll, when set, is invoked by POST /api/poll — the
+	// dashboard's "Опросить сейчас" button and the equivalent curl call.
+	// It triggers an immediate operator-requested poll (archive + current)
+	// on the live process without a restart. nil = the endpoint reports
+	// that manual polling isn't wired (e.g. a context that only serves the
+	// dashboard read-only), rather than panicking.
+	onManualPoll func()
 }
 
 func NewServer(repo storage.Repo, port int) *Server {
 	return &Server{repo: repo, port: port}
 }
 
+// SetManualPoll wires the operator "poll now" action. Called by run.go /
+// serve.go after the scheduler and devices exist. Kept separate from
+// NewServer so the web package doesn't need to import scheduler/device.
+func (s *Server) SetManualPoll(fn func()) {
+	s.onManualPoll = fn
+}
+
 func (s *Server) Start(ctx context.Context) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/current", s.handleAPI)
+	mux.HandleFunc("/api/poll", s.handlePoll)
 	mux.HandleFunc("/", s.handleDashboard)
 
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
@@ -46,6 +61,29 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	deviceID := r.URL.Query().Get("device_id")
 	readings, _ := s.repo.GetLatestReadings(r.Context(), deviceID)
 	_ = json.NewEncoder(w).Encode(readings)
+}
+
+// handlePoll triggers an immediate operator-requested poll (archive +
+// current) on all devices. Wired to the dashboard "Опросить сейчас" button
+// and callable directly, e.g. from PowerShell 2.0 on the ЭС server:
+//
+//	(New-Object System.Net.WebClient).UploadString('http://127.0.0.1:8080/api/poll','POST','')
+//
+// Accepts POST only (a plain browser GET must not trigger device I/O).
+func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "используйте POST"})
+		return
+	}
+	if s.onManualPoll == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "ручной опрос не подключён в этом режиме"})
+		return
+	}
+	s.onManualPoll()
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "опрос запрошен (архив + текущие)"})
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +134,10 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 </head>
 <body>
 <h2>MBGW Diagnostic Dashboard</h2>
+<p>
+<button id="pollBtn" onclick="pollNow()" style="font-size:14px;padding:8px 16px;background:#0e639c;color:#fff;border:none;cursor:pointer;">Опросить сейчас (архив + текущие)</button>
+<span id="pollStatus" style="margin-left:12px;color:#858585;"></span>
+</p>
 <table>
 <thead><tr><th>Device ID</th><th>Point ID</th><th>Instance</th><th>Value</th><th>Unit</th><th>Quality</th><th>Time</th></tr></thead>
 <tbody id="data"><tr><td colspan="7" style="text-align: center; padding: 20px;">ожидание данных...</td></tr></tbody>
@@ -141,8 +183,27 @@ function loadData() {
   };
   xhr.send();
 }
+function pollNow() {
+  var btn = document.getElementById('pollBtn');
+  var status = document.getElementById('pollStatus');
+  btn.disabled = true;
+  status.innerText = 'запрос отправлен...';
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/poll', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    btn.disabled = false;
+    if (xhr.status === 200) {
+      status.innerText = 'опрос запрошен — данные появятся в таблице через несколько секунд';
+      setTimeout(loadData, 4000);
+    } else {
+      status.innerText = 'ошибка: HTTP ' + xhr.status;
+    }
+  };
+  xhr.send('');
+}
 loadData();
-setInterval(loadData, 3000);
+setInterval(loadData, 30000);
 </script>
 </body>
 </html>`)

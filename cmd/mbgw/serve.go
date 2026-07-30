@@ -84,7 +84,7 @@ func serve() {
 		port = 8080
 	}
 	webServer := web.NewServer(repo, port)
-	go webServer.Start(ctx)
+	// Start deferred until after scheduler/devices exist (see run.go).
 
 	leaseMgr := lease.New()
 	eventBus := monitor.NewBus(nil)
@@ -137,8 +137,13 @@ func serve() {
 		dev.GapScanWindowHours = devCfg.Backfill.GapScanWindowOrDefault()
 		devices[devCfg.ID] = dev
 
+		// See cmd/mbgw/run.go's identical block for why this must be
+		// blocking (not `go dev.BackfillArchives(...)`) and run before
+		// sched.Register: it previously raced the scheduler's
+		// due-immediately first archive tick for the same per-device
+		// lease, silently costing an hour of collection at startup.
 		if len(p.Archives) > 0 {
-			go dev.BackfillArchives(ctx, device.BackfillOptions{
+			dev.BackfillArchives(ctx, device.BackfillOptions{
 				MaxDepthHours: devCfg.Backfill.MaxDepthHours,
 			})
 		}
@@ -147,8 +152,22 @@ func serve() {
 		if len(p.Archives) > 0 {
 			archiveInterval = 1 * time.Hour
 		}
-		sched.Register(devCfg.ID, 3*time.Second, archiveInterval, nil)
+		currentInterval := devCfg.CurrentPollInterval()
+		sched.Register(devCfg.ID, currentInterval, archiveInterval, nil)
+		log.Printf("[OK] прибор %s зарегистрирован (текущие каждые %s, архив каждые %s)\n",
+			devCfg.ID, currentInterval, archiveInterval)
 	}
+
+	webServer.SetManualPoll(func() {
+		log.Printf("[WEB] ручной опрос запрошен для %d прибор(ов)\n", len(devices))
+		for id, d := range devices {
+			sched.RequestManualPoll(id, scheduler.KindCurrent)
+			if len(d.Profile.Archives) > 0 {
+				go d.BackfillArchives(ctx, device.BackfillOptions{MaxDepthHours: 0})
+			}
+		}
+	})
+	go webServer.Start(ctx)
 
 	pl := poller.New(sched, devices, 1*time.Second)
 	go pl.Run(ctx)

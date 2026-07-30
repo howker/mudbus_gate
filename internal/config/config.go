@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -64,6 +65,27 @@ type DeviceConfig struct {
 	// behaviour (variant "В": pull everything the DB is missing, bounded
 	// only by the profile's buffer_depth_hours). See BACKFILL_DESIGN.md.
 	Backfill BackfillConfig `yaml:"backfill"`
+
+	// CurrentPollSeconds is how often current values (V/Q/meter clock) are
+	// polled, in seconds. This gateway's job is archive collection, not
+	// real-time telemetry, so current values do NOT need frequent polling
+	// — they were previously hammered every 3s (a leftover from live
+	// dashboard debugging, ~1000 device round-trips/hour on the RS-485
+	// line for data we don't archive). 0 → CurrentPollDefault (3600s = once
+	// an hour) for the настройка phase. The meter clock read that rides
+	// along in this same cycle is why the interval can't simply be 0/off.
+	CurrentPollSeconds int `yaml:"current_poll_seconds"`
+}
+
+const CurrentPollDefault = 3600 // seconds (once an hour)
+
+// CurrentPollInterval returns the configured current-values poll interval,
+// or the default when unset.
+func (d DeviceConfig) CurrentPollInterval() time.Duration {
+	if d.CurrentPollSeconds <= 0 {
+		return CurrentPollDefault * time.Second
+	}
+	return time.Duration(d.CurrentPollSeconds) * time.Second
 }
 
 // BackfillConfig configures archive-history catch-up per device.
