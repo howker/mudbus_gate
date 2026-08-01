@@ -102,6 +102,17 @@ func (d *Device) collectVKMHour(ctx context.Context, a profile.Archive, hourStar
 		return 0, nil
 	}
 
+	// Сырую строку сохраняем отдельно от разобранных полей — она нужна
+	// northbound-у, чтобы отдавать в ЭС ровно то, что прислал прибор, а
+	// не собирать строку заново из S/ST (см. doc-комментарий
+	// VKMArchiveSource в internal/northbound/vkm_archive.go). Ошибка
+	// сохранения сырой строки не должна ронять сохранение S/ST — это
+	// две независимые вещи.
+	if err := d.Repo.SaveVKMRawString(ctx, d.ID, q.Instance, hourStart, string(records[0].Raw)); err != nil {
+		log.Printf("[%s] VKM час %s: ошибка сохранения сырой строки: %v\n",
+			d.ID, hourStart.Format("02.01.2006 15:00"), err)
+	}
+
 	return persistVKMHourly(ctx, d, hourStart, records[0]), nil
 }
 

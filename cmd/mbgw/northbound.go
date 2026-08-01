@@ -95,7 +95,7 @@ func runNorthbound() {
 	}
 
 	if serveVKM {
-		runVKMLiveMode(listenAddr, vkmString, logPath)
+		runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID)
 		return
 	}
 
@@ -233,13 +233,16 @@ func runAkronLiveMode(listenAddr, dbPath, deviceID, logPath string) {
 // this record uses plain Modbus TCP, not raw RTU — unlike the Akron
 // carrier.
 //
-// vkmString is a FIXED test archive string for the current smoke-testing
-// stage — a real per-device, per-request archive source (reading actual
-// collected ВКМ data) is a later step once we know the real device's
-// string format and have a live ВКМ to collect from. This flag exists so
-// the transport and protocol mechanics can be verified end-to-end on a
-// live Энергосфера today, without waiting on that.
-func runVKMLiveMode(listenAddr, vkmString, logPath string) {
+// vkmString остаётся резервным вариантом для отладки механики протокола
+// без БД/живого прибора (--vkm-string, без --db/--device). Боевой режим —
+// DBVKMArchiveSource, читает реально собранные архивы из БД (см.
+// internal/device/vkm_hourly.go и internal/northbound/vkm_live.go).
+//
+// dbPath/deviceID, если заданы, включают боевой режим: строка архива
+// берётся из реально собранных данных (internal/device/vkm_hourly.go),
+// а не из фиксированной/настраиваемой заглушки. Без них поведение
+// прежнее — для отладки механики протокола без живого прибора.
+func runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID string) {
 	if listenAddr == "" {
 		fmt.Println("northbound --serve-vkm: --listen обязателен")
 		os.Exit(1)
@@ -258,13 +261,31 @@ func runVKMLiveMode(listenAddr, vkmString, logPath string) {
 	}
 	defer dlog.Close()
 
-	// Archive string comes from vkm_config.txt when present, falling back
-	// to --vkm-string (or the built-in default). This is what lets the
-	// string be changed on the Энергосфера server by editing a text file
-	// instead of rebuilding and re-uploading the binary.
-	srv := northbound.NewVKMServer(listenAddr, func() northbound.VKMArchiveSource {
-		return northbound.ConfigArchiveSource{Fallback: vkmString}
-	})
+	var newSrc func() northbound.VKMArchiveSource
+	if dbPath != "" && deviceID != "" {
+		repo, err := sqliterepo.New(dbPath)
+		if err != nil {
+			log.Fatalf("[FATAL] northbound --serve-vkm: открытие БД: %v", err)
+		}
+		defer repo.Close()
+		if err := repo.InitArchiveSchema(context.Background()); err != nil {
+			log.Fatalf("[FATAL] northbound --serve-vkm: инициализация схемы архива: %v", err)
+		}
+		src := northbound.NewDBVKMArchiveSource(repo, deviceID)
+		newSrc = func() northbound.VKMArchiveSource { return src }
+		log.Printf("northbound --serve-vkm: боевой режим — источник архива: БД %s, прибор %s\n", dbPath, deviceID)
+	} else {
+		// Archive string comes from vkm_config.txt when present, falling back
+		// to --vkm-string (or the built-in default). This is what lets the
+		// string be changed on the Энергосфера server by editing a text file
+		// instead of rebuilding and re-uploading the binary.
+		newSrc = func() northbound.VKMArchiveSource {
+			return northbound.ConfigArchiveSource{Fallback: vkmString}
+		}
+		log.Println("northbound --serve-vkm: тестовый режим (нет --db/--device) — фиксированная/настраиваемая строка")
+	}
+
+	srv := northbound.NewVKMServer(listenAddr, newSrc)
 	srv.Log = dlog
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -272,9 +293,6 @@ func runVKMLiveMode(listenAddr, vkmString, logPath string) {
 	waitForShutdownSignal(cancel, "northbound --serve-vkm")
 
 	log.Printf("northbound --serve-vkm: слушаем %s (лог: %s)\n", listenAddr, logPath)
-	log.Printf("  строка архива строится по спецификации ВКМ-360 (период + параметры + NUL)\n")
-	log.Printf("  подстройка в vkm_config.txt: time_layout, archive_string — без пересборки\n")
-
 	if err := srv.Listen(ctx); err != nil {
 		log.Fatalf("[FATAL] northbound --serve-vkm: %v", err)
 	}
@@ -346,7 +364,8 @@ func printNorthboundUsage() {
 	fmt.Println()
 	fmt.Println("  mbgw northbound --discovery --raw --listen <addr> [--log <p.jsonl>] [--sim <s.yaml>] [--cmd110 <mode>]")
 	fmt.Println("  mbgw northbound --serve-akron --listen <addr> --db <path> --device <id> [--log <p.jsonl>]")
-	fmt.Println("  mbgw northbound --serve-vkm --listen <addr> [--vkm-string <s>] [--log <p.jsonl>]")
+	fmt.Println("  mbgw northbound --serve-vkm --listen <addr> --db <p> --device <id> [--log <p.jsonl>]   (боевой режим)")
+	fmt.Println("  mbgw northbound --serve-vkm --listen <addr> [--vkm-string <s>] [--log <p.jsonl>]        (тестовый режим, без --db/--device)")
 	fmt.Println("      Raw-TCP discovery: log bare Modbus RTU and answer as an Akron (M3).")
 	fmt.Println("      --sim <file>  YAML controlling responder behaviour (edit on server, no rebuild):")
 	fmt.Println("                    cmd110, live_clock, identity, per-command overrides.")

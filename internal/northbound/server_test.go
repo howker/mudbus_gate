@@ -3,6 +3,7 @@ package northbound
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -19,6 +20,24 @@ type fakeRepo struct {
 	readings  []storage.ReadingCurrent
 	hourly    []storage.HourlyArchiveRecord
 	passports map[string]storage.DevicePassport
+	vkmRaw    map[string]string // key: deviceID|pipe|ts_hour.Unix()
+}
+
+func (f *fakeRepo) SaveVKMRawString(ctx context.Context, deviceID string, pipe int, hourStart time.Time, raw string) error {
+	if f.vkmRaw == nil {
+		f.vkmRaw = make(map[string]string)
+	}
+	f.vkmRaw[fakeVKMRawKey(deviceID, pipe, hourStart)] = raw
+	return nil
+}
+
+func (f *fakeRepo) GetVKMRawString(ctx context.Context, deviceID string, pipe int, hourStart time.Time) (string, bool, error) {
+	raw, ok := f.vkmRaw[fakeVKMRawKey(deviceID, pipe, hourStart)]
+	return raw, ok, nil
+}
+
+func fakeVKMRawKey(deviceID string, pipe int, hourStart time.Time) string {
+	return fmt.Sprintf("%s|%d|%s", deviceID, pipe, hourStart.UTC().Format(time.RFC3339))
 }
 
 func (f *fakeRepo) InitSchema(ctx context.Context) error { return nil }

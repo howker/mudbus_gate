@@ -1,0 +1,58 @@
+package northbound
+
+import (
+	"context"
+	"log"
+	"time"
+
+	"mbgw/internal/storage"
+)
+
+// DBVKMArchiveSource — «боевая» реализация VKMArchiveSource: отдаёт в ЭС
+// реально собранную с прибора строку архива (сохранённую при почасовом
+// сборе, см. internal/device/vkm_hourly.go), а не выдуманную/фиксированную
+// (как FixedVKMSource, который был нужен только для отладки механики
+// протокола до появления живого прибора).
+//
+// Принципиально важно: мы не пересобираем строку из распарсенных S/ST —
+// отдаём ровно то, что произвёл сам прибор (уже раскодировано из cp1251 в
+// UTF-8 при сборе; кодируем обратно в cp1251 перед отправкой на провод —
+// см. writeVKMResultString/cp1251Encode). Так драйвер ЭС видит те же
+// байты, что видел бы при прямом опросе настоящего ВКМ-360.
+type DBVKMArchiveSource struct {
+	repo     storage.Repo
+	deviceID string
+
+	// QueryTimeout ограничивает каждый запрос к БД; 0 = 5 секунд.
+	QueryTimeout time.Duration
+}
+
+// NewDBVKMArchiveSource создаёт источник архива ВКМ, читающий из репо.
+func NewDBVKMArchiveSource(repo storage.Repo, deviceID string) *DBVKMArchiveSource {
+	return &DBVKMArchiveSource{repo: repo, deviceID: deviceID}
+}
+
+// Archive ищет сохранённую строку за час, на который начинается [start,
+// end). Наш почасовой сбор всегда пишет ровно часовые окна (hourStart,
+// hourStart+1ч), поэтому запрос ЭС должен совпасть по границе часа —
+// если ЭС просит окно другой длины/выравнивания, вернём ok=false (нет
+// записей), а не подгонять что-то приблизительное.
+func (s *DBVKMArchiveSource) Archive(pipe int, start, end time.Time, opts uint16) (string, bool) {
+	timeout := s.QueryTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	hourStart := start.Truncate(time.Hour)
+	raw, found, err := s.repo.GetVKMRawString(ctx, s.deviceID, pipe, hourStart)
+	if err != nil {
+		log.Printf("[VKM northbound] ошибка чтения архива за %s: %v\n", hourStart.Format("02.01.2006 15:00"), err)
+		return "", false
+	}
+	if !found {
+		return "", false
+	}
+	return raw, true
+}

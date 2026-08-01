@@ -39,6 +39,20 @@ CREATE TABLE IF NOT EXISTS archive_hourly (
 );
 CREATE INDEX IF NOT EXISTS idx_archive_hourly_lookup
     ON archive_hourly (device_id, channel, param, ts_hour DESC);
+
+-- archive_vkm_raw хранит СЫРУЮ строку архива ВКМ-360 за каждый час
+-- (уже раскодированную из cp1251 в UTF-8, но не разобранную на поля).
+-- Нужна отдельно от archive_hourly, потому что там value REAL — под
+-- текст не годится. northbound должен отдавать в ЭС именно ту строку,
+-- что реально прислал прибор (не синтезировать её заново из S/ST) —
+-- см. doc-комментарий VKMArchiveSource в internal/northbound.
+CREATE TABLE IF NOT EXISTS archive_vkm_raw (
+    device_id  TEXT NOT NULL,
+    pipe       INTEGER NOT NULL,
+    ts_hour    DATETIME NOT NULL,
+    raw_string TEXT NOT NULL,
+    PRIMARY KEY (device_id, pipe, ts_hour)
+);
 `)
 	if err != nil {
 		return fmt.Errorf("init archive schema: %w", err)
@@ -191,4 +205,39 @@ WHERE device_id = ? AND channel = ? AND param = ?
 		}
 	}
 	return missing, nil
+}
+
+// SaveVKMRawString сохраняет сырую (уже раскодированную из cp1251, но не
+// разобранную на поля) строку архива ВКМ-360 за конкретный час. Upsert —
+// повторный сбор того же часа перезаписывает старое значение, как и у
+// SaveHourlyArchive.
+func (r *Repo) SaveVKMRawString(ctx context.Context, deviceID string, pipe int, hourStart time.Time, raw string) error {
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO archive_vkm_raw (device_id, pipe, ts_hour, raw_string)
+VALUES (?, ?, ?, ?)
+ON CONFLICT (device_id, pipe, ts_hour) DO UPDATE SET
+    raw_string = excluded.raw_string
+`, deviceID, pipe, hourStart, raw)
+	if err != nil {
+		return fmt.Errorf("save vkm raw string: %w", err)
+	}
+	return nil
+}
+
+// GetVKMRawString возвращает сырую строку архива ВКМ-360 за конкретный
+// час, если она есть. found=false (без ошибки) — если для этого часа
+// ничего не собрано.
+func (r *Repo) GetVKMRawString(ctx context.Context, deviceID string, pipe int, hourStart time.Time) (string, bool, error) {
+	var raw string
+	err := r.db.QueryRowContext(ctx, `
+SELECT raw_string FROM archive_vkm_raw
+WHERE device_id = ? AND pipe = ? AND ts_hour = ?
+`, deviceID, pipe, hourStart).Scan(&raw)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("get vkm raw string: %w", err)
+	}
+	return raw, true, nil
 }

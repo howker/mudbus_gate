@@ -38,6 +38,13 @@ type Repo interface {
 	// truncated to the hour by the caller.
 	MissingHours(ctx context.Context, deviceID, channel, param string, fromHour, toHour time.Time) ([]time.Time, error)
 
+	// SaveVKMRawString/GetVKMRawString хранят сырую (раскодированную из
+	// cp1251, но не разобранную на поля) строку архива ВКМ-360 за час —
+	// нужна northbound-у, чтобы отдавать в ЭС именно то, что прислал
+	// прибор, а не собирать строку заново из S/ST.
+	SaveVKMRawString(ctx context.Context, deviceID string, pipe int, hourStart time.Time, raw string) error
+	GetVKMRawString(ctx context.Context, deviceID string, pipe int, hourStart time.Time) (raw string, found bool, err error)
+
 	// Device passport store (M4). Static identity read once at startup and
 	// served upstream on command 101. GetDevicePassport reports found=false
 	// (nil error) when the device has not been identified yet.
