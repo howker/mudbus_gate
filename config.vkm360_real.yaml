@@ -1,0 +1,36 @@
+app:
+  # Own DB file, separate from the Akron pilot's mbgw.db — keeps the two
+  # real-device deployments independent (no shared-file WAL contention,
+  # no risk of one poller's mistake touching the other's data). If you
+  # later want ONE process serving both devices, list them both under
+  # `devices:` in a single config instead of running two config files.
+  storage_path: "mbgw_vkm.db"
+  web_port: 8081 # different port from Akron's 8080 dashboard if run alongside it
+
+devices:
+  - id: "vkm360_real"
+    profile: "profiles/vkm360.yaml"
+    # current_poll_seconds: same reasoning as Akron — this gateway
+    # collects archives, not real-time telemetry. 3600 = once an hour.
+    current_poll_seconds: 3600
+    # archive_at_minute: collect the just-closed hour shortly after it
+    # closes (HH:05), not on whatever minute the process happened to
+    # start — same fix already applied for Akron's ЭС zero-delta-hour bug.
+    # max_depth_hours is deliberately left UNSET here: VKM's default
+    # (device.vkmDefaultBackfillDepthHours = 24h) applies. Each missing
+    # hour costs a real multi-second device round-trip (one full
+    # write/poll/read request per hour, confirmed live 2026-08-01) —
+    # raise this only if you specifically need deeper history and are
+    # prepared for the wait (e.g. 168 for a week ≈ up to ~168 requests
+    # at startup).
+    backfill:
+      archive_at_minute: 5
+    transport:
+      kind: "modbus_tcp" # REAL Modbus TCP/MBAP — confirmed live, this is
+      # a proper Modbus TCP gateway, not a raw-RTU-over-TCP converter like
+      # Akron's RawTCP setup (see tools/vkmprobe's --tcp-mbap flag, which
+      # exists precisely because these two framings are NOT interchangeable).
+      host: "10.48.228.126"
+      port: 502
+      timeout_ms: 1000
+      unit_id: 2 # confirmed live via tools/vkmprobe --unit 2

@@ -368,3 +368,43 @@ func TestReadRegistersChunked_SkipsOneShotAboveModbusMax(t *testing.T) {
 		t.Fatalf("reconstructed payload mismatch")
 	}
 }
+
+// TestParseTaggedString_MixedBracketStyles is a regression test for the
+// 2026-08-01 incident: a real 24-hour VKM backfill saved ZERO hours
+// because S and ST — the two fields the whole hourly integration depends
+// on — use {...} for their header while Pi/Pbar/T/dP use <...>, all in
+// the SAME response string. An angle-only stripper left S/ST as
+// unparsed raw text forever.
+func TestParseTaggedString_MixedBracketStyles(t *testing.T) {
+	// Trimmed-down real fragment (2026-08-01, tools/mbgw.log): S and ST
+	// use curly braces, Pi uses angle brackets, in the same string.
+	raw := "Pi=<Избыт. давление *>4.2097e+05Па;" +
+		"S={Масса теплонос. }2049.8782кг;" +
+		"ST={Тепловая энергия }5.888087e+09Дж;" +
+		"Time={Время  }31/07/26 16:00:00-31/07/26 17:00:00;" +
+		"Twrk={Время штатной работы}1ч00м00с;"
+
+	recs, err := parseTaggedString(raw)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	fields := recs[0].Fields
+
+	if v, ok := fields["Pi"].(float64); !ok || v != 4.2097e+05 {
+		t.Fatalf("expected Pi=4.2097e+05 (angle-bracket header), got %v", fields["Pi"])
+	}
+	if v, ok := fields["S"].(float64); !ok || v != 2049.8782 {
+		t.Fatalf("expected S=2049.8782 (curly-brace header) — the exact field the hourly integration depends on, got %v (%T)", fields["S"], fields["S"])
+	}
+	if u, ok := fields["S_unit"].(string); !ok || u != "кг" {
+		t.Fatalf("expected S_unit='кг', got %v", fields["S_unit"])
+	}
+	if v, ok := fields["ST"].(float64); !ok || v != 5.888087e+09 {
+		t.Fatalf("expected ST=5.888087e+09 (curly-brace header), got %v", fields["ST"])
+	}
+	// Time and Twrk are non-numeric (date range / duration text) — must
+	// survive as readable strings, not raw unparsed "{header}value" junk.
+	if got, ok := fields["Time"].(string); !ok || got != "31/07/26 16:00:00-31/07/26 17:00:00" {
+		t.Fatalf("expected Time to be the plain date range, got %v", fields["Time"])
+	}
+}

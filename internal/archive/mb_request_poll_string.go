@@ -365,11 +365,17 @@ var numericPrefixRe = regexp.MustCompile(`^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?`)
 //
 // Two header placements are supported, tried in this order:
 //
-//  1. тег=<шапка>значениеЕДИНИЦА;  — CONFIRMED against real hardware
-//     (2026-08-01): the header sits AFTER '=' in angle brackets, and the
-//     value and unit are concatenated with NO separating space (e.g.
-//     "Pi=<Расход. Массовый *>4.2229e+05кг/ч;"). A numeric-prefix regex
-//     splits the value from the trailing unit text.
+//  1. тег=<шапка>значениеЕДИНИЦА;  or  тег={шапка}значениеЕДИНИЦА;  —
+//     CONFIRMED against real hardware (2026-08-01): the header sits AFTER
+//     '=', and the value/unit are concatenated with NO separating space
+//     (e.g. "Pi=<Изб.давление *>4.2229e+05кг/ч;"). The bracket STYLE is
+//     inconsistent across tags in the SAME response: Pi/Pbar/T/dP used
+//     angle brackets, while S/ST/H/Time/Twrk/Tnss/NSS/S_ns/ST_ns — the
+//     very fields the hourly integration depends on — used curly braces.
+//     A version that only stripped '<...>' left every curly-header tag
+//     unparsed for a full 24-hour live backfill (0 hours saved) before
+//     this was caught; stripHeaderBlock now handles both. A
+//     numeric-prefix regex splits the value from the trailing unit text.
 //  2. тег{шапка}=значение ед.изм;  — the format originally assumed from
 //     CONTRACTS.md's spec text (header BEFORE '=' in curly braces, value
 //     and unit space-separated). Kept for compatibility in case a
@@ -405,10 +411,11 @@ func parseTaggedString(raw string) ([]ArchiveRecord, error) {
 			tag = strings.TrimSpace(tagPart[:br])
 		}
 
-		// Real format: header AFTER '=' in <...>. Strip it before
-		// splitting value/unit. No-op if valuePart doesn't start with '<'
-		// (format 2, or a tag with no header at all).
-		valuePart = stripAngleHeader(valuePart)
+		// Real format: header AFTER '=' in <...> OR {...}. Strip it
+		// before splitting value/unit. No-op if valuePart doesn't start
+		// with either bracket (format 2 with the header already stripped
+		// via tagPart's '{', or a tag with no header at all).
+		valuePart = stripHeaderBlock(valuePart)
 
 		valueStr := valuePart
 		unit := ""
@@ -448,15 +455,23 @@ func parseTaggedString(raw string) ([]ArchiveRecord, error) {
 	return []ArchiveRecord{rec}, nil
 }
 
-// stripAngleHeader removes a leading "<...>" block (the real device's
-// header/description placement) and returns the trimmed remainder. If
-// valuePart doesn't start with '<', or has no matching '>', it's returned
-// unchanged.
-func stripAngleHeader(valuePart string) string {
-	if !strings.HasPrefix(valuePart, "<") {
+// stripHeaderBlock removes a leading "<...>" or "{...}" block (the real
+// device's header/description placement — CONFIRMED live to use BOTH
+// styles inconsistently across different tags in the same response
+// string) and returns the trimmed remainder. If valuePart doesn't start
+// with either opening bracket, or has no matching closing bracket, it's
+// returned unchanged.
+func stripHeaderBlock(valuePart string) string {
+	var closer byte
+	switch {
+	case strings.HasPrefix(valuePart, "<"):
+		closer = '>'
+	case strings.HasPrefix(valuePart, "{"):
+		closer = '}'
+	default:
 		return valuePart
 	}
-	if end := strings.Index(valuePart, ">"); end >= 0 {
+	if end := strings.IndexByte(valuePart, closer); end >= 0 {
 		return strings.TrimSpace(valuePart[end+1:])
 	}
 	return valuePart
