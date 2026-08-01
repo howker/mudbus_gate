@@ -41,8 +41,14 @@ type ModbusByteOrderAuth struct {
 	// txID is the rolling Modbus TCP transaction id used for protocol helpers.
 	txID uint16
 
-	// unitID is currently pinned to the default Modbus slave id used by the
-	// early session skeleton. It can be moved to profile/device config later.
+	// unitID is the Modbus slave/bus address used for every request this
+	// session makes (control-register reads AND the authorize writes to
+	// 200/201). Defaults to 1 — set the real device address via SetUnitID
+	// before Open() for any device not actually at address 1 (confirmed:
+	// reads (110/112/114) appear tolerant of a wrong unit id on this
+	// device's TCP gateway, but there is no reason to assume the
+	// authorize WRITE step is equally lenient, so this must be correct
+	// before authorize() runs, not just for detectByteOrder()).
 	unitID uint8
 }
 
@@ -260,7 +266,19 @@ func float32AlmostEqual(a, b float32) bool {
 }
 
 func float64AlmostEqual(a, b float64) bool {
-	return math.Abs(a-b) <= 1e-12
+	// 1e-12 was too tight: vkmGolden114Float64 (123.4567890123456) has 16
+	// significant digits, right at float64's precision limit. The real
+	// device's own decimal-to-IEEE754 conversion of that constant can
+	// differ from Go's by a bit or two in the mantissa — not a device
+	// fault, just normal floating-point rounding — which 1e-12 rejected
+	// even though the values are for all practical purposes identical.
+	// CONFIRMED against real hardware (2026-07-30, tools/vkmprobe
+	// --probe-control-regs): register 114 via HR/"01234567" matches
+	// under a 1e-9 tolerance but not 1e-12. 1e-6 keeps a comfortable
+	// margin above real rounding noise while staying far tighter than
+	// any plausible false-positive (adjacent orders/garbage bytes decode
+	// to values differing by many orders of magnitude, not by 1e-6).
+	return math.Abs(a-b) <= 1e-6
 }
 
 func isBusyModbusError(err error) bool {

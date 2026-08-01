@@ -45,14 +45,18 @@ type BackfillOptions struct {
 // zeroed device never poisons the store.
 func (d *Device) BackfillArchives(ctx context.Context, opts BackfillOptions) {
 	for _, a := range d.Profile.Archives {
-		if a.Strategy != "akron_archive" {
-			continue // only the index-addressable Akron archive for now
+		switch a.Strategy {
+		case "akron_archive":
+			kind, _ := a.Params["archive_kind"].(string)
+			if kind != "hourly" {
+				continue
+			}
+			d.backfillAkronHourly(ctx, a, opts)
+		case "mb_request_poll_string":
+			d.backfillVKMHourly(ctx, a, opts)
+		default:
+			continue // strategy has no backfill path (yet)
 		}
-		kind, _ := a.Params["archive_kind"].(string)
-		if kind != "hourly" {
-			continue
-		}
-		d.backfillAkronHourly(ctx, a, opts)
 	}
 }
 

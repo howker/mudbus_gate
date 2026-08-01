@@ -300,6 +300,15 @@ func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, i
 // (exported so internal/poller can drive it centrally).
 func (d *Device) PollArchives(ctx context.Context) {
 	for _, a := range d.Profile.Archives {
+		// VKM's mb_request_poll_string strategy returns ONE aggregate per
+		// request (CONFIRMED live 2026-08-01 — see vkm_hourly.go), not a
+		// per-hour breakdown the generic single-wide-window query below
+		// would assume. It gets its own dedicated per-hour path instead.
+		if a.Strategy == "mb_request_poll_string" {
+			d.pollVKMHourlyLatest(ctx, a)
+			continue
+		}
+
 		reader, ok := archive.Get(a.Strategy)
 		if !ok {
 			log.Printf("[%s] архив %s: неизвестная стратегия %s\n", d.ID, a.ID, a.Strategy)

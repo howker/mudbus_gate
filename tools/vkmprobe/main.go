@@ -68,6 +68,8 @@ func main() {
 	skipArchive := flag.Bool("skip-archive", false, "skip the archive request, only read current values")
 	skipSession := flag.Bool("skip-session", false, "skip session.Open() (byte-order detect + auth) entirely and go straight to current-value/archive reads. Use this if the byte-order handshake fails (e.g. modbus exception on register 110) — many real Modbus devices allow plain register reads with no handshake at all; this tells you whether that's the case here.")
 	probeControlRegs := flag.Bool("probe-control-regs", false, "diagnostic: instead of the normal flow, try reading the CONTRACTS.md §byte-order control constant (expected int32=1234567890 at register 110) across HR/IR spaces and 109/110 addressing, and print the raw results. Use this when the handshake's register-110 read fails with an address error, to find out where the value actually lives on THIS device.")
+	probeArchiveRegs := flag.Bool("probe-archive-regs", false, "diagnostic: instead of the normal flow, try READING (not writing — safe) the archive-request register block (7900-7914) via HR function 03, at a few nearby address offsets, to check whether the block exists at all on this firmware before the archive dance's WRITE attempt hits it.")
+	probeArchiveRead := flag.Bool("probe-archive-read", false, "diagnostic: assumes a request is already 'ready' (run the normal flow first, or this reads whatever result — even someone else's — is currently cached). Bundles several checks for the 'read archive string' step failing: exact length-register value, a sweep of read quantities (to find the device's real per-request register cap), alternate data-start addresses, and a fresh status re-check.")
 	flag.Parse()
 
 	var params transport.Params
@@ -122,6 +124,16 @@ func main() {
 
 	if *probeControlRegs {
 		probeControlRegisters(ctx, tr, isTCP, uint8(*unit))
+		return
+	}
+
+	if *probeArchiveRegs {
+		probeArchiveRegisters(ctx, tr, isTCP, uint8(*unit))
+		return
+	}
+
+	if *probeArchiveRead {
+		probeArchiveReadStep(ctx, tr, isTCP, uint8(*unit))
 		return
 	}
 
@@ -346,6 +358,266 @@ func probeControlRegisters(ctx context.Context, tr transport.Transport, isTCP bo
 	fmt.Println("Сравни сырые байты double вручную с ожидаемыми (40 5E DD 3C 07 FB 4C 93) — если это")
 	fmt.Println("такие же байты, но в другом порядке (не 4-байтовыми парами, а иначе перемешаны),")
 	fmt.Println("порядок придётся добавить в internal/codec/codec.go:Reorder64 отдельным случаем.")
+}
+
+// probeArchiveRegisters is a one-shot diagnostic bundling several
+// hypotheses for why startRequest's WRITE to register 7900
+// (CONTRACTS.md §6.1 / registri_mbrrtu_vkm.pdf) fails with "illegal data
+// address" — deliberately checking all of them in one run instead of
+// iterating server round-trips one guess at a time:
+//
+//  1. Does the whole 7900-8002 block even exist on THIS firmware, in
+//     EITHER register space (HR, which the doc implies, or IR)?
+//  2. Does a plain, isolated WRITE to 7900 alone (the same mechanism
+//     that already proved itself working for the auth registers 200/201
+//     during session.Open()) succeed or fail, and what EXACTLY does the
+//     device say?
+//  3. If the write fails, does a READ of 7900 immediately after still
+//     show a sane value (register exists, write specifically rejected)
+//     or the same address error (register plain doesn't exist here)?
+//  4. Sanity check against a block we KNOW works from the current-value
+//     read (real-time clock 1800-1805HR) — confirms our general
+//     register I/O isn't itself flaky, so a failure on 7900+ really is
+//     specific to that block.
+//  5. Firmware/serial identification (1807HR version, 1810HR serial) —
+//     if this is a different firmware revision than CONTRACTS.md's
+//     source documentation assumed, the archive register map could
+//     simply differ for this unit.
+func probeArchiveRegisters(ctx context.Context, tr transport.Transport, isTCP bool, unit uint8) {
+	fmt.Println("\n=== диагностика архивного блока (7900-8002) — несколько гипотез разом ===")
+
+	fmt.Println("\n--- 0) контрольная проверка: часы прибора (1800-1805 HR) — точно рабочий диапазон ---")
+	clockNames := []string{"день", "месяц", "год", "часы", "минуты", "секунды"}
+	for i, name := range clockNames {
+		addr := 1800 + i
+		readInt16(ctx, tr, isTCP, unit, "HR", addr, name)
+	}
+
+	fmt.Println("\n--- 0b) прошивка/серийник — вдруг это другая ревизия карты регистров ---")
+	readInt16(ctx, tr, isTCP, unit, "HR", 1807, "номер версии ПО")
+	if data, err := modbus.ReadPoint(ctx, tr, isTCP, unit, "HR", 1810, "int32"); err != nil {
+		fmt.Printf("HR 1810 (серийный номер, int32)            : ошибка: %v\n", err)
+	} else if v, err := codec.DecodeInt32(data, "0123"); err == nil {
+		fmt.Printf("HR 1810 (серийный номер, int32)            : %d (сырые байты % X)\n", v, data)
+	}
+
+	fmt.Println("\n--- 1) блок 7900-7914 (запрос) и 8000-8002 (статус) — обе пространства ---")
+	archAddrs := []struct {
+		name string
+		addr int
+	}{
+		{"7900 (id запроса)", 7900},
+		{"7901 (труба)", 7901},
+		{"7902 (нач.время,день)", 7902},
+		{"7908 (кон.время,день)", 7908},
+		{"7914 (опции)", 7914},
+		{"8000 (статус)", 8000},
+		{"8001 (эхо id)", 8001},
+		{"8002 (длина результата)", 8002},
+	}
+	for _, a := range archAddrs {
+		readInt16(ctx, tr, isTCP, unit, "HR", a.addr, a.name)
+	}
+	fmt.Println("  (то же самое, но через IR — вдруг пространство не HR):")
+	for _, a := range archAddrs {
+		readInt16(ctx, tr, isTCP, unit, "IR", a.addr, a.name)
+	}
+
+	fmt.Println("\n--- 2) изолированная запись+чтение рег.7900 (та же механика, что уже сработала для 200/201) ---")
+	writeErr := writeSingleRegister(ctx, tr, isTCP, unit, 7900, 1)
+	if writeErr != nil {
+		fmt.Printf("ЗАПИСЬ HR 7900 = 1 (unit=%d) : ошибка: %v\n", unit, writeErr)
+	} else {
+		fmt.Printf("ЗАПИСЬ HR 7900 = 1 (unit=%d) : успех\n", unit)
+	}
+	fmt.Println("  чтение сразу после попытки записи (регистр существует, но запись отклонена, или тот же address error?):")
+	readInt16(ctx, tr, isTCP, unit, "HR", 7900, "7900 после попытки записи")
+
+	fmt.Println("\n--- 3) запись НЕСКОЛЬКИХ регистров разом (функция 16) — так пишутся поля времени 7902-7913 ---")
+	fmt.Println("(7900/7901/7914 пишутся по одному регистру функцией 06 — она уже подтверждена в пункте 2)")
+	now := time.Now()
+	timeRegs := []uint16{
+		uint16(now.Day()), uint16(now.Month()), uint16(now.Year()),
+		uint16(now.Hour()), uint16(now.Minute()), uint16(now.Second()),
+	}
+	if err := writeMultipleRegisters(ctx, tr, isTCP, unit, 7902, timeRegs); err != nil {
+		fmt.Printf("ЗАПИСЬ HR 7902 (6 рег., функция 16) = %v : ошибка: %v\n", timeRegs, err)
+	} else {
+		fmt.Printf("ЗАПИСЬ HR 7902 (6 рег., функция 16) = %v : успех\n", timeRegs)
+	}
+	fmt.Println("  чтение всех 6 регистров сразу после записи:")
+	for i, label := range []string{"день", "месяц", "год", "часы", "минуты", "секунды"} {
+		readInt16(ctx, tr, isTCP, unit, "HR", 7902+i, "7902+"+fmt.Sprint(i)+" ("+label+")")
+	}
+
+	// Deliberately LAST: this alt-unit-address test previously caused a
+	// transport-level "not open" error (the device likely just doesn't
+	// answer a "wrong" unit at all on this TCP connection, which our
+	// transport treats as needing a fresh Open) — not a meaningful
+	// modbus-level answer, and risks leaving the connection in a state
+	// that would contaminate any diagnostic run AFTER it. Kept only for
+	// completeness; the earlier run's result already argues against this
+	// hypothesis mattering here (register reads/writes work fine at the
+	// device's real unit id regardless).
+	fmt.Println("\n--- 4) (для полноты, менее вероятно) архивный блок на СВОЁМ unit-адресе для TCP-клиентов ---")
+	fmt.Println("(registri_mbrrtu_vkm.pdf: 'Протоколу Modbus/TCP выделено 17 адресов (0-16)'; предыдущий")
+	fmt.Println(" прогон уже дал транспортную ошибку, а не осмысленный ответ прибора — маловероятная версия)")
+	for _, altUnit := range []uint8{0, 1, unit + 1} {
+		if altUnit == unit {
+			continue
+		}
+		err := writeSingleRegister(ctx, tr, isTCP, altUnit, 7900, 1)
+		if err != nil {
+			fmt.Printf("ЗАПИСЬ HR 7900 = 1 (unit=%d) : ошибка: %v\n", altUnit, err)
+		} else {
+			fmt.Printf("ЗАПИСЬ HR 7900 = 1 (unit=%d) : успех  <-- ЕСЛИ ВИДИШЬ ЭТО, ДЕЛО В UNIT-АДРЕСЕ\n", altUnit)
+		}
+	}
+
+	fmt.Println("\n=== ИТОГ ===")
+	fmt.Println("если 1)/2) прошли, а 3) провалилась — функция 16 (запись нескольких регистров) не")
+	fmt.Println("работает на этом приборе/подключении, хотя функция 06 (один регистр) работает. Тогда")
+	fmt.Println("правим startRequest — писать все 15 регистров 7900-7914 ПООДИНОЧНЕ функцией 06.")
+	fmt.Println("если 1)/2)/3) все прошли — значит и запись работает полностью, и запрос архива должен")
+	fmt.Println("собираться штатно; тогда проблема в другом шаге (waitReady/чтение результата) — пришли")
+	fmt.Println("вывод обычного (не диагностического) запуска, разберём его отдельно.")
+}
+
+// readInt16 reads one HR/IR int16 register and prints the result or error,
+// used by several probe helpers to keep output format consistent.
+func readInt16(ctx context.Context, tr transport.Transport, isTCP bool, unit uint8, space string, addr int, label string) {
+	data, err := modbus.ReadPoint(ctx, tr, isTCP, unit, space, addr, "int16")
+	if err != nil {
+		fmt.Printf("%s %-30s : ошибка: %v\n", space, label, err)
+		return
+	}
+	v, err := codec.DecodeInt16(data)
+	if err != nil {
+		fmt.Printf("%s %-30s : сырые байты = % X (не int16: %v)\n", space, label, data, err)
+		return
+	}
+	fmt.Printf("%s %-30s : значение = %-8d (сырые байты % X)\n", space, label, v, data)
+}
+
+// writeSingleRegister writes one HR register via Modbus function 06.
+func writeSingleRegister(ctx context.Context, tr transport.Transport, isTCP bool, unit uint8, addr int, value uint16) error {
+	reqPDU := modbus.BuildWriteSingleRegisterPDU(addr, value)
+	_, err := modbus.Transact(ctx, tr, isTCP, nextProbeTxID(), unit, reqPDU)
+	return err
+}
+
+// writeMultipleRegisters writes a block of HR registers via Modbus
+// function 16 — the mechanism startRequest uses for the 6-register time
+// fields (7902-7907, 7908-7913), as opposed to writeSingleRegister's
+// function 06 used for the single-value fields (7900, 7901, 7914).
+func writeMultipleRegisters(ctx context.Context, tr transport.Transport, isTCP bool, unit uint8, addr int, values []uint16) error {
+	reqPDU, err := modbus.BuildWriteMultipleRegistersPDU(addr, values)
+	if err != nil {
+		return err
+	}
+	_, err = modbus.Transact(ctx, tr, isTCP, nextProbeTxID(), unit, reqPDU)
+	return err
+}
+
+var probeTxID uint16
+
+func nextProbeTxID() uint16 {
+	probeTxID++
+	return probeTxID
+}
+
+// probeArchiveReadStep bundles several hypotheses for why readResultString's
+// final read (the data block at 8003+) fails with Modbus exception 0x03
+// (illegal data VALUE, as opposed to 0x02 illegal ADDRESS — the register
+// itself is accepted, something about the request's shape isn't):
+//
+//  1. Exact current length-register (8002) value — the source of truth for
+//     how many registers readResultString computes and requests.
+//  2. A sweep of read quantities (1, 2, 5, 10, 20, 50, 100, and the exact
+//     computed value) at the data-start address, to find whether the
+//     device caps how many registers it will return in one read (some
+//     devices cap well below the Modbus spec's 125-register ceiling).
+//  3. Alternate data-start addresses (8003, 8002, 8004) in case of an
+//     off-by-one in the documented base.
+//  4. A fresh status (8000) re-check — the result-cache window is only
+//     ~300s per the doc, so if this runs a while after the last real
+//     request, "ready" may have already reverted to "no records"/expired,
+//     which would explain a value error on the FOLLOWING read differently
+//     than a genuine quantity/address problem.
+func probeArchiveReadStep(ctx context.Context, tr transport.Transport, isTCP bool, unit uint8) {
+	fmt.Println("\n=== диагностика шага чтения результата (8002 длина, 8003+ данные) ===")
+
+	fmt.Println("\n--- 0) статус сейчас (окно кэша результата ~300с — мог уже истечь) ---")
+	if data, err := modbus.ReadPoint(ctx, tr, isTCP, unit, "HR", 8000, "int16"); err != nil {
+		fmt.Printf("HR статус (8000) : ошибка: %v\n", err)
+	} else {
+		v, _ := codec.DecodeInt16(data)
+		labels := map[int16]string{0: "expired (истёк)", 1: "collecting (собирается)", 2: "ready (готово)", 3: "no records (нет записей)", 4: "bad start", 5: "bad end", 6: "bad pipe", 7: "too large"}
+		label, ok := labels[v]
+		if !ok {
+			label = "неизвестно"
+		}
+		fmt.Printf("HR статус (8000) : значение = %d (%s)\n", v, label)
+	}
+
+	fmt.Println("\n--- 1) точное значение длины (8002) ---")
+	lenData, lenErr := modbus.ReadPoint(ctx, tr, isTCP, unit, "HR", 8002, "int16")
+	var strLen int
+	if lenErr != nil {
+		fmt.Printf("HR 8002 (длина) : ошибка: %v\n", lenErr)
+	} else {
+		v, _ := codec.DecodeInt16(lenData)
+		strLen = int(v)
+		neededRegs := (strLen + 1) / 2
+		fmt.Printf("HR 8002 (длина) : значение = %d символов -> расчётно нужно %d регистров\n", strLen, neededRegs)
+	}
+
+	fmt.Println("\n--- 2) перебор количества регистров за одно чтение начиная с 8003 ---")
+	qtys := []int{1, 2, 5, 10, 20, 50, 100}
+	if strLen > 0 {
+		needed := (strLen + 1) / 2
+		already := false
+		for _, q := range qtys {
+			if q == needed {
+				already = true
+			}
+		}
+		if !already && needed > 0 {
+			qtys = append(qtys, needed)
+		}
+	}
+	for _, qty := range qtys {
+		pdu, err := modbus.BuildReadPDUWithQty("HR", 8003, uint16(qty))
+		if err != nil {
+			fmt.Printf("чтение 8003, qty=%-4d : ошибка сборки PDU: %v\n", qty, err)
+			continue
+		}
+		resp, err := modbus.Transact(ctx, tr, isTCP, nextProbeTxID(), unit, pdu)
+		if err != nil {
+			fmt.Printf("чтение 8003, qty=%-4d : ошибка: %v\n", qty, err)
+			continue
+		}
+		fmt.Printf("чтение 8003, qty=%-4d : успех, получено байт данных = %d\n", qty, len(resp)-2)
+	}
+
+	fmt.Println("\n--- 3) альтернативные адреса начала данных (вдруг не 8003) ---")
+	for _, addr := range []int{8002, 8003, 8004} {
+		pdu, _ := modbus.BuildReadPDUWithQty("HR", addr, 5)
+		resp, err := modbus.Transact(ctx, tr, isTCP, nextProbeTxID(), unit, pdu)
+		if err != nil {
+			fmt.Printf("чтение с адреса %d, qty=5 : ошибка: %v\n", addr, err)
+			continue
+		}
+		fmt.Printf("чтение с адреса %d, qty=5 : успех, сырые байты = % X\n", addr, resp[2:])
+	}
+
+	fmt.Println("\n=== ИТОГ ===")
+	fmt.Println("если пункт 2) показывает успех для МАЛЫХ qty, но ошибку для большего — найден реальный")
+	fmt.Println("потолок регистров за одно чтение у этого прибора; тогда readResultString нужно читать")
+	fmt.Println("результат несколькими чтениями по кругу, а не одним большим запросом.")
+	fmt.Println("если 2) провалилась ВЕЗДЕ, а 3) на каком-то адресе — успех, значит адрес данных другой.")
+	fmt.Println("если статус в 0) уже НЕ 'готово' — окно кэша истекло, и это просто гонка по времени,")
+	fmt.Println("а не баг: нужно читать данные быстрее после готовности статуса.")
 }
 
 func archiveWindow(minutesBack int, fromStr, toStr string) (time.Time, time.Time, error) {
