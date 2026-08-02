@@ -28,6 +28,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -52,6 +54,8 @@ func main() {
 	showTo := flag.String("show-to", "", "LIST mode: window end (e.g. \"2026-07-30 01:00\"). Read-only.")
 	vkmRaw := flag.Bool("vkm-raw", false, "с --show-from/--show-to: вместо archive_hourly (S/ST) показать сырые строки архива ВКМ из archive_vkm_raw")
 	vkmPipe := flag.Int("pipe", 1, "с --vkm-raw: номер трубы (по умолчанию 1)")
+	vkmForget := flag.Bool("vkm-forget", false, "с --show-from/--show-to и --vkm-raw: УДАЛИТЬ периоды в этом окне из archive_hourly (S/ST) и archive_vkm_raw, чтобы дозабор/gap-scan переснял их заново — полезно, если прибор один раз отдал битую/непривычную строку и нужно попробовать ещё раз")
+	vkmScan := flag.Bool("vkm-scan", false, "просканировать ВСЮ историю archive_vkm_raw для устройства на посторонние символы (переносы строк, управляющие байты) — вместо точечной проверки одного периода за раз. Read-only.")
 	flag.Parse()
 
 	if *dbPath == "" || *deviceID == "" {
@@ -65,7 +69,18 @@ func main() {
 	}
 	defer db.Close()
 
-	// LIST mode takes precedence and never modifies anything.
+	// LIST mode takes precedence and never modifies anything, EXCEPT
+	// --vkm-forget, which is the one deliberate exception (explicit flag,
+	// explicit window, explicit action word — "forget", not "delete", to
+	// keep it distinct from the future-date --delete mode above).
+	if *vkmScan {
+		scanVKMAnomalies(db, *deviceID, *vkmPipe)
+		return
+	}
+	if *vkmRaw && *vkmForget && (*showFrom != "" || *showTo != "") {
+		forgetVKMWindow(db, *deviceID, *vkmPipe, *showFrom, *showTo)
+		return
+	}
 	if *vkmRaw && (*showFrom != "" || *showTo != "") {
 		listVKMRaw(db, *deviceID, *vkmPipe, *showFrom, *showTo)
 		return
@@ -222,6 +237,118 @@ ORDER BY ts_hour DESC
 		fmt.Printf("  %s:\n    %s\n\n", r.ts.Format("02.01.2006 15:04"), r.raw)
 	}
 	fmt.Printf("Всего строк: %d\n", len(got))
+}
+
+// forgetVKMWindow deletes every archive_hourly (S/ST) and archive_vkm_raw
+// row for the device/pipe within the given window — so the next
+// backfill/gap-scan cycle sees these periods as genuinely missing and
+// re-fetches them from the device. Prints exactly what was removed;
+// never silent.
+func forgetVKMWindow(db *sql.DB, deviceID string, pipe int, fromStr, toStr string) {
+	from := parseShowTime(fromStr, "--show-from", time.Time{})
+	to := parseShowTime(toStr, "--show-to", time.Now().Add(time.Hour))
+
+	resHourly, err := db.Exec(`
+DELETE FROM archive_hourly
+WHERE device_id = ? AND param IN ('S','ST') AND ts_hour >= ? AND ts_hour <= ?
+`, deviceID, from, to)
+	if err != nil {
+		fatal("удаление из archive_hourly", err)
+	}
+	nHourly, _ := resHourly.RowsAffected()
+
+	resRaw, err := db.Exec(`
+DELETE FROM archive_vkm_raw
+WHERE device_id = ? AND pipe = ? AND ts_hour >= ? AND ts_hour <= ?
+`, deviceID, pipe, from, to)
+	if err != nil {
+		fatal("удаление из archive_vkm_raw", err)
+	}
+	nRaw, _ := resRaw.RowsAffected()
+
+	fmt.Printf("Забыто для %s (труба %d) за период %s .. %s:\n",
+		deviceID, pipe, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
+	fmt.Printf("  archive_hourly (S/ST): удалено строк %d\n", nHourly)
+	fmt.Printf("  archive_vkm_raw:       удалено строк %d\n", nRaw)
+	fmt.Println("Эти периоды снова считаются пропущенными — их переснимет ближайший")
+	fmt.Println("дозабор/gap-scan (запускается автоматически, раз в час, или перезапусти mbgw_vkm.exe run).")
+}
+
+// scanVKMAnomalies проверяет ВСЮ историю archive_vkm_raw для устройства
+// разом — вместо точечной проверки "а что не так именно в этом периоде"
+// каждый раз заново. Смотрит на несколько независимых видов аномалий
+// одновременно (управляющие символы вроде CRLF, отсутствие ожидаемого
+// начала строки, нетипичная длина), чтобы понять масштаб проблемы —
+// единичный ли случай или системная вещь, которая ещё встретится
+// впереди. Read-only.
+func scanVKMAnomalies(db *sql.DB, deviceID string, pipe int) {
+	rows, err := db.Query(`
+SELECT ts_hour, raw_string FROM archive_vkm_raw
+WHERE device_id = ? AND pipe = ?
+ORDER BY ts_hour
+`, deviceID, pipe)
+	if err != nil {
+		fatal("сканирование archive_vkm_raw", err)
+	}
+	defer rows.Close()
+
+	type finding struct {
+		ts   time.Time
+		what string
+	}
+	var (
+		total        int
+		lengths      []int
+		controlChars []finding
+		noTimePrefix []finding
+	)
+
+	for rows.Next() {
+		var ts time.Time
+		var raw string
+		if err := rows.Scan(&ts, &raw); err != nil {
+			fatal("чтение строки при сканировании", err)
+		}
+		total++
+		lengths = append(lengths, len(raw))
+
+		for _, c := range []byte(raw) {
+			if c == '\r' || c == '\n' {
+				controlChars = append(controlChars, finding{ts, fmt.Sprintf("байт 0x%02X (перенос строки) прямо в данных", c)})
+				break
+			}
+		}
+		if !strings.HasPrefix(raw, "Time=") {
+			noTimePrefix = append(noTimePrefix, finding{ts, "строка не начинается с 'Time='"})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		fatal("сканирование archive_vkm_raw (rows.Err)", err)
+	}
+
+	fmt.Printf("Сканирование archive_vkm_raw для %s (труба %d): всего строк %d\n\n", deviceID, pipe, total)
+
+	if total > 0 {
+		sorted := append([]int(nil), lengths...)
+		sort.Ints(sorted)
+		fmt.Printf("Длина строки (символов): мин=%d медиана=%d макс=%d\n\n", sorted[0], sorted[len(sorted)/2], sorted[len(sorted)-1])
+	}
+
+	fmt.Printf("Строк с переносом строки прямо в данных (как 'кор.времени'): %d из %d\n", len(controlChars), total)
+	for _, f := range controlChars {
+		fmt.Printf("  %s — %s\n", f.ts.Format("02.01.2006 15:04"), f.what)
+	}
+	fmt.Println()
+
+	fmt.Printf("Строк с нестандартным началом (не 'Time=...'): %d из %d\n", len(noTimePrefix), total)
+	for _, f := range noTimePrefix {
+		fmt.Printf("  %s — %s\n", f.ts.Format("02.01.2006 15:04"), f.what)
+	}
+	fmt.Println()
+
+	if len(controlChars) == 0 && len(noTimePrefix) == 0 {
+		fmt.Println("Ничего постороннего не найдено — вся история чистая по этим двум критериям.")
+	}
 }
 
 func parseShowTime(s, flagName string, fallback time.Time) time.Time {

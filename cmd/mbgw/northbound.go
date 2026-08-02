@@ -27,6 +27,7 @@ func runNorthbound() {
 	var deviceID string
 	serveVKM := false
 	var vkmString string
+	vkmProbe := false
 
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
@@ -53,6 +54,8 @@ func runNorthbound() {
 			}
 		case "--serve-vkm":
 			serveVKM = true
+		case "--vkm-probe":
+			vkmProbe = true
 		case "--vkm-string":
 			if i+1 < len(os.Args) {
 				vkmString = os.Args[i+1]
@@ -95,7 +98,7 @@ func runNorthbound() {
 	}
 
 	if serveVKM {
-		runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID)
+		runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID, vkmProbe)
 		return
 	}
 
@@ -242,7 +245,7 @@ func runAkronLiveMode(listenAddr, dbPath, deviceID, logPath string) {
 // берётся из реально собранных данных (internal/device/vkm_hourly.go),
 // а не из фиксированной/настраиваемой заглушки. Без них поведение
 // прежнее — для отладки механики протокола без живого прибора.
-func runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID string) {
+func runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID string, vkmProbe bool) {
 	if listenAddr == "" {
 		fmt.Println("northbound --serve-vkm: --listen обязателен")
 		os.Exit(1)
@@ -272,8 +275,14 @@ func runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID string) {
 			log.Fatalf("[FATAL] northbound --serve-vkm: инициализация схемы архива: %v", err)
 		}
 		src := northbound.NewDBVKMArchiveSource(repo, deviceID)
+		src.ProbeVariants = vkmProbe
 		newSrc = func() northbound.VKMArchiveSource { return src }
 		log.Printf("northbound --serve-vkm: боевой режим — источник архива: БД %s, прибор %s\n", dbPath, deviceID)
+		if vkmProbe {
+			log.Println("northbound --serve-vkm: РЕЖИМ ПЕРЕБОРА ГИПОТЕЗ (--vkm-probe) включён:")
+			log.Println("  пока ЭС повторяет запрос одного периода, каждая попытка получает СЛЕДУЮЩИЙ вариант строки;")
+			log.Println("  когда ЭС примет период и пойдёт дальше — в логе будет видно, на каком варианте это случилось.")
+		}
 	} else {
 		// Archive string comes from vkm_config.txt when present, falling back
 		// to --vkm-string (or the built-in default). This is what lets the

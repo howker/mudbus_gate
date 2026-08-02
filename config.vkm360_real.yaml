@@ -5,7 +5,7 @@ app:
   # later want ONE process serving both devices, list them both under
   # `devices:` in a single config instead of running two config files.
   storage_path: "mbgw_vkm.db"
-  web_port: 8081 # different port from Akron's 8080 dashboard if run alongside it
+  web_port: 8082 # 8081 занят на сервере другим процессом
 
 devices:
   - id: "vkm360_real"
@@ -25,6 +25,13 @@ devices:
     # at startup).
     backfill:
       archive_at_minute: 5
+      # Разово увеличено под запрошенный ЭС переопрос с 27.07 — обычной
+      # глубины (24ч по умолчанию) для этого не хватает. Каждый
+      # получасовой период — отдельный запрос к прибору (~4-5 сек), так
+      # что 168ч = 336 периодов ≈ 25-30 минут дозабора при старте.
+      # После того как история накопится, можно вернуть значение поменьше
+      # (или убрать эту строку совсем — тогда снова возьмётся дефолт 24ч).
+      max_depth_hours: 168
     transport:
       kind: "modbus_tcp" # REAL Modbus TCP/MBAP — confirmed live, this is
       # a proper Modbus TCP gateway, not a raw-RTU-over-TCP converter like

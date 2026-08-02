@@ -18,7 +18,7 @@ func TestNormalizeVKMNumbers_RealStuckPeriod(t *testing.T) {
 		"S_ns={Масса теплонос. при НС}0кг;" +
 		"Twrk={Время штатной работы}30м 00сек;"
 
-	got := normalizeVKMNumbers(raw)
+	got := vkmAddDecimalPoint(raw)
 
 	// dP: целое -> получает .0
 	wantDP := "dP={Перепад давления *}12397.0Па"
@@ -42,7 +42,7 @@ func TestNormalizeVKMNumbers_RealStuckPeriod(t *testing.T) {
 }
 
 // TestNormalizeVKMNumbers_AlreadyAcceptedPeriodUnchanged — период, который
-// ЭС УЖЕ успешно приняла (все значения дробные) — normalizeVKMNumbers не
+// ЭС УЖЕ успешно приняла (все значения дробные) — vkmAddDecimalPoint не
 // должен ничего в нём менять.
 func TestNormalizeVKMNumbers_AlreadyAcceptedPeriodUnchanged(t *testing.T) {
 	raw := "Time={Время  }01/08/26 19:00:00-01/08/26 19:30:00;" +
@@ -50,8 +50,96 @@ func TestNormalizeVKMNumbers_AlreadyAcceptedPeriodUnchanged(t *testing.T) {
 		"dP={Перепад давления *}6566.1Па;" +
 		"S={Масса теплонос. }929.72064кг;"
 
-	got := normalizeVKMNumbers(raw)
+	got := vkmAddDecimalPoint(raw)
 	if got != raw {
 		t.Fatalf("уже дробная строка была изменена:\nбыло:  %q\nстало: %q", raw, got)
+	}
+}
+
+// TestNormalizeVKMLineBreaks_RealCorrectionSuffix — regression-тест на
+// живой находке (2026-08-02): период с суффиксом "кор.времени" содержал
+// буквальный CRLF прямо в данных, перед завершающей ';'. Именно этот
+// период ЭС бесконечно переспрашивала (id дошёл до 418), пока соседний
+// период без такого суффикса принимался нормально.
+func TestNormalizeVKMLineBreaks_RealCorrectionSuffix(t *testing.T) {
+	raw := "Twrk={Время штатной работы}29м 57сек;Tnss={Время нештатных ситуаций}0сек;" +
+		"NSS={Нештатные ситуации(время)  Сообщения[время]}кор.времени\r\n;"
+
+	got := vkmStripLineBreaks(raw)
+
+	if strings.Contains(got, "\r") || strings.Contains(got, "\n") {
+		t.Fatalf("перенос строки не убран: %q", got)
+	}
+	// Сам текст "кор.времени" должен сохраниться — убираем только разрыв строки.
+	if !strings.Contains(got, "кор.времени") {
+		t.Fatalf("текст 'кор.времени' был утрачен: %q", got)
+	}
+	// Завершающая ';' должна остаться на месте (была после \r\n).
+	if !strings.HasSuffix(got, ";") {
+		t.Fatalf("строка должна заканчиваться на ';': %q", got)
+	}
+}
+
+// TestVKMVariants_AllProduceValidStrings — базовая проверка всех вариантов
+// перебора: каждый должен вернуть непустую строку, сохранить поле Time
+// с исходным диапазоном дат и не оставить в данных переносов строк.
+func TestVKMVariants_AllProduceValidStrings(t *testing.T) {
+	raw := "Time={Время  }27/07/26 16:00:00-27/07/26 16:30:00;" +
+		"Pi={Изб. давление *}4.1042e+05Па;" +
+		"dP={Перепад давления *}7972Па;" +
+		"S={Масса теплонос. }1006.4156кг;" +
+		"Twrk={Время штатной работы}29м 57сек;" +
+		"NSS={Нештатные ситуации(время)  Сообщения[время]}кор.времени\r\n;"
+
+	for _, v := range vkmVariants {
+		if v.fn == nil {
+			continue // вариант 8 требует доступа к БД, проверяется отдельно
+		}
+		got := v.fn(raw)
+		if got == "" {
+			t.Fatalf("вариант %s вернул пустую строку", v.name)
+		}
+		if !strings.Contains(got, "27/07/26 16:00:00-27/07/26 16:30:00") {
+			t.Fatalf("вариант %s потерял диапазон времени: %q", v.name, got)
+		}
+		// Вариант 1 (контроль) намеренно отдаёт строку как есть, включая CRLF.
+		if v.name != "1-as-is" && (strings.Contains(got, "\r") || strings.Contains(got, "\n")) {
+			t.Fatalf("вариант %s оставил перенос строки: %q", v.name, got)
+		}
+	}
+}
+
+// TestVKMForceFullTwrk проверяет, что Twrk приводится к полному периоду,
+// а остальные поля не задеваются.
+func TestVKMForceFullTwrk(t *testing.T) {
+	raw := "Twrk={Время штатной работы}29м 57сек;Tnss={Время нештатных ситуаций}0сек;"
+	got := vkmForceFullTwrk(raw)
+	if !strings.Contains(got, "Twrk={Время штатной работы}30м 00сек") {
+		t.Fatalf("Twrk не приведён к полному периоду: %q", got)
+	}
+	if !strings.Contains(got, "Tnss={Время нештатных ситуаций}0сек") {
+		t.Fatalf("задето соседнее поле Tnss: %q", got)
+	}
+}
+
+// TestVKMStripAllHeaders проверяет компактный формат (без блоков {..}).
+func TestVKMStripAllHeaders(t *testing.T) {
+	raw := "Pi={Изб. давление *}4.1042e+05Па;S={Масса теплонос. }1006.4156кг;"
+	got := vkmStripAllHeaders(raw)
+	want := "Pi=4.1042e+05Па;S=1006.4156кг;"
+	if got != want {
+		t.Fatalf("компактный формат неверен:\nполучено: %q\nожидалось: %q", got, want)
+	}
+}
+
+// TestVKMEmptyNSS проверяет полное опустошение поля NSS.
+func TestVKMEmptyNSS(t *testing.T) {
+	raw := "Tnss={Время нештатных ситуаций}0сек;NSS={Нештатные ситуации(время)}кор.времени;"
+	got := vkmEmptyNSS(raw)
+	if !strings.Contains(got, "NSS=;") {
+		t.Fatalf("поле NSS не опустошено: %q", got)
+	}
+	if !strings.Contains(got, "Tnss={Время нештатных ситуаций}0сек") {
+		t.Fatalf("задето соседнее поле Tnss: %q", got)
 	}
 }
