@@ -56,6 +56,7 @@ func main() {
 	vkmPipe := flag.Int("pipe", 1, "с --vkm-raw: номер трубы (по умолчанию 1)")
 	vkmForget := flag.Bool("vkm-forget", false, "с --show-from/--show-to и --vkm-raw: УДАЛИТЬ периоды в этом окне из archive_hourly (S/ST) и archive_vkm_raw, чтобы дозабор/gap-scan переснял их заново — полезно, если прибор один раз отдал битую/непривычную строку и нужно попробовать ещё раз")
 	vkmScan := flag.Bool("vkm-scan", false, "просканировать ВСЮ историю archive_vkm_raw для устройства на посторонние символы (переносы строк, управляющие байты) — вместо точечной проверки одного периода за раз. Read-only.")
+	vkmForgetAnomalous := flag.Bool("vkm-forget-anomalous", false, "просканировать ВСЮ историю archive_vkm_raw и УДАЛИТЬ разом все периоды с 'чужим' форматом Time (голые секунды вместо даты — тот же признак, что детектирует mbgw при сборе) — вместо точечной чистки по одному периоду за раз, каждый раз как встретится в ЭС")
 	flag.Parse()
 
 	if *dbPath == "" || *deviceID == "" {
@@ -73,6 +74,10 @@ func main() {
 	// --vkm-forget, which is the one deliberate exception (explicit flag,
 	// explicit window, explicit action word — "forget", not "delete", to
 	// keep it distinct from the future-date --delete mode above).
+	if *vkmForgetAnomalous {
+		forgetVKMAnomalous(db, *deviceID, *vkmPipe)
+		return
+	}
 	if *vkmScan {
 		scanVKMAnomalies(db, *deviceID, *vkmPipe)
 		return
@@ -349,6 +354,91 @@ ORDER BY ts_hour
 	if len(controlChars) == 0 && len(noTimePrefix) == 0 {
 		fmt.Println("Ничего постороннего не найдено — вся история чистая по этим двум критериям.")
 	}
+}
+
+// isRawTimeAnomalous — та же проверка, что internal/device использует
+// при сборе (see isVKMTimeAnomalous): нормальная дата всегда содержит
+// '/', "чужой" формат — голые секунды через дефис.
+func isRawTimeAnomalous(raw string) bool {
+	idx := strings.Index(raw, "Time=")
+	if idx < 0 {
+		return false
+	}
+	rest := raw[idx+len("Time="):]
+	value := rest
+	if semi := strings.Index(rest, ";"); semi >= 0 {
+		value = rest[:semi]
+	}
+	return !strings.Contains(value, "/")
+}
+
+// forgetVKMAnomalous сканирует ВСЮ историю archive_vkm_raw для
+// устройства/трубы и удаляет разом (из archive_hourly и archive_vkm_raw)
+// каждый период с "чужим" форматом Time — вместо того чтобы чинить их по
+// одному, каждый раз как ЭС на очередном упрётся. Периоды снова считаются
+// пропущенными; ближайший дозабор/gap-scan их переснимет — уже новым
+// кодом с автоповтором (internal/device/vkm_hourly.go), так что повторно
+// это, скорее всего, не потребуется.
+func forgetVKMAnomalous(db *sql.DB, deviceID string, pipe int) {
+	rows, err := db.Query(`
+SELECT ts_hour, raw_string FROM archive_vkm_raw
+WHERE device_id = ? AND pipe = ?
+ORDER BY ts_hour
+`, deviceID, pipe)
+	if err != nil {
+		fatal("сканирование archive_vkm_raw", err)
+	}
+
+	var anomalous []time.Time
+	for rows.Next() {
+		var ts time.Time
+		var raw string
+		if err := rows.Scan(&ts, &raw); err != nil {
+			rows.Close()
+			fatal("чтение строки при сканировании", err)
+		}
+		if isRawTimeAnomalous(raw) {
+			anomalous = append(anomalous, ts)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		fatal("сканирование archive_vkm_raw (rows.Err)", err)
+	}
+
+	if len(anomalous) == 0 {
+		fmt.Println("Аномальных периодов (Time без даты) не найдено — история чистая.")
+		return
+	}
+
+	fmt.Printf("Найдено периодов с 'чужим' форматом Time: %d\n", len(anomalous))
+	var totalHourly, totalRaw int64
+	for _, ts := range anomalous {
+		resHourly, err := db.Exec(`
+DELETE FROM archive_hourly
+WHERE device_id = ? AND param IN ('S','ST') AND ts_hour = ?
+`, deviceID, ts)
+		if err != nil {
+			fatal("удаление из archive_hourly", err)
+		}
+		n, _ := resHourly.RowsAffected()
+		totalHourly += n
+
+		resRaw, err := db.Exec(`
+DELETE FROM archive_vkm_raw
+WHERE device_id = ? AND pipe = ? AND ts_hour = ?
+`, deviceID, pipe, ts)
+		if err != nil {
+			fatal("удаление из archive_vkm_raw", err)
+		}
+		n, _ = resRaw.RowsAffected()
+		totalRaw += n
+
+		fmt.Printf("  %s — забыт\n", ts.Format("02.01.2006 15:04"))
+	}
+	fmt.Printf("\nВсего: archive_hourly удалено строк %d, archive_vkm_raw удалено строк %d\n", totalHourly, totalRaw)
+	fmt.Println("Эти периоды снова считаются пропущенными — их переснимет ближайший")
+	fmt.Println("дозабор/gap-scan (запускается автоматически, раз в час, или перезапусти mbgw_vkm.exe run).")
 }
 
 func parseShowTime(s, flagName string, fallback time.Time) time.Time {

@@ -139,9 +139,16 @@ func (s *DBVKMArchiveSource) Archive(pipe int, start, end time.Time, opts uint16
 	}
 
 	if !s.ProbeVariants {
-		// Обычный боевой режим: применяем правки, которые уже считаем
-		// правильными, без перебора.
-		return vkmAddDecimalPoint(vkmStripLineBreaks(raw)), true
+		// Обычный боевой режим: компактный формат без {..} — ПОДТВЕРЖДЕНО
+		// живым перебором (2026-08-02): два периода подряд (27.07 16:00,
+		// 27.07 16:30) ЭС приняла синхронно на одном и том же варианте
+		// (7-no-headers), а не на разных случайных — значит дело не в
+		// "любой отличающийся контент", а именно в отсутствии блоков-
+		// заголовков {..}. Похоже, драйвер ЭС не ожидает их вообще, и все
+		// прежние "успешно принятые" периоды (со скобками) проходили не
+		// благодаря заголовкам, а несмотря на них — по исчерпании
+		// внутреннего лимита её собственных ретраев.
+		return vkmAddDecimalPoint(vkmStripAllHeaders(vkmStripLineBreaks(raw))), true
 	}
 
 	return s.applyProbeVariant(ctx, pipe, periodStart, raw), true
@@ -205,8 +212,10 @@ func (s *DBVKMArchiveSource) neighbourTemplate(ctx context.Context, pipe int, pe
 var (
 	// vkmTimeRangeRe находит диапазон дат в поле Time.
 	vkmTimeRangeRe = regexp.MustCompile(`\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}-\d{2}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}`)
-	// vkmHeaderRe находит блок-заголовок {..} сразу после '='.
-	vkmHeaderRe = regexp.MustCompile(`=\{[^}]*\}`)
+	// vkmHeaderRe находит блок-заголовок сразу после '=' — как в фигурных
+	// скобках {..}, так и в угловых <..> (прибор использует оба вперемешку
+	// для разных тегов в одной строке, см. mb_request_poll_string.go).
+	vkmHeaderRe = regexp.MustCompile(`=[\{<][^}>]*[\}>]`)
 	// numAfterHeaderRe находит целое число сразу после закрывающей скобки.
 	numAfterHeaderRe = regexp.MustCompile(`[}>](-?\d+)`)
 	// twrkRe находит значение поля Twrk.

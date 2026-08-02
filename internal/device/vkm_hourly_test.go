@@ -95,3 +95,34 @@ func TestPersistVKMHourly_MissingFieldIsGraceful(t *testing.T) {
 		t.Fatalf("expected 1 field saved (ST only), got %d", saved)
 	}
 }
+
+// TestIsVKMTimeAnomalous_RealExamples — на живых данных: нормальный
+// формат (дата со слэшами) и аномальный (голые секунды через дефис),
+// оба встречались реально (2026-08-02, несколько раз за один день).
+func TestIsVKMTimeAnomalous_RealExamples(t *testing.T) {
+	normal := "Time={Время  }28/07/26 15:00:00-28/07/26 15:30:00;Pi={Изб. давление *}4.1494e+05Па;"
+	if isVKMTimeAnomalous(normal) {
+		t.Fatalf("нормальный формат (со слэшами в дате) ошибочно помечен как аномальный: %q", normal)
+	}
+
+	anomalous := "Time=839089620-839089800сек;Pi=425096.5Па;"
+	if !isVKMTimeAnomalous(anomalous) {
+		t.Fatalf("аномальный формат (голые секунды) не распознан: %q", anomalous)
+	}
+
+	// Компактный формат (без {..}) тоже должен корректно распознаваться —
+	// боевой режим northbound теперь всегда его использует.
+	normalCompact := "Time=28/07/26 15:00:00-28/07/26 15:30:00;Pi=4.1494e+05Па;"
+	if isVKMTimeAnomalous(normalCompact) {
+		t.Fatalf("нормальный компактный формат ошибочно помечен как аномальный: %q", normalCompact)
+	}
+}
+
+// TestIsVKMTimeAnomalous_NoTimeField — если поля Time вообще нет,
+// не должно быть ложного срабатывания.
+func TestIsVKMTimeAnomalous_NoTimeField(t *testing.T) {
+	raw := "Pi=4.1494e+05Па;S=1230.7Кг;"
+	if isVKMTimeAnomalous(raw) {
+		t.Fatalf("отсутствие поля Time не должно считаться аномалией: %q", raw)
+	}
+}

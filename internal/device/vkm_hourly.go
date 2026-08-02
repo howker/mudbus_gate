@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"mbgw/internal/archive"
@@ -73,6 +74,32 @@ func persistVKMHourly(ctx context.Context, d *Device, periodStart time.Time, rec
 }
 
 // collectVKMPeriod делает ОДИН полный танец запись/ожидание/чтение архива
+// vkmMaxAnomalyRetries — сколько раз переспрашиваем период, если прибор
+// вернул "чужой" формат строки (Time в секундах вида "839089620-839089800сек"
+// вместо привычной даты "DD/MM/YY..."). Встречается регулярно (не
+// единичный случай — подтверждено живьём несколько раз за один день), и
+// повторный запрос почти всегда даёт нормальный ответ. Без этой проверки
+// такая строка тихо сохранялась бы в базу и позже стопорила ЭС на этом
+// периоде — гораздо дешевле переспросить сразу, чем потом вручную искать
+// проблему по логам northbound.
+const vkmMaxAnomalyRetries = 3
+
+// isVKMTimeAnomalous определяет "чужой" формат по отсутствию '/' в
+// значении поля Time — нормальная дата всегда содержит "ДД/ММ/ГГ", а
+// аномальная запись — просто числа-секунды через дефис.
+func isVKMTimeAnomalous(raw string) bool {
+	idx := strings.Index(raw, "Time=")
+	if idx < 0 {
+		return false // нет поля Time вообще — не наш случай, не трогаем
+	}
+	rest := raw[idx+len("Time="):]
+	value := rest
+	if semi := strings.Index(rest, ";"); semi >= 0 {
+		value = rest[:semi]
+	}
+	return !strings.Contains(value, "/")
+}
+
 // для окна [periodStart, periodStart+vkmArchivePeriod) и сохраняет то, что
 // пришло. Возвращает, сколько из vkmHourlyParams реально сохранено (0 без
 // ошибки — законный исход: у прибора не было данных за этот период).
@@ -97,12 +124,31 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, period
 	}
 	defer release()
 
-	records, err := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, q)
-	if err != nil {
-		return 0, err
-	}
-	if len(records) == 0 {
-		return 0, nil
+	var records []archive.ArchiveRecord
+	var err error
+	for attempt := 1; attempt <= vkmMaxAnomalyRetries; attempt++ {
+		records, err = reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, q)
+		if err != nil {
+			return 0, err
+		}
+		if len(records) == 0 {
+			return 0, nil
+		}
+		if !isVKMTimeAnomalous(string(records[0].Raw)) {
+			break
+		}
+		if attempt == vkmMaxAnomalyRetries {
+			log.Printf("[%s] VKM период %s: после %d попыток прибор так и не дал нормальный формат — сохраняем как есть, потребуется ручная пересборка (--vkm-forget)\n",
+				d.ID, periodStart.Format("02.01.2006 15:04"), vkmMaxAnomalyRetries)
+			break
+		}
+		log.Printf("[%s] VKM период %s: попытка %d — прибор вернул нестандартный формат строки (без даты), переспрашиваем\n",
+			d.ID, periodStart.Format("02.01.2006 15:04"), attempt)
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(time.Second):
+		}
 	}
 
 	// Сырую строку сохраняем отдельно от разобранных полей — она нужна

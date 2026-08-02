@@ -9,9 +9,13 @@ import (
 func TestDBVKMArchiveSource_FindsSavedString(t *testing.T) {
 	repo := &fakeRepo{}
 	hour := time.Date(2026, 8, 1, 14, 0, 0, 0, time.UTC)
-	want := "Pi=<Изб. давление *>4.2229e+05Па;S={Масса теплонос. }1837.7266кг;"
+	stored := "Pi=<Изб. давление *>4.2229e+05Па;S={Масса теплонос. }1837.7266кг;"
+	// Боевая ветка убирает блоки-заголовки {..}/<..> перед отдачей в ЭС —
+	// ПОДТВЕРЖДЕНО живым перебором (2026-08-02): драйвер ЭС принимает
+	// именно компактный формат без них.
+	want := "Pi=4.2229e+05Па;S=1837.7266кг;"
 
-	if err := repo.SaveVKMRawString(context.Background(), "vkm360_real", 1, hour, want); err != nil {
+	if err := repo.SaveVKMRawString(context.Background(), "vkm360_real", 1, hour, stored); err != nil {
 		t.Fatalf("seed error: %v", err)
 	}
 
