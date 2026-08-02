@@ -50,6 +50,8 @@ func main() {
 	doDelete := flag.Bool("delete", false, "actually delete the flagged rows (default: list only, changes nothing)")
 	showFrom := flag.String("show-from", "", "LIST mode: window start (e.g. \"2026-07-29 22:00\"). Read-only.")
 	showTo := flag.String("show-to", "", "LIST mode: window end (e.g. \"2026-07-30 01:00\"). Read-only.")
+	vkmRaw := flag.Bool("vkm-raw", false, "с --show-from/--show-to: вместо archive_hourly (S/ST) показать сырые строки архива ВКМ из archive_vkm_raw")
+	vkmPipe := flag.Int("pipe", 1, "с --vkm-raw: номер трубы (по умолчанию 1)")
 	flag.Parse()
 
 	if *dbPath == "" || *deviceID == "" {
@@ -64,6 +66,10 @@ func main() {
 	defer db.Close()
 
 	// LIST mode takes precedence and never modifies anything.
+	if *vkmRaw && (*showFrom != "" || *showTo != "") {
+		listVKMRaw(db, *deviceID, *vkmPipe, *showFrom, *showTo)
+		return
+	}
 	if *showFrom != "" || *showTo != "" {
 		listWindow(db, *deviceID, *showFrom, *showTo)
 		return
@@ -173,6 +179,49 @@ ORDER BY ts_hour DESC
 	fmt.Printf("\nВсего строк: %d\n", len(got))
 	fmt.Println("Если какого-то часа тут нет — значит он в базе отсутствует (пропуск),")
 	fmt.Println("и его надо добрать (кнопка «Опросить сейчас» на дашборде или перезапуск).")
+}
+
+// listVKMRaw prints every archive_vkm_raw row for the device/pipe in the
+// given window, newest first. Read-only — used to inspect the exact text
+// the device sent for a period without needing another live capture.
+func listVKMRaw(db *sql.DB, deviceID string, pipe int, fromStr, toStr string) {
+	from := parseShowTime(fromStr, "--show-from", time.Time{})
+	to := parseShowTime(toStr, "--show-to", time.Now().Add(time.Hour))
+
+	rows, err := db.Query(`
+SELECT ts_hour, raw_string
+FROM archive_vkm_raw
+WHERE device_id = ? AND pipe = ? AND ts_hour >= ? AND ts_hour <= ?
+ORDER BY ts_hour DESC
+`, deviceID, pipe, from, to)
+	if err != nil {
+		fatal("запрос диапазона (archive_vkm_raw)", err)
+	}
+	defer rows.Close()
+
+	type row struct {
+		ts  time.Time
+		raw string
+	}
+	var got []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.ts, &r.raw); err != nil {
+			fatal("чтение строки диапазона (archive_vkm_raw)", err)
+		}
+		got = append(got, r)
+	}
+
+	fmt.Printf("Сырые строки archive_vkm_raw для %s (труба %d) в период %s .. %s (новые сверху):\n\n",
+		deviceID, pipe, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
+	if len(got) == 0 {
+		fmt.Println("  (ничего не найдено — за этот период в базе нет ни одной строки)")
+		return
+	}
+	for _, r := range got {
+		fmt.Printf("  %s:\n    %s\n\n", r.ts.Format("02.01.2006 15:04"), r.raw)
+	}
+	fmt.Printf("Всего строк: %d\n", len(got))
 }
 
 func parseShowTime(s, flagName string, fallback time.Time) time.Time {
