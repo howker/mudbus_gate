@@ -146,6 +146,11 @@ const (
 	vkmReqEchoReg   = 8001
 	vkmLenReg       = 8002
 	vkmDataReg      = 8003
+	// vkmArchDataEnd — верхняя граница диапазона регистров, где может
+	// продолжаться строка архива при повторных чтениях (см. Respond).
+	// Симметрично southbound-стороне (internal/archive/mb_request_poll_string.go
+	// использует ровно 9999 как vkmArchDataEnd).
+	vkmArchDataEnd = 9999
 
 	vkmStatusCollecting = 1
 	vkmStatusReady      = 2
@@ -263,14 +268,23 @@ func (r *VKMArchiveResponder) read(pdu []byte) []byte {
 		return r.statusResponse(fc, qty)
 	case vkmReqEchoReg:
 		return word(fc, r.regs[vkmReqIDReg])
-	case vkmLenReg:
-		return r.lengthResponse(fc, qty)
-	case vkmDataReg:
-		return r.dataResponse(fc, qty)
 	case vkmParamNameReg:
 		return ansiStringResponse(fc, qty, r.paramMapName())
 	case vkmParamValReg:
 		return ansiStringResponse(fc, qty, r.paramMapValue())
+	}
+
+	// Длина+строка (8002+) — ДИАПАЗОН, а не точный адрес. Подтверждено
+	// живым захватом (2026-08-01, vkm_live.jsonl): ЭС читает 8002 разом на
+	// 120 регистров (длина + первые 238 байт строки), а если строка длиннее
+	// — тут же читает ПРОДОЛЖЕНИЕ с адреса 8002+120=8122 (и так далее, пока
+	// не получит всю строку). Раньше здесь матчился только addr==8002 и
+	// addr==8003 — любое продолжение получало Modbus exception 0x02, и ЭС
+	// не могла дочитать строки длиннее одного 120-регистрового чтения (наша
+	// реальная строка — 469 символов, в 238 байт не влезает). Теперь любой
+	// адрес в [vkmLenReg, vkmArchDataEnd] обслуживается со своим смещением.
+	if addr >= vkmLenReg && addr <= vkmArchDataEnd {
+		return r.archiveBlockResponse(fc, addr, qty)
 	}
 
 	// Fall back to the static identification/status register map for any
@@ -379,35 +393,42 @@ func exceptionResponse(funcCode, code byte) []byte {
 	return []byte{funcCode | 0x80, code}
 }
 
-// lengthResponse serves a read starting at 8002 (string length in bytes).
-// Honors qty: 8002 is immediately followed by the data string at 8003, so
-// a multi-register read anchored at 8002 continues into the string,
-// exactly like a real contiguous register block — and a live capture
-// confirmed the driver DOES read both in one request (qty=120 covering
-// length + the whole string). The payload is Windows-1251-encoded (see
-// cp1251Encode), matching dataResponse, so the length and the inline data
-// tail always agree regardless of which path served them.
-func (r *VKMArchiveResponder) lengthResponse(fc byte, qty int) []byte {
+// archiveBlockResponse обслуживает ЛЮБОЙ адрес в [vkmLenReg, vkmArchDataEnd]
+// как чтение из одного непрерывного буфера: 2 байта длины (регистр 8002),
+// затем сама строка архива (с 8003 и далее). Раньше это были две разные
+// функции (lengthResponse/dataResponse), каждая всегда начинавшая ответ с
+// байта 0 — работало только для ПЕРВОГО чтения. Живой захват (2026-08-01,
+// vkm_live.jsonl) показал: если строка длиннее одного запроса (наша
+// реальная — 469 символов, а один запрос на 120 регистров даёт только 238
+// байт данных), ЭС читает ПРОДОЛЖЕНИЕ с адреса, равного (первый_адрес +
+// первый_qty) — то есть регистр 8122 при первом чтении 8002 на 120 штук.
+// Без смещения это продолжение было бы неотличимо от чтения с начала.
+//
+// Смещение считается от vkmLenReg: регистр addr — это (addr-vkmLenReg)-й
+// 16-битный кусок буфера [длина(2 байта)][строка]. Запрос за пределами
+// реальных данных возвращает нули (как и раньше — прежнее поведение при
+// нехватке данных, ES просто не найдёт там значимых байт).
+func (r *VKMArchiveResponder) archiveBlockResponse(fc byte, addr, qty int) []byte {
 	if qty < 1 {
 		qty = 1
 	}
 	payload := cp1251Encode(r.result)
 	strLen := len(payload)
 
-	data := make([]byte, 0, qty*2)
-	data = append(data, byte(strLen>>8), byte(strLen))
-	for i := 1; i < qty; i++ { // remaining registers = the string itself
-		hi := 2 * (i - 1)
-		lo := hi + 1
-		var b1, b2 byte
-		if hi < len(payload) {
-			b1 = payload[hi]
+	buf := make([]byte, 2+strLen)
+	buf[0] = byte(strLen >> 8)
+	buf[1] = byte(strLen)
+	copy(buf[2:], payload)
+
+	byteOffset := (addr - vkmLenReg) * 2
+	data := make([]byte, qty*2)
+	for i := range data {
+		srcIdx := byteOffset + i
+		if srcIdx >= 0 && srcIdx < len(buf) {
+			data[i] = buf[srcIdx]
 		}
-		if lo < len(payload) {
-			b2 = payload[lo]
-		}
-		data = append(data, b1, b2)
 	}
+
 	resp := make([]byte, 0, 2+len(data))
 	resp = append(resp, fc, byte(len(data)))
 	return append(resp, data...)
@@ -634,23 +655,6 @@ func (r *VKMArchiveResponder) statusResponse(fc byte, qty int) []byte {
 // (see cp1251Encode) — the device/driver's expected ANSI encoding, not
 // Go's native UTF-8 — padded or truncated to the requested register
 // quantity (qty*2 bytes), matching how a Modbus string block read behaves.
-func (r *VKMArchiveResponder) dataResponse(fc byte, qty int) []byte {
-	payload := cp1251Encode(r.result)
-	maxBytes := qty * 2
-	if len(payload) > maxBytes {
-		payload = payload[:maxBytes]
-	} else {
-		padded := make([]byte, maxBytes)
-		copy(padded, payload)
-		payload = padded
-	}
-	resp := make([]byte, 2+len(payload))
-	resp[0] = fc
-	resp[1] = byte(len(payload))
-	copy(resp[2:], payload)
-	return resp
-}
-
 // word builds a single-register (2-byte) read response: [fc][02][hi][lo].
 func word(fc byte, v uint16) []byte {
 	return []byte{fc, 2, byte(v >> 8), byte(v)}

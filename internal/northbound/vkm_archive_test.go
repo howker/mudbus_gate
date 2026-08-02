@@ -389,7 +389,7 @@ func TestVKM_CurrentBlock_AllPipes(t *testing.T) {
 // NACK.
 func TestVKM_UnknownRegister_GetsException(t *testing.T) {
 	r := NewVKMArchiveResponder(FixedVKMSource{Result: testString})
-	resp := r.Respond(fc03(9500, 2))
+	resp := r.Respond(fc03(6000, 2)) // вне диапазона 7900-9999, заведомо неизвестный регистр
 	if resp == nil {
 		t.Fatal("unknown register returned silence — should be a Modbus exception")
 	}
@@ -516,5 +516,55 @@ func TestVKM_ParameterMap_OutOfRangeRow(t *testing.T) {
 	}
 	if nameResp[2] != 0 {
 		t.Fatalf("first byte = 0x%02X, want 0x00 (empty C-string)", nameResp[2])
+	}
+}
+
+// TestVKM_ContinuationRead_LongString — regression-тест на баг с продолжением
+// чтения, найденный на живом захвате (2026-08-01, vkm_live.jsonl): ЭС
+// читает 8002 разом на 120 регистров (длина + первые 238 байт), а если
+// строка длиннее — тут же читает продолжение с адреса 8002+120=8122.
+// Раньше это давало Modbus exception 0x02 (адрес не обслуживался вообще),
+// и ЭС не могла дочитать строку длиннее одного 120-регистрового чтения.
+func TestVKM_ContinuationRead_LongString(t *testing.T) {
+	// Строка длиннее 238 байт (120 регистров - 2 байта на длину), чтобы
+	// потребовалось продолжение чтения. Наращиваем по факту длины В CP1251
+	// (1 байт на кириллический символ), а не по len(long) — это длина
+	// Go-строки в UTF-8 (2 байта на кириллический символ), которая
+	// заметно больше и вводит в заблуждение при подборе порога.
+	long := "V01{Расход}=123.45 кг/с;"
+	for len(cp1251Encode(long)) < 300 {
+		long += "V02{Масса теплоносителя за интервал измерения}=678.90 кг;"
+	}
+
+	r := NewVKMArchiveResponder(FixedVKMSource{Result: long})
+	writeFullRequestFC06(t, r)
+	_ = readU16(r.Respond(fc03(8000, 1)), t) // collecting
+	_ = readU16(r.Respond(fc03(8000, 1)), t) // ready
+
+	wantBytes := cp1251Encode(long)
+
+	// Первое чтение: 8002, 120 регистров (длина + первые 238 байт).
+	first := r.Respond(fc03(8002, 120))
+	if first[0] != 0x03 || int(first[1]) != 240 {
+		t.Fatalf("первое чтение: fc=0x%02X byteCount=%d, ожидалось fc=03 byteCount=240", first[0], first[1])
+	}
+	gotLen := binary.BigEndian.Uint16(first[2:4])
+	if int(gotLen) != len(wantBytes) {
+		t.Fatalf("длина в ответе = %d, ожидалось %d", gotLen, len(wantBytes))
+	}
+	firstChunk := first[4:242] // 238 байт данных после 2 байт длины
+
+	// Продолжение: адрес 8002+120=8122, читаем ещё сколько нужно.
+	remaining := len(wantBytes) - len(firstChunk)
+	contQty := uint16((remaining + 1) / 2)
+	cont := r.Respond(fc03(8122, contQty))
+	if cont == nil || cont[0] != 0x03 {
+		t.Fatalf("продолжение (адрес 8122): получен exception вместо данных: % X", cont)
+	}
+	contChunk := cont[2 : 2+remaining]
+
+	got := append(append([]byte{}, firstChunk...), contChunk...)
+	if string(got) != string(wantBytes) {
+		t.Fatalf("собранная строка не совпадает с исходной\nполучено: % X\nожидалось: % X", got, wantBytes)
 	}
 }
