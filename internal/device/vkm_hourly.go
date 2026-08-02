@@ -11,41 +11,45 @@ import (
 	"mbgw/internal/storage"
 )
 
-// vkmDefaultBackfillDepthHours is how far back a VKM startup/manual
-// backfill reaches by default (opts.MaxDepthHours overrides). Kept far
-// shallower than Akron's 648h default: Akron's archive is one cheap
-// indexed-paged read for many hours at once, but VKM's
-// mb_request_poll_string strategy returns ONE aggregate per request —
-// CONFIRMED against real hardware (2026-08-01): S/ST scale linearly with
-// the requested period length (a 24h request returned ~25x a 1h
-// request's totals), i.e. there is no per-hour breakdown to page
-// through. Getting hourly granularity out of VKM means one full
-// write/poll/read request PER HOUR (each taking real wall-clock seconds
-// — see mb_request_poll_string.go's vkmArchCollectTimeout), so reaching
-// back 648h the way Akron does would mean ~648 sequential device
-// round-trips at startup. 24h (one day) is a sane default; deeper reaches
-// are opt-in via config, not the default.
+// vkmArchivePeriod — длина одного периода сбора архива ВКМ. Подтверждено
+// живым захватом (2026-08-02, vkm_live.jsonl): реальный драйвер ЭС (УВП-280)
+// запрашивает архив ИМЕННО получасовыми окнами (например 19:00:00-19:30:00),
+// а не часовыми — этот параметр в самой ЭС не настраивается, так жёстко
+// сделан драйвер. Раньше здесь был час (по аналогии с Акроном) — из-за
+// этого ЭС получала строку с Time=...19:00-20:00, не совпадающую с тем,
+// что сама запросила, и просто бесконечно повторяла один и тот же запрос
+// с новым id, не продвигаясь дальше. Все периоды/границы в этом файле
+// теперь считаются кратными этому значению, а не часу.
+const vkmArchivePeriod = 30 * time.Minute
+
+// vkmDefaultBackfillDepthHours — насколько глубоко назад стартовый/ручной
+// дозабор ВКМ идёт по умолчанию (opts.MaxDepthHours переопределяет).
+// Значение в ЧАСАХ (для совместимости с конфигом — то же поле, что и у
+// Акрона), внутри переводится в количество получасовых периодов
+// (глубина_в_часах * 2). Каждый период — это отдельный полный запрос
+// (запись/ожидание/чтение), поэтому 648ч, как у Акрона, здесь неуместны:
+// 24 часа = 48 периодов, уже несколько минут работы при старте.
 const vkmDefaultBackfillDepthHours = 24
 
-// vkmHourlyParams are the fields persisted to archive_hourly from one VKM
-// archive result — the period-INTEGRATED totals, not the instantaneous
-// snapshots. CONFIRMED against real hardware: S (mass) and ST (thermal
-// energy) scale linearly with the requested period length, exactly what
-// a per-hour archive row needs; Pi/Pbar/T/dP/H are end-of-period
-// instantaneous readings and are deliberately NOT saved here.
+// vkmHourlyParams — поля, которые сохраняются в archive_hourly из одного
+// результата архива ВКМ — интегральные за период суммы, а не мгновенные
+// значения. Подтверждено на реальном приборе: S (масса) и ST (тепловая
+// энергия) растут пропорционально длине запрошенного периода; Pi/Pbar/T/
+// dP/H — мгновенные показания на конец периода и сюда сознательно не
+// попадают.
 var vkmHourlyParams = []string{"S", "ST"}
 
-// persistVKMHourly saves vkmHourlyParams from one VKM archive result as
-// archive_hourly rows tagged to hourStart (the specific hour the request's
-// From/To window covered — NOT time.Now(), since a backfilled hour is by
-// definition in the past).
-func persistVKMHourly(ctx context.Context, d *Device, hourStart time.Time, rec archive.ArchiveRecord) int {
+// persistVKMHourly сохраняет vkmHourlyParams из одного результата архива
+// ВКМ как строки archive_hourly, привязанные к periodStart (начало периода,
+// который реально покрывало окно From/To запроса — не time.Now(), так как
+// дозабираемый период всегда в прошлом).
+func persistVKMHourly(ctx context.Context, d *Device, periodStart time.Time, rec archive.ArchiveRecord) int {
 	saved := 0
 	for _, param := range vkmHourlyParams {
 		v, ok := fieldFloat(rec.Fields, param)
 		if !ok {
-			log.Printf("[%s] VKM час %s: поле %s отсутствует в ответе прибора (поля=%v)\n",
-				d.ID, hourStart.Format("02.01.2006 15:00"), param, rec.Fields)
+			log.Printf("[%s] VKM период %s: поле %s отсутствует в ответе прибора (поля=%v)\n",
+				d.ID, periodStart.Format("02.01.2006 15:04"), param, rec.Fields)
 			continue
 		}
 		unit, _ := rec.Fields[param+"_unit"].(string)
@@ -54,13 +58,13 @@ func persistVKMHourly(ctx context.Context, d *Device, hourStart time.Time, rec a
 			DeviceID: d.ID,
 			Channel:  "",
 			Param:    param,
-			TsHour:   hourStart,
+			TsHour:   periodStart,
 			Value:    v,
 			Unit:     unit,
 		}
 		if err := d.Repo.SaveHourlyArchive(ctx, r); err != nil {
-			log.Printf("[%s] VKM час %s: ошибка сохранения %s: %v\n",
-				d.ID, hourStart.Format("02.01.2006 15:00"), param, err)
+			log.Printf("[%s] VKM период %s: ошибка сохранения %s: %v\n",
+				d.ID, periodStart.Format("02.01.2006 15:04"), param, err)
 			continue
 		}
 		saved++
@@ -68,12 +72,11 @@ func persistVKMHourly(ctx context.Context, d *Device, hourStart time.Time, rec a
 	return saved
 }
 
-// collectVKMHour issues ONE archive request/wait/read dance for the
-// window [hourStart, hourStart+1h) and persists whatever comes back.
-// Returns how many of vkmHourlyParams were actually saved (0 without an
-// error is a legitimate outcome — e.g. the device had no data for that
-// hour).
-func (d *Device) collectVKMHour(ctx context.Context, a profile.Archive, hourStart time.Time) (int, error) {
+// collectVKMPeriod делает ОДИН полный танец запись/ожидание/чтение архива
+// для окна [periodStart, periodStart+vkmArchivePeriod) и сохраняет то, что
+// пришло. Возвращает, сколько из vkmHourlyParams реально сохранено (0 без
+// ошибки — законный исход: у прибора не было данных за этот период).
+func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, periodStart time.Time) (int, error) {
 	reader, ok := archive.Get(a.Strategy)
 	if !ok {
 		return 0, fmt.Errorf("неизвестная стратегия %s", a.Strategy)
@@ -83,8 +86,8 @@ func (d *Device) collectVKMHour(ctx context.Context, a profile.Archive, hourStar
 		DeviceID:  d.ID,
 		ArchiveID: a.ID,
 		Instance:  1,
-		From:      hourStart,
-		To:        hourStart.Add(time.Hour),
+		From:      periodStart,
+		To:        periodStart.Add(vkmArchivePeriod),
 		Params:    a.Params,
 	}
 
@@ -103,88 +106,112 @@ func (d *Device) collectVKMHour(ctx context.Context, a profile.Archive, hourStar
 	}
 
 	// Сырую строку сохраняем отдельно от разобранных полей — она нужна
-	// northbound-у, чтобы отдавать в ЭС ровно то, что прислал прибор, а
-	// не собирать строку заново из S/ST (см. doc-комментарий
-	// VKMArchiveSource в internal/northbound/vkm_archive.go). Ошибка
-	// сохранения сырой строки не должна ронять сохранение S/ST — это
-	// две независимые вещи.
-	if err := d.Repo.SaveVKMRawString(ctx, d.ID, q.Instance, hourStart, string(records[0].Raw)); err != nil {
-		log.Printf("[%s] VKM час %s: ошибка сохранения сырой строки: %v\n",
-			d.ID, hourStart.Format("02.01.2006 15:00"), err)
+	// northbound-у, чтобы отдавать в ЭС ровно то, что прислал прибор (и с
+	// тем же временным диапазоном, что реально запросили — иначе ЭС видит
+	// несовпадение периода в ответе и не продвигается дальше, это и было
+	// найдено живьём 2026-08-02). Ошибка сохранения сырой строки не должна
+	// ронять сохранение S/ST — это две независимые вещи.
+	if err := d.Repo.SaveVKMRawString(ctx, d.ID, q.Instance, periodStart, string(records[0].Raw)); err != nil {
+		log.Printf("[%s] VKM период %s: ошибка сохранения сырой строки: %v\n",
+			d.ID, periodStart.Format("02.01.2006 15:04"), err)
 	}
 
-	return persistVKMHourly(ctx, d, hourStart, records[0]), nil
+	return persistVKMHourly(ctx, d, periodStart, records[0]), nil
 }
 
-// pollVKMHourlyLatest is VKM's regular per-cycle archive poll — the
-// counterpart to Akron's hourly PollArchives tick. Requests exactly the
-// most recently COMPLETED hour (now truncated to the hour, minus one) —
-// paired with the archive_at_minute scheduling anchor (config.yaml's
-// devices[].backfill.archive_at_minute), this naturally lands the request
-// shortly after that hour closes, the same timing fix already applied for
-// Akron's "ЭС reads before the hour is collected" bug.
+// pollVKMHourlyLatest — обычный плановый опрос архива ВКМ (аналог часового
+// тика PollArchives у Акрона). Запрашивает последний ПОЛНОСТЬЮ завершённый
+// получасовой период.
 func (d *Device) pollVKMHourlyLatest(ctx context.Context, a profile.Archive) {
-	hourStart := time.Now().Truncate(time.Hour).Add(-time.Hour)
+	periodStart := time.Now().Truncate(vkmArchivePeriod).Add(-vkmArchivePeriod)
 
-	saved, err := d.collectVKMHour(ctx, a, hourStart)
+	saved, err := d.collectVKMPeriod(ctx, a, periodStart)
 	if err != nil {
-		log.Printf("[%s] VKM архив %s: час %s: ошибка: %v\n",
-			d.ID, a.ID, hourStart.Format("02.01.2006 15:00"), err)
+		log.Printf("[%s] VKM архив %s: период %s: ошибка: %v\n",
+			d.ID, a.ID, periodStart.Format("02.01.2006 15:04"), err)
 		return
 	}
-	log.Printf("[%s] VKM архив %s: час %s: сохранено полей: %d/%d\n",
-		d.ID, a.ID, hourStart.Format("02.01.2006 15:00"), saved, len(vkmHourlyParams))
+	log.Printf("[%s] VKM архив %s: период %s: сохранено полей: %d/%d\n",
+		d.ID, a.ID, periodStart.Format("02.01.2006 15:04"), saved, len(vkmHourlyParams))
 }
 
-// backfillVKMHourly is VKM's counterpart to Akron's deep startup sweep —
-// but one archive REQUEST per missing hour (not one cheap indexed page
-// covering many hours), so depth defaults much shallower
-// (vkmDefaultBackfillDepthHours) and every hour costs a real
-// multi-second round-trip. Only reaches back over FULLY completed hours
-// (never the current, still-open hour).
-func (d *Device) backfillVKMHourly(ctx context.Context, a profile.Archive, opts BackfillOptions) {
-	depthLimit := vkmDefaultBackfillDepthHours
-	if opts.MaxDepthHours > 0 {
-		depthLimit = opts.MaxDepthHours
+// missingVKMPeriods находит получасовые периоды в [from, to], для которых
+// ещё нет строки archive_hourly с param="S" — собственный расчёт (не через
+// storage.Repo.MissingHours, который жёстко считает по часу) специально
+// под получасовой шаг ВКМ.
+func missingVKMPeriods(ctx context.Context, repo storage.Repo, deviceID string, from, to time.Time) ([]time.Time, error) {
+	// Разумный запас по лимиту — покрывает несколько лет получасовых
+	// записей; для наших объёмов (месяцы работы одного прибора) с большим
+	// запасом достаточно.
+	existing, err := repo.GetHourlyArchiveDesc(ctx, deviceID, "", "S", 0, 200000)
+	if err != nil {
+		return nil, fmt.Errorf("чтение существующих записей: %w", err)
+	}
+	present := make(map[int64]bool, len(existing))
+	for _, r := range existing {
+		present[r.TsHour.Unix()] = true
 	}
 
-	toBoundary := time.Now().Truncate(time.Hour).Add(-time.Hour) // last fully-completed hour
-	fromBoundary := toBoundary.Add(-time.Duration(depthLimit-1) * time.Hour)
+	var missing []time.Time
+	for t := from; !t.After(to); t = t.Add(vkmArchivePeriod) {
+		if !present[t.Unix()] {
+			missing = append(missing, t)
+		}
+	}
+	return missing, nil
+}
 
-	missing, err := d.Repo.MissingHours(ctx, d.ID, "", "S", fromBoundary, toBoundary)
+// backfillVKMHourly — аналог глубокого стартового дозабора Акрона, но один
+// ЗАПРОС на каждый пропущенный получасовой период (не одно дешёвое
+// индексное чтение на много часов разом), поэтому глубина по умолчанию
+// заметно меньше акроновской (vkmDefaultBackfillDepthHours), и каждый
+// период стоит настоящего многосекундного обращения к прибору. Достаёт
+// только полностью завершённые периоды (никогда текущий, ещё не закрытый).
+func (d *Device) backfillVKMHourly(ctx context.Context, a profile.Archive, opts BackfillOptions) {
+	depthHours := vkmDefaultBackfillDepthHours
+	if opts.MaxDepthHours > 0 {
+		depthHours = opts.MaxDepthHours
+	}
+	periodsCount := depthHours * 2 // 2 получасовых периода на час
+
+	toBoundary := time.Now().Truncate(vkmArchivePeriod).Add(-vkmArchivePeriod) // последний завершённый период
+	fromBoundary := toBoundary.Add(-time.Duration(periodsCount-1) * vkmArchivePeriod)
+
+	missing, err := missingVKMPeriods(ctx, d.Repo, d.ID, fromBoundary, toBoundary)
 	if err != nil {
 		log.Printf("[%s] VKM дозабор %s: не удалось вычислить пропуски: %v\n", d.ID, a.ID, err)
 		return
 	}
 	if len(missing) == 0 {
-		log.Printf("[%s] VKM дозабор %s: пропусков в пределах %dч нет\n", d.ID, a.ID, depthLimit)
+		log.Printf("[%s] VKM дозабор %s: пропусков в пределах %dч (%d периодов по 30 мин) нет\n",
+			d.ID, a.ID, depthHours, periodsCount)
 		return
 	}
 
-	log.Printf("[%s] VKM дозабор %s: старт, пропущено часов: %d из %d (по одному запросу на час — дороже, чем у Акрона, наберись терпения)\n",
-		d.ID, a.ID, len(missing), depthLimit)
+	log.Printf("[%s] VKM дозабор %s: старт, пропущено периодов: %d из %d (по одному запросу на получас — дороже, чем у Акрона, наберись терпения)\n",
+		d.ID, a.ID, len(missing), periodsCount)
 
-	hoursFilled := 0
-	for _, hour := range missing {
+	periodsFilled := 0
+	for _, period := range missing {
 		select {
 		case <-ctx.Done():
-			log.Printf("[%s] VKM дозабор %s: прервано контекстом (заполнено часов: %d/%d)\n",
-				d.ID, a.ID, hoursFilled, len(missing))
+			log.Printf("[%s] VKM дозабор %s: прервано контекстом (заполнено периодов: %d/%d)\n",
+				d.ID, a.ID, periodsFilled, len(missing))
 			return
 		default:
 		}
 
-		saved, err := d.collectVKMHour(ctx, a, hour)
+		saved, err := d.collectVKMPeriod(ctx, a, period)
 		if err != nil {
-			log.Printf("[%s] VKM дозабор %s: час %s: ошибка: %v\n",
-				d.ID, a.ID, hour.Format("02.01.2006 15:00"), err)
+			log.Printf("[%s] VKM дозабор %s: период %s: ошибка: %v\n",
+				d.ID, a.ID, period.Format("02.01.2006 15:04"), err)
 			continue
 		}
 		if saved > 0 {
-			hoursFilled++
+			periodsFilled++
 		}
-		log.Printf("[%s] VKM дозабор %s: час %s: сохранено полей: %d/%d\n",
-			d.ID, a.ID, hour.Format("02.01.2006 15:00"), saved, len(vkmHourlyParams))
+		log.Printf("[%s] VKM дозабор %s: период %s: сохранено полей: %d/%d\n",
+			d.ID, a.ID, period.Format("02.01.2006 15:04"), saved, len(vkmHourlyParams))
 	}
-	log.Printf("[%s] VKM дозабор %s: готово, заполнено часов: %d/%d\n", d.ID, a.ID, hoursFilled, len(missing))
+	log.Printf("[%s] VKM дозабор %s: готово, заполнено периодов: %d/%d\n", d.ID, a.ID, periodsFilled, len(missing))
 }

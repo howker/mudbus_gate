@@ -32,11 +32,13 @@ func NewDBVKMArchiveSource(repo storage.Repo, deviceID string) *DBVKMArchiveSour
 	return &DBVKMArchiveSource{repo: repo, deviceID: deviceID}
 }
 
-// Archive ищет сохранённую строку за час, на который начинается [start,
-// end). Наш почасовой сбор всегда пишет ровно часовые окна (hourStart,
-// hourStart+1ч), поэтому запрос ЭС должен совпасть по границе часа —
-// если ЭС просит окно другой длины/выравнивания, вернём ok=false (нет
-// записей), а не подгонять что-то приблизительное.
+// Archive ищет сохранённую строку за период, на который начинается
+// [start, end). Наш сбор всегда пишет получасовые окна (periodStart,
+// periodStart+30мин) — подтверждено живым захватом (2026-08-02): именно
+// такими окнами реально запрашивает архив драйвер ЭС (УВП-280), а не
+// часовыми, как предполагалось раньше. Если ЭС просит окно другой длины/
+// выравнивания, вернём ok=false (нет записей), а не подгонять что-то
+// приблизительное.
 func (s *DBVKMArchiveSource) Archive(pipe int, start, end time.Time, opts uint16) (string, bool) {
 	timeout := s.QueryTimeout
 	if timeout <= 0 {
@@ -45,10 +47,10 @@ func (s *DBVKMArchiveSource) Archive(pipe int, start, end time.Time, opts uint16
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	hourStart := start.Truncate(time.Hour)
-	raw, found, err := s.repo.GetVKMRawString(ctx, s.deviceID, pipe, hourStart)
+	periodStart := start.Truncate(30 * time.Minute)
+	raw, found, err := s.repo.GetVKMRawString(ctx, s.deviceID, pipe, periodStart)
 	if err != nil {
-		log.Printf("[VKM northbound] ошибка чтения архива за %s: %v\n", hourStart.Format("02.01.2006 15:00"), err)
+		log.Printf("[VKM northbound] ошибка чтения архива за %s: %v\n", periodStart.Format("02.01.2006 15:04"), err)
 		return "", false
 	}
 	if !found {
