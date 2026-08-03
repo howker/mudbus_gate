@@ -28,6 +28,8 @@ func runNorthbound() {
 	serveVKM := false
 	var vkmString string
 	vkmProbe := false
+	numProbe := false
+	numProbeLog := "vkm_numprobe.txt"
 
 	for i := 2; i < len(os.Args); i++ {
 		switch os.Args[i] {
@@ -56,6 +58,12 @@ func runNorthbound() {
 			serveVKM = true
 		case "--vkm-probe":
 			vkmProbe = true
+		case "--vkm-numprobe":
+			numProbe = true
+		case "--vkm-numprobe-log":
+			if i+1 < len(os.Args) {
+				numProbeLog = os.Args[i+1]
+			}
 		case "--vkm-string":
 			if i+1 < len(os.Args) {
 				vkmString = os.Args[i+1]
@@ -98,7 +106,7 @@ func runNorthbound() {
 	}
 
 	if serveVKM {
-		runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID, vkmProbe)
+		runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID, vkmProbe, numProbe, numProbeLog)
 		return
 	}
 
@@ -245,7 +253,7 @@ func runAkronLiveMode(listenAddr, dbPath, deviceID, logPath string) {
 // берётся из реально собранных данных (internal/device/vkm_hourly.go),
 // а не из фиксированной/настраиваемой заглушки. Без них поведение
 // прежнее — для отладки механики протокола без живого прибора.
-func runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID string, vkmProbe bool) {
+func runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID string, vkmProbe, numProbe bool, numProbeLog string) {
 	if listenAddr == "" {
 		fmt.Println("northbound --serve-vkm: --listen обязателен")
 		os.Exit(1)
@@ -276,12 +284,19 @@ func runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID string, vkm
 		}
 		src := northbound.NewDBVKMArchiveSource(repo, deviceID)
 		src.ProbeVariants = vkmProbe
+		src.NumFormatProbe = numProbe
+		src.NumProbeLogPath = numProbeLog
 		newSrc = func() northbound.VKMArchiveSource { return src }
 		log.Printf("northbound --serve-vkm: боевой режим — источник архива: БД %s, прибор %s\n", dbPath, deviceID)
 		if vkmProbe {
 			log.Println("northbound --serve-vkm: РЕЖИМ ПЕРЕБОРА ГИПОТЕЗ (--vkm-probe) включён:")
 			log.Println("  пока ЭС повторяет запрос одного периода, каждая попытка получает СЛЕДУЮЩИЙ вариант строки;")
 			log.Println("  когда ЭС примет период и пойдёт дальше — в логе будет видно, на каком варианте это случилось.")
+		}
+		if numProbe {
+			log.Println("northbound --serve-vkm: РЕЖИМ ПЕРЕБОРА ФОРМАТА ЧИСЛА (--vkm-numprobe) включён:")
+			log.Printf("  каждому экспоненциальному полю присвоен свой формат; карта пишется в %s\n", numProbeLog)
+			log.Println("  посмотри в ЭС, какие каналы стали ненулевыми, и сопоставь с форматом по этому файлу.")
 		}
 	} else {
 		// Archive string comes from vkm_config.txt when present, falling back

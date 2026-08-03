@@ -3,6 +3,7 @@ package northbound
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestNormalizeVKMNumbers_RealStuckPeriod — на данных живого захвата
@@ -142,4 +143,95 @@ func TestVKMEmptyNSS(t *testing.T) {
 	if !strings.Contains(got, "Tnss={Время нештатных ситуаций}0сек") {
 		t.Fatalf("задето соседнее поле Tnss: %q", got)
 	}
+}
+
+// TestVKMExpandExponent_RealValues — на реальных значениях из архива ВКМ
+// (2026-08-02). Гипотеза по багу нулей: ЭС не разбирает научную нотацию.
+// Разворот e+NN в обычное число должен затронуть ТОЛЬКО экспоненциальные
+// значения, не трогая обычные десятичные (которые уже работали — S, T).
+func TestVKMExpandExponent_RealValues(t *testing.T) {
+	cases := map[string]string{
+		"Pi=4.2126e+05Па":   "Pi=421260Па",
+		"ST=2.658389e+09Дж": "ST=2658389000Дж",
+		"Pbar=1.0092e+05Па": "Pbar=100920Па",
+		"H=2.8694e+06Дж/кг": "H=2869400Дж/кг",
+		// Обычные числа не трогаем.
+		"dP=6338.6Па":   "dP=6338.6Па",
+		"S=929.72064кг": "S=929.72064кг",
+		"T=202.16°С":    "T=202.16°С",
+	}
+	for in, want := range cases {
+		got := vkmExpandExponent(in)
+		if got != want {
+			t.Errorf("vkmExpandExponent(%q) = %q, ожидалось %q", in, got, want)
+		}
+	}
+}
+
+// TestVKMExpandExponent_FullString — на целой архивной строке: все
+// экспоненциальные поля развёрнуты, структура (теги, ;, единицы) цела.
+func TestVKMExpandExponent_FullString(t *testing.T) {
+	raw := "Time=02/08/26 05:30:00-02/08/26 06:00:00;Pi=4.27e+05Па;Pbar=1.0092e+05Па;" +
+		"T=206.98°С;dP=6338.6Па;S=913.77557кг;ST=2.6219832e+09Дж;"
+	got := vkmExpandExponent(raw)
+
+	if strings.Contains(got, "e+") || strings.Contains(got, "E+") {
+		t.Fatalf("осталась экспоненциальная запись: %q", got)
+	}
+	// Дата в поле Time (со слэшами и двоеточиями) не должна пострадать.
+	if !strings.Contains(got, "02/08/26 05:30:00-02/08/26 06:00:00") {
+		t.Fatalf("поле Time повреждено: %q", got)
+	}
+	// Обычные числа на месте.
+	if !strings.Contains(got, "S=913.77557кг") || !strings.Contains(got, "dP=6338.6Па") {
+		t.Fatalf("обычные числа пострадали: %q", got)
+	}
+	// Экспоненциальные развёрнуты.
+	if !strings.Contains(got, "Pi=427000Па") {
+		t.Fatalf("Pi не развёрнут: %q", got)
+	}
+}
+
+// TestApplyNumFormatProbe_DistributesFormats проверяет, что режим перебора
+// формата раздаёт РАЗНЫЕ форматы по РАЗНЫМ экспоненциальным полям одной
+// строки, не трогая обычные (S, T) и структуру.
+func TestApplyNumFormatProbe_DistributesFormats(t *testing.T) {
+	repo := &fakeRepo{}
+	src := NewDBVKMArchiveSource(repo, "vkm360_real")
+	src.NumFormatProbe = true
+	// NumProbeLogPath пустой -> лог идёт в обычный log, файл не трогаем.
+
+	raw := "Time=02/08/26 05:30:00-02/08/26 06:00:00;" +
+		"Pi=4.27e+05Па;Pbar=1.0092e+05Па;T=206.98°С;S=913.77557кг;ST=2.6219832e+09Дж;"
+
+	period := timeParseTest(t, "2026-08-02 05:30")
+	got := src.applyNumFormatProbe(period, raw)
+
+	// Обычные поля не тронуты.
+	if !strings.Contains(got, "S=913.77557кг") || !strings.Contains(got, "T=206.98°С") {
+		t.Fatalf("обычные поля пострадали: %q", got)
+	}
+	// Дата цела.
+	if !strings.Contains(got, "02/08/26 05:30:00-02/08/26 06:00:00") {
+		t.Fatalf("дата пострадала: %q", got)
+	}
+	// Экспоненциальные поля больше НЕ должны все совпадать по формату —
+	// Pi получил формат A (целое), Pbar формат B и т.д. Проверяем, что Pi
+	// стало целым (первый формат в списке — "A-целое-без-точки").
+	if !strings.Contains(got, "Pi=427000Па") {
+		t.Fatalf("Pi должен был получить формат A (целое 427000): %q", got)
+	}
+	// ST не должно остаться в исходной научной нотации с маленькой 'e'.
+	if strings.Contains(got, "ST=2.6219832e+09") {
+		t.Fatalf("ST не переформатирован: %q", got)
+	}
+}
+
+func timeParseTest(t *testing.T, s string) time.Time {
+	t.Helper()
+	tm, err := time.Parse("2006-01-02 15:04", s)
+	if err != nil {
+		t.Fatalf("time parse: %v", err)
+	}
+	return tm
 }

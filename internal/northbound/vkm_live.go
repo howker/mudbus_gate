@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,20 @@ type DBVKMArchiveSource struct {
 	// каком варианте это произошло. Смысл: проверить все гипотезы за один
 	// прогон, а не пересобирать и перезаливать бинарник под каждую.
 	ProbeVariants bool
+
+	// NumFormatProbe включает режим ПЕРЕБОРА ФОРМАТА ЧИСЛА. В отличие от
+	// ProbeVariants, здесь нет автоиндикатора (значение канала «ноль/не
+	// ноль» видно только глазами в ЭС), поэтому крутить варианты во
+	// времени бессмысленно. Вместо этого раздаём РАЗНЫЕ форматы числа по
+	// РАЗНЫМ экспоненциальным полям ОДНОЙ строки одновременно: Pi —
+	// формат A, Pbar — формат B, ST — формат C и т.д. За один проход
+	// человек смотрит в ЭС, какие каналы стали ненулевыми, и по
+	// отдельному лог-файлу (NumProbeLogPath) сразу видит, какой формат
+	// сработал — без перебора во времени вообще.
+	NumFormatProbe bool
+	// NumProbeLogPath — путь к отдельному подробному логу перебора формата.
+	NumProbeLogPath string
+	numProbeOnce    sync.Once
 
 	mu             sync.Mutex
 	lastPeriod     time.Time // период предыдущего запроса (для сброса счётчика)
@@ -138,17 +154,23 @@ func (s *DBVKMArchiveSource) Archive(pipe int, start, end time.Time, opts uint16
 		return "", false
 	}
 
+	if s.NumFormatProbe {
+		return s.applyNumFormatProbe(periodStart, raw), true
+	}
+
 	if !s.ProbeVariants {
-		// Обычный боевой режим: компактный формат без {..} — ПОДТВЕРЖДЕНО
-		// живым перебором (2026-08-02): два периода подряд (27.07 16:00,
-		// 27.07 16:30) ЭС приняла синхронно на одном и том же варианте
-		// (7-no-headers), а не на разных случайных — значит дело не в
-		// "любой отличающийся контент", а именно в отсутствии блоков-
-		// заголовков {..}. Похоже, драйвер ЭС не ожидает их вообще, и все
-		// прежние "успешно принятые" периоды (со скобками) проходили не
-		// благодаря заголовкам, а несмотря на них — по исчерпании
-		// внутреннего лимита её собственных ретраев.
-		return vkmAddDecimalPoint(vkmStripAllHeaders(vkmStripLineBreaks(raw))), true
+		// Обычный боевой режим:
+		//  1) компактный формат без {..} — ПОДТВЕРЖДЕНО живым перебором
+		//     (2026-08-02): два периода подряд ЭС приняла синхронно на
+		//     варианте 7-no-headers, драйвер не ожидает блоков-заголовков.
+		//  2) экспоненциальная запись (e+NN) развёрнута в обычную
+		//     десятичную — ПОДТВЕРЖДЕНО сравнением сработавших и нет
+		//     каналов: S/T (обычные числа 929.72, 202.16) ЭС распарсила и
+		//     показала, а ST/Pi/Pbar (научная нотация 2.65e+09, 4.21e+05)
+		//     дали нули. Единственное системное различие — форма записи
+		//     числа; парсер драйвера ЭС, похоже, не понимает 'e+NN'.
+		//  3) целые числа без точки -> ".0" (прежняя правка, оставлена).
+		return vkmAddDecimalPoint(vkmExpandExponent(vkmStripAllHeaders(vkmStripLineBreaks(raw)))), true
 	}
 
 	return s.applyProbeVariant(ctx, pipe, periodStart, raw), true
@@ -218,6 +240,10 @@ var (
 	vkmHeaderRe = regexp.MustCompile(`=[\{<][^}>]*[\}>]`)
 	// numAfterHeaderRe находит целое число сразу после закрывающей скобки.
 	numAfterHeaderRe = regexp.MustCompile(`[}>](-?\d+)`)
+	// expNumRe находит число в научной нотации (напр. 4.2126e+05,
+	// 2.658389e+09, 1e-3). Границы \b нельзя (символы кириллицы-единицы
+	// сразу после), поэтому мантисса+экспонента описаны явно.
+	expNumRe = regexp.MustCompile(`-?\d+(?:\.\d+)?[eE][+-]?\d+`)
 	// twrkRe находит значение поля Twrk.
 	twrkRe = regexp.MustCompile(`(Twrk=\{[^}]*\})[^;]*`)
 	// nssTailRe находит текстовый хвост после закрывающей скобки NSS.
@@ -258,6 +284,132 @@ func vkmForceFullTwrk(raw string) string {
 // Прибор сам иногда шлёт архив в таком компактном виде.
 func vkmStripAllHeaders(raw string) string {
 	return vkmHeaderRe.ReplaceAllString(raw, "=")
+}
+
+// numFormat — один способ записать число (гипотеза о том, что ждёт ЭС).
+type numFormat struct {
+	name string
+	fn   func(f float64) string
+}
+
+// numFormats — набор гипотез форматирования числа, раздаваемых по разным
+// полям одной строки в режиме NumFormatProbe. Каждая — отдельная причина,
+// почему научная нотация могла не парситься драйвером ЭС.
+var numFormats = []numFormat{
+	{"A-целое-без-точки", func(f float64) string { return strconv.FormatFloat(f, 'f', 0, 64) }},
+	{"B-десятичное-минимальное", func(f float64) string { return strconv.FormatFloat(f, 'f', -1, 64) }},
+	{"C-точка-1-знак", func(f float64) string { return strconv.FormatFloat(f, 'f', 1, 64) }},
+	{"D-запятая-рус-2-знака", func(f float64) string {
+		return strings.Replace(strconv.FormatFloat(f, 'f', 2, 64), ".", ",", 1)
+	}},
+	{"E-экспонента-заглавная-E", func(f float64) string { return strconv.FormatFloat(f, 'E', -1, 64) }},
+	{"F-фикс-3-знака", func(f float64) string { return strconv.FormatFloat(f, 'f', 3, 64) }},
+}
+
+// mapping — одна запись карты «поле -> назначенный формат -> было -> стало».
+type mapping struct{ field, format, before, after string }
+
+// expFieldRe находит поле вида "тег=<число в науч.нотации><хвост-единица>"
+// до ';'. Заменяется только числовая часть.
+var expFieldRe = regexp.MustCompile(`([A-Za-z_]+)=(-?\d+(?:\.\d+)?[eE][+-]?\d+)([^;]*)`)
+
+// applyNumFormatProbe раздаёт каждому экспоненциальному полю строки свой
+// формат числа (по кругу из numFormats) и пишет карту в отдельный лог.
+// Обычные поля (S, T) не трогает. Человек смотрит в ЭС, какие каналы
+// стали ненулевыми, и по логу узнаёт, какой формат сработал — за ОДИН
+// проход, без перебора во времени.
+func (s *DBVKMArchiveSource) applyNumFormatProbe(periodStart time.Time, raw string) string {
+	base := vkmStripAllHeaders(vkmStripLineBreaks(raw))
+
+	var mappings []mapping
+	idx := 0
+	out := expFieldRe.ReplaceAllStringFunc(base, func(m string) string {
+		sub := expFieldRe.FindStringSubmatch(m)
+		if sub == nil {
+			return m
+		}
+		tag, numStr, unit := sub[1], sub[2], sub[3]
+		f, err := strconv.ParseFloat(numStr, 64)
+		if err != nil {
+			return m
+		}
+		nf := numFormats[idx%len(numFormats)]
+		idx++
+		formatted := nf.fn(f)
+		mappings = append(mappings, mapping{tag, nf.name, numStr, formatted})
+		return tag + "=" + formatted + unit
+	})
+
+	// Карта одинакова в пределах периода (значения те же), а строки
+	// повторяются каждые ~4 сек — пишем лог только при СМЕНЕ периода.
+	s.mu.Lock()
+	newPeriod := !periodStart.Equal(s.lastPeriod)
+	if newPeriod {
+		s.lastPeriod = periodStart
+	}
+	s.mu.Unlock()
+	if newPeriod {
+		s.logNumProbe(periodStart, mappings)
+	}
+	return out
+}
+
+// logNumProbe пишет карту в отдельный файл (NumProbeLogPath) или в обычный
+// log, если путь не задан.
+func (s *DBVKMArchiveSource) logNumProbe(periodStart time.Time, mappings []mapping) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "=== ПЕРЕБОР ФОРМАТА ЧИСЛА, период %s ===\n", periodStart.Format("02.01.2006 15:04"))
+	fmt.Fprintf(&b, "Посмотри в ЭС, какие из этих каналов стали НЕнулевыми, и сопоставь с форматом:\n")
+	for _, m := range mappings {
+		fmt.Fprintf(&b, "  поле %-6s формат %-26s : %s -> %s\n", m.field, m.format, m.before, m.after)
+	}
+	msg := b.String()
+
+	if s.NumProbeLogPath == "" {
+		log.Print(msg)
+		return
+	}
+	s.numProbeOnce.Do(func() {
+		if f, err := os.OpenFile(s.NumProbeLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+			fmt.Fprintf(f, "# Лог перебора формата числа ВКМ northbound. Запущен %s\n", time.Now().Format(time.RFC3339))
+			fmt.Fprintf(f, "# Каждому экспоненциальному полю присвоен свой формат записи.\n")
+			fmt.Fprintf(f, "# Задача: увидеть в ЭС, при каком формате канал перестаёт быть нулём.\n\n")
+			f.Close()
+		}
+	})
+	f, err := os.OpenFile(s.NumProbeLogPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("[VKM ФОРМАТ] не могу открыть %s: %v; пишу в обычный лог:\n%s", s.NumProbeLogPath, err, msg)
+		return
+	}
+	defer f.Close()
+	fmt.Fprintln(f, msg)
+}
+
+// vkmExpandExponent разворачивает числа в научной нотации (4.2126e+05) в
+// обычную десятичную запись (421260), не трогая остальной текст. СИЛЬНАЯ
+// гипотеза по багу нулей (2026-08-02): каналы, чьи значения прибор шлёт
+// обычными числами (S=929.72, T=202.16), ЭС распарсила и показала; а те,
+// что в научной нотации (ST=2.65e+09, Pi=4.21e+05, Pbar=1.0092e+05), дали
+// нули. Единственное системное различие — форма записи числа, значит
+// парсер драйвера ЭС, скорее всего, не понимает 'e+NN'.
+//
+// Разворачиваем через strconv (round-trip float64) — этого достаточно для
+// диапазона величин теплосчётчика (масса, энергия, давление); при
+// невозможности разобрать оставляем как есть (не портим строку).
+func vkmExpandExponent(raw string) string {
+	return expNumRe.ReplaceAllStringFunc(raw, func(m string) string {
+		f, err := strconv.ParseFloat(m, 64)
+		if err != nil {
+			return m
+		}
+		// 'f' с -1 разрядностью даёт кратчайшее точное представление без
+		// экспоненты для обычных величин; но strconv может вернуть
+		// экспоненту для очень больших/малых — поэтому проверяем и, если
+		// так, форматируем фиксированно.
+		out := strconv.FormatFloat(f, 'f', -1, 64)
+		return out
+	})
 }
 
 // vkmAddDecimalPoint добавляет ".0" к целым числовым значениям без
