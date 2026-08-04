@@ -54,6 +54,10 @@ type DBVKMArchiveSource struct {
 	lastPeriod     time.Time // период предыдущего запроса (для сброса счётчика)
 	variantIdx     int       // индекс текущего варианта в vkmVariants
 	attemptsOnSame int       // сколько попыток уже сделано по текущему периоду
+
+	comboLogged      bool // логирована ли уже текущая комбинация преобразований
+	lastStripHeaders bool
+	lastExpandExp    bool
 }
 
 // NewDBVKMArchiveSource создаёт источник архива ВКМ, читающий из репо.
@@ -159,18 +163,22 @@ func (s *DBVKMArchiveSource) Archive(pipe int, start, end time.Time, opts uint16
 	}
 
 	if !s.ProbeVariants {
-		// Обычный боевой режим:
-		//  1) компактный формат без {..} — ПОДТВЕРЖДЕНО живым перебором
-		//     (2026-08-02): два периода подряд ЭС приняла синхронно на
-		//     варианте 7-no-headers, драйвер не ожидает блоков-заголовков.
-		//  2) экспоненциальная запись (e+NN) развёрнута в обычную
-		//     десятичную — ПОДТВЕРЖДЕНО сравнением сработавших и нет
-		//     каналов: S/T (обычные числа 929.72, 202.16) ЭС распарсила и
-		//     показала, а ST/Pi/Pbar (научная нотация 2.65e+09, 4.21e+05)
-		//     дали нули. Единственное системное различие — форма записи
-		//     числа; парсер драйвера ЭС, похоже, не понимает 'e+NN'.
-		//  3) целые числа без точки -> ".0" (прежняя правка, оставлена).
-		return vkmAddDecimalPoint(vkmExpandExponent(vkmStripAllHeaders(vkmStripLineBreaks(raw)))), true
+		// Обычный боевой режим: набор преобразований управляется через
+		// vkm_config.txt (strip_headers / expand_exponent — см.
+		// vkm_config.go), перечитывается на лету, пересборка не нужна.
+		// Дефолт: шапки ОСТАВИТЬ + экспоненту РАЗВЕРНУТЬ — см. историю
+		// ошибочного вывода про «формат без шапок» в vkm_config.go.
+		cfg := loadVKMConfig()
+		out := vkmStripLineBreaks(raw)
+		if cfg.stripHeaders {
+			out = vkmStripAllHeaders(out)
+		}
+		if cfg.expandExponent {
+			out = vkmExpandExponent(out)
+		}
+		out = vkmAddDecimalPoint(out)
+		s.logActiveComboOnChange(cfg.stripHeaders, cfg.expandExponent)
+		return out, true
 	}
 
 	return s.applyProbeVariant(ctx, pipe, periodStart, raw), true
@@ -284,6 +292,24 @@ func vkmForceFullTwrk(raw string) string {
 // Прибор сам иногда шлёт архив в таком компактном виде.
 func vkmStripAllHeaders(raw string) string {
 	return vkmHeaderRe.ReplaceAllString(raw, "=")
+}
+
+// logActiveComboOnChange пишет в лог активную комбинацию преобразований —
+// при старте и при каждой смене через vkm_config.txt (перечитывается на
+// лету), чтобы в логе была видна привязка «какая комбинация действовала в
+// какой момент» при сверке с каналами ЭС.
+func (s *DBVKMArchiveSource) logActiveComboOnChange(stripHeaders, expandExp bool) {
+	s.mu.Lock()
+	changed := !s.comboLogged || stripHeaders != s.lastStripHeaders || expandExp != s.lastExpandExp
+	s.comboLogged = true
+	s.lastStripHeaders = stripHeaders
+	s.lastExpandExp = expandExp
+	s.mu.Unlock()
+	if changed {
+		log.Printf("[VKM northbound] активная комбинация: шапки {..} %s, экспонента %s (правится в vkm_config.txt: strip_headers / expand_exponent, без пересборки)\n",
+			map[bool]string{true: "УБРАНЫ", false: "ОСТАВЛЕНЫ"}[stripHeaders],
+			map[bool]string{true: "РАЗВЁРНУТА в десятичное", false: "как есть (e+NN)"}[expandExp])
+	}
 }
 
 // numFormat — один способ записать число (гипотеза о том, что ждёт ЭС).
@@ -421,7 +447,14 @@ func vkmAddDecimalPoint(raw string) string {
 		if eq < 0 {
 			continue
 		}
-		if entry[:eq] == "Time" {
+		switch entry[:eq] {
+		case "Time", "Twrk", "Tnss", "NSS":
+			// Time — дата; Twrk/Tnss — длительности ("30м 00сек");
+			// NSS — текст. Добавление ".0" к числу внутри них ломает
+			// формат (напр. "30м" -> "30.0м"), а числовыми величинами
+			// они не являются. С УБРАННЫМИ шапками их числа не матчились
+			// (нет '}' перед числом), но теперь шапки по умолчанию
+			// ОСТАВЛЕНЫ — и регекс начал бы их задевать.
 			continue
 		}
 		entries[i] = numAfterHeaderRe.ReplaceAllStringFunc(entry, func(m string) string {

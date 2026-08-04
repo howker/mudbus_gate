@@ -24,18 +24,45 @@ import (
 //	time_layout = 02.01.2006 15:04:05   # timestamp format inside the string
 //	archive_string = ...    # raw override; leave unset to auto-build a
 //	                        # spec-compliant string (period + parameters)
+//	cur_byte_order_probe = false  # true: раздать РАЗНЫМ офсетам области
+//	                        # текущих показаний (2000-2600, IR) РАЗНЫЙ
+//	                        # порядок байт float32 (ABCD/DCBA/BADC/CDAB),
+//	                        # с картой в cur_byte_order_probe_log — на
+//	                        # случай, если "Тепловая энергия"/"Давление"
+//	                        # остаются нулями при заведомо верных значениях:
+//	                        # возможно, порядок байт для ЭТОЙ области не
+//	                        # совпадает с архивным протоколом (110/112/114).
+//	cur_byte_order_probe_log = vkm_byteorder_probe.txt
 //
 // Missing file or missing keys → documented defaults, so the carrier runs
 // fine with no config file at all.
 const vkmConfigFileName = "vkm_config.txt"
 
 type vkmConfig struct {
-	yearMode      string
-	clockOffset   time.Duration
-	minReady      time.Duration
-	archiveString string
-	timeLayout    string
-	periodFormat  string
+	yearMode            string
+	clockOffset         time.Duration
+	minReady            time.Duration
+	archiveString       string
+	timeLayout          string
+	periodFormat        string
+	curByteOrderProbe   bool
+	curByteOrderLogPath string
+	// stripHeaders/expandExponent — два ключевых преобразования архивной
+	// строки перед отдачей в ЭС, вынесены в конфиг, чтобы перебирать их
+	// комбинации правкой ТЕКСТОВОГО файла, без пересборки бинарника.
+	// История (2026-08-03): вывод «ЭС принимает только формат без шапок»
+	// оказался, скорее всего, ошибочным — продвижение ЭС по периодам не
+	// означало успешный разбор значений (все каналы остались нулями;
+	// «принятие» на 7-й попытке перебора было, вероятно, «сдалась и
+	// записала нули», а не «распарсила»). Новая рабочая теория: парсер ЭС
+	// опознаёт величины ПО ТЕКСТУ ШАПКИ ({Масса теплонос.} и т.п. — так
+	// объясняется, почему с прямого прибора масса/температура доходят), а
+	// экспоненциальную запись значений не понимает (так объясняется,
+	// почему тепло/давление не доходят ДАЖЕ с прямого прибора).
+	// Комбинация «шапки оставить + экспоненту развернуть» не проверялась
+	// ни разу — теперь это дефолт.
+	stripHeaders   bool
+	expandExponent bool
 }
 
 func defaultVKMConfig() vkmConfig {
@@ -46,8 +73,12 @@ func defaultVKMConfig() vkmConfig {
 		// Empty by default so a caller-supplied string (CLI --vkm-string,
 		// or ConfigArchiveSource.Fallback) is used unless the config file
 		// explicitly overrides it.
-		archiveString: "",
-		periodFormat:  "datetime",
+		archiveString:       "",
+		periodFormat:        "datetime",
+		curByteOrderProbe:   false,
+		curByteOrderLogPath: "vkm_byteorder_probe.txt",
+		stripHeaders:        false, // шапки ОСТАВИТЬ (ключи сопоставления для парсера ЭС)
+		expandExponent:      true,  // экспоненту РАЗВЕРНУТЬ (парсер ЭС не понимает e+NN)
 	}
 }
 
@@ -153,6 +184,28 @@ func parseVKMConfig(text string) vkmConfig {
 			// string, e.g. "02.01.2006 15:04:05" or "02.01.06 15:04".
 			if v := strings.TrimSpace(val); v != "" {
 				cfg.timeLayout = v
+			}
+		case "cur_byte_order_probe":
+			if v := stripInlineComment(val); v == "true" || v == "1" {
+				cfg.curByteOrderProbe = true
+			} else if v == "false" || v == "0" {
+				cfg.curByteOrderProbe = false
+			}
+		case "cur_byte_order_probe_log":
+			if v := strings.TrimSpace(val); v != "" {
+				cfg.curByteOrderLogPath = v
+			}
+		case "strip_headers":
+			if v := stripInlineComment(val); v == "true" || v == "1" {
+				cfg.stripHeaders = true
+			} else if v == "false" || v == "0" {
+				cfg.stripHeaders = false
+			}
+		case "expand_exponent":
+			if v := stripInlineComment(val); v == "true" || v == "1" {
+				cfg.expandExponent = true
+			} else if v == "false" || v == "0" {
+				cfg.expandExponent = false
 			}
 		}
 	}

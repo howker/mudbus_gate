@@ -70,6 +70,9 @@ func main() {
 	probeControlRegs := flag.Bool("probe-control-regs", false, "diagnostic: instead of the normal flow, try reading the CONTRACTS.md §byte-order control constant (expected int32=1234567890 at register 110) across HR/IR spaces and 109/110 addressing, and print the raw results. Use this when the handshake's register-110 read fails with an address error, to find out where the value actually lives on THIS device.")
 	probeArchiveRegs := flag.Bool("probe-archive-regs", false, "diagnostic: instead of the normal flow, try READING (not writing — safe) the archive-request register block (7900-7914) via HR function 03, at a few nearby address offsets, to check whether the block exists at all on this firmware before the archive dance's WRITE attempt hits it.")
 	probeArchiveRead := flag.Bool("probe-archive-read", false, "diagnostic: assumes a request is already 'ready' (run the normal flow first, or this reads whatever result — even someone else's — is currently cached). Bundles several checks for the 'read archive string' step failing: exact length-register value, a sweep of read quantities (to find the device's real per-request register cap), alternate data-start addresses, and a fresh status re-check.")
+	probeCurrentRegs := flag.Bool("probe-current-regs", false, "diagnostic: scan a wide register range in BOTH HR and IR space, decoding every register pair as float32 in all 4 byte orders (ABCD/DCBA/BADC/CDAB), printing only values that look like plausible physical readings. Use this when a known-good value (e.g. mass ~900-1000 kg, temperature ~200-230°C, seen on a DIRECT poll of the real device) doesn't show up at the documented address/format — this finds where it ACTUALLY lives by brute-force comparison against a real value, instead of guessing addresses from documentation.")
+	scanFrom := flag.Int("scan-from", 2000, "с --probe-current-regs: начальный адрес диапазона сканирования")
+	scanTo := flag.Int("scan-to", 2300, "с --probe-current-regs: конечный адрес диапазона сканирования (исключительно)")
 	flag.Parse()
 
 	var params transport.Params
@@ -134,6 +137,11 @@ func main() {
 
 	if *probeArchiveRead {
 		probeArchiveReadStep(ctx, tr, isTCP, uint8(*unit))
+		return
+	}
+
+	if *probeCurrentRegs {
+		probeCurrentValues(ctx, tr, isTCP, uint8(*unit), *scanFrom, *scanTo)
 		return
 	}
 
@@ -618,6 +626,99 @@ func probeArchiveReadStep(ctx context.Context, tr transport.Transport, isTCP boo
 	fmt.Println("если 2) провалилась ВЕЗДЕ, а 3) на каком-то адресе — успех, значит адрес данных другой.")
 	fmt.Println("если статус в 0) уже НЕ 'готово' — окно кэша истекло, и это просто гонка по времени,")
 	fmt.Println("а не баг: нужно читать данные быстрее после готовности статуса.")
+}
+
+// probeCurrentValues сканирует широкий диапазон регистров в ОБОИХ
+// пространствах (HR и IR) и декодирует каждую пару регистров как float32
+// во всех 4 стандартных порядках байт, печатая только то, что похоже на
+// разумную физическую величину. Смысл: у нас есть ИЗВЕСТНОЕ верное
+// значение (снятое с прямого опроса реального прибора, например масса
+// ~900-1000 кг, температура ~200-230°C) — если оно НЕ появляется по
+// документированному адресу/формату, этот зонд ищет его перебором вместо
+// дальнейших догадок по документации.
+func probeCurrentValues(ctx context.Context, tr transport.Transport, isTCP bool, unit uint8, scanFrom, scanTo int) {
+	fmt.Printf("\n=== зонд текущих показаний: диапазон %d-%d, оба пространства (HR и IR) ===\n", scanFrom, scanTo)
+	fmt.Println("Печатаются только значения, похожие на разумную физическую величину")
+	fmt.Println("(не NaN/Inf, модуль в пределах 0.0001..1e10). Сравни с известными")
+	fmt.Println("значениями с прямого опроса реального прибора (масса, температура и т.д.)")
+
+	for _, space := range []string{"HR", "IR"} {
+		fmt.Printf("\n--- пространство %s ---\n", space)
+		addr := scanFrom
+		found := 0
+		for addr < scanTo {
+			qty := 100
+			if addr+qty > scanTo {
+				qty = scanTo - addr
+			}
+			if qty <= 0 {
+				break
+			}
+			pdu, err := modbus.BuildReadPDUWithQty(space, addr, uint16(qty))
+			if err != nil {
+				addr += qty
+				continue
+			}
+			resp, err := modbus.Transact(ctx, tr, isTCP, nextProbeTxID(), unit, pdu)
+			if err != nil {
+				// Вероятно exception (адрес недоступен) — пропускаем блок,
+				// не прерывая сканирование остального диапазона.
+				addr += qty
+				continue
+			}
+			if len(resp) >= 2 {
+				data := resp[2:]
+				for i := 0; i+3 < len(data); i += 2 {
+					regAddr := addr + i/2
+					b := data[i : i+4]
+					found += printIfReasonableFloat(space, regAddr, b)
+				}
+			}
+			addr += qty
+		}
+		if found == 0 {
+			fmt.Printf("  (в этом пространстве ничего похожего на разумное значение не найдено)\n")
+		}
+	}
+	fmt.Println("\n=== ИТОГ ===")
+	fmt.Println("Найди среди напечатанных строк значение, БЛИЗКОЕ к известному (масса/температура")
+	fmt.Println("с прямого опроса прибора) — адрес и порядок байт рядом с ним и есть правильные.")
+}
+
+// printIfReasonableFloat декодирует 4 байта как float32 во всех 4
+// стандартных порядках и печатает те, что похожи на разумную физическую
+// величину. Возвращает, сколько строк напечатано (для итоговой сводки).
+func printIfReasonableFloat(space string, regAddr int, b []byte) int {
+	orders := []struct {
+		name string
+		perm [4]int // индексы в исходном b, дающие big-endian представление для этого порядка
+	}{
+		{"ABCD", [4]int{0, 1, 2, 3}},
+		{"DCBA", [4]int{3, 2, 1, 0}},
+		{"BADC", [4]int{1, 0, 3, 2}},
+		{"CDAB", [4]int{2, 3, 0, 1}},
+	}
+	printed := 0
+	for _, o := range orders {
+		bits := uint32(b[o.perm[0]])<<24 | uint32(b[o.perm[1]])<<16 | uint32(b[o.perm[2]])<<8 | uint32(b[o.perm[3]])
+		f := math.Float32frombits(bits)
+		if isReasonablePhysicalValue(float64(f)) {
+			fmt.Printf("  %s %5d (порядок %s) float32 = %v\n", space, regAddr, o.name, f)
+			printed++
+		}
+	}
+	return printed
+}
+
+// isReasonablePhysicalValue отсекает NaN/Inf и заведомо не физические
+// величины (нулевые байты, гигантские мусорные числа), пропуская
+// правдоподобный диапазон для давления/температуры/массы/энергии и т.п.
+func isReasonablePhysicalValue(f float64) bool {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return false
+	}
+	af := math.Abs(f)
+	return af > 0.0001 && af < 1e10
 }
 
 func archiveWindow(minutesBack int, fromStr, toStr string) (time.Time, time.Time, error) {
