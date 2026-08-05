@@ -164,10 +164,8 @@ func (s *DBVKMArchiveSource) Archive(pipe int, start, end time.Time, opts uint16
 
 	if !s.ProbeVariants {
 		// Обычный боевой режим: набор преобразований управляется через
-		// vkm_config.txt (strip_headers / expand_exponent — см.
-		// vkm_config.go), перечитывается на лету, пересборка не нужна.
-		// Дефолт: шапки ОСТАВИТЬ + экспоненту РАЗВЕРНУТЬ — см. историю
-		// ошибочного вывода про «формат без шапок» в vkm_config.go.
+		// vkm_config.txt (strip_headers / expand_exponent / field_scale —
+		// см. vkm_config.go), перечитывается на лету, пересборка не нужна.
 		cfg := loadVKMConfig()
 		out := vkmStripLineBreaks(raw)
 		if cfg.stripHeaders {
@@ -175,6 +173,9 @@ func (s *DBVKMArchiveSource) Archive(pipe int, start, end time.Time, opts uint16
 		}
 		if cfg.expandExponent {
 			out = vkmExpandExponent(out)
+		}
+		if len(cfg.fieldScale) > 0 {
+			out = vkmScaleFields(out, cfg.fieldScale)
 		}
 		out = vkmAddDecimalPoint(out)
 		s.logActiveComboOnChange(cfg.stripHeaders, cfg.expandExponent)
@@ -436,6 +437,69 @@ func vkmExpandExponent(raw string) string {
 		out := strconv.FormatFloat(f, 'f', -1, 64)
 		return out
 	})
+}
+
+// numLeadingRe находит числовой префикс строки (целое/дробное, возможно с
+// экспонентой) — используется в vkmScaleFields, чтобы отделить значение
+// от единицы измерения, идущей сразу после без пробела.
+var numLeadingRe = regexp.MustCompile(`^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?`)
+
+// vkmScaleFields умножает значение конкретных тегов на заданный
+// коэффициент (см. field_scale в vkm_config.go) — работает по точному
+// совпадению имени тега (через strings.Split(";"), как остальные функции
+// в этом файле), а не regex по всей строке, чтобы не задеть похожие теги
+// (например "S_ns" при масштабировании "S"). Понимает как компактный
+// формат (шапки убраны), так и с шапкой — сохраняет шапку на месте,
+// трогает только число.
+func vkmScaleFields(raw string, scale map[string]float64) string {
+	if len(scale) == 0 {
+		return raw
+	}
+	entries := strings.Split(raw, ";")
+	for i, entry := range entries {
+		eq := strings.Index(entry, "=")
+		if eq < 0 {
+			continue
+		}
+		tag := entry[:eq]
+		mult, ok := scale[tag]
+		if !ok {
+			continue
+		}
+		rest := entry[eq+1:]
+
+		headerLen := 0
+		if len(rest) > 0 && (rest[0] == '{' || rest[0] == '<') {
+			close := byte('}')
+			if rest[0] == '<' {
+				close = '>'
+			}
+			if idx := strings.IndexByte(rest, close); idx >= 0 {
+				headerLen = idx + 1
+			}
+		}
+		header := rest[:headerLen]
+		valuePart := rest[headerLen:]
+
+		numMatch := numLeadingRe.FindString(valuePart)
+		if numMatch == "" {
+			continue
+		}
+		f, err := strconv.ParseFloat(numMatch, 64)
+		if err != nil {
+			continue
+		}
+		f *= mult
+
+		var newNum string
+		if strings.ContainsAny(numMatch, "eE") {
+			newNum = strconv.FormatFloat(f, 'e', -1, 64)
+		} else {
+			newNum = strconv.FormatFloat(f, 'f', -1, 64)
+		}
+		entries[i] = tag + "=" + header + newNum + valuePart[len(numMatch):]
+	}
+	return strings.Join(entries, ";")
 }
 
 // vkmAddDecimalPoint добавляет ".0" к целым числовым значениям без

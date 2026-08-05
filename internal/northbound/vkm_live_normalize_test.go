@@ -235,3 +235,47 @@ func timeParseTest(t *testing.T, s string) time.Time {
 	}
 	return tm
 }
+
+// TestVKMScaleFields_ScalesOnlyNamedTag проверяет, что масштабируется
+// только указанный тег, включая похожие имена (S_ns при масштабировании S).
+func TestVKMScaleFields_ScalesOnlyNamedTag(t *testing.T) {
+	raw := "S=929.72064кг;S_ns=0кг;ST=2.6219832e+09Дж;"
+	scale := map[string]float64{"ST": 0.001}
+
+	got := vkmScaleFields(raw, scale)
+
+	if !strings.Contains(got, "S=929.72064кг") {
+		t.Fatalf("S не должен был измениться: %q", got)
+	}
+	if !strings.Contains(got, "S_ns=0кг") {
+		t.Fatalf("S_ns не должен был измениться (похожее имя на S): %q", got)
+	}
+	if !strings.Contains(got, "ST=2.6219832e+06Дж") {
+		t.Fatalf("ST должен был уменьшиться в 1000 раз: %q", got)
+	}
+}
+
+// TestVKMScaleFields_PreservesHeader проверяет, что при оставленной шапке
+// масштабирование трогает только число, шапка остаётся на месте.
+func TestVKMScaleFields_PreservesHeader(t *testing.T) {
+	raw := "ST={Тепловая энергия }2.6219832e+09Дж;"
+	scale := map[string]float64{"ST": 0.001}
+
+	got := vkmScaleFields(raw, scale)
+	want := "ST={Тепловая энергия }2.6219832e+06Дж;"
+	if got != want {
+		t.Fatalf("получено %q, ожидалось %q", got, want)
+	}
+}
+
+// TestVKMScaleFields_PlainNumber проверяет масштабирование обычного (не
+// экспоненциального) числа.
+func TestVKMScaleFields_PlainNumber(t *testing.T) {
+	raw := "S=929.72064кг;"
+	scale := map[string]float64{"S": 2}
+
+	got := vkmScaleFields(raw, scale)
+	if !strings.Contains(got, "S=1859.44128кг") {
+		t.Fatalf("S не удвоился корректно: %q", got)
+	}
+}

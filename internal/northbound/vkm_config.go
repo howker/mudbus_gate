@@ -33,6 +33,27 @@ import (
 //	                        # возможно, порядок байт для ЭТОЙ области не
 //	                        # совпадает с архивным протоколом (110/112/114).
 //	cur_byte_order_probe_log = vkm_byteorder_probe.txt
+//	field_scale = ST:0.001,Pi:0.01   # умножить значение конкретных тегов
+//	                        # перед отдачей в ЭС (формат "ТЕГ:МНОЖИТЕЛЬ",
+//	                        # через запятую). Найдено эмпирически
+//	                        # (2026-08-05): драйвер УВП280 сам ставит
+//	                        # State=1 (недостоверно) конкретно на Тепловую
+//	                        # энергию/Давление, даже когда значение верное
+//	                        # и конфигурация канала идентична рабочим
+//	                        # (масса/температура) — единственное системное
+//	                        # отличие этих полей это ПОРЯДОК ВЕЛИЧИНЫ числа
+//	                        # (Дж~1e9 против кг~1e3). Проверка: подобрать
+//	                        # масштаб, при котором драйвер сам перестаёт
+//	                        # считать значение недостоверным.
+//
+// РАССМОТРЕНО И ОТКЛОНЕНО (2026-08-05): идея переставить '=' на место
+// ПОСЛЕ шапки ("tag{header}=value" вместо текущего "tag={header}value") —
+// именно так задокументирован формат в registri_mbrrtu_vkm.pdf, отличие
+// от того, что реально шлёт эта прошивка прибора. Опровергнуто логически
+// до реализации: масса/температура УЖЕ пишутся в БД ЭС достоверными
+// (State=0) с ТЕКУЩИМ, недокументированным порядком, в ТОЙ ЖЕ строке, что
+// и тепловая энергия/давление (State=1, недостоверно) — если бы порядок
+// '=' был причиной, не работали бы все поля разом, а не только часть.
 //
 // Missing file or missing keys → documented defaults, so the carrier runs
 // fine with no config file at all.
@@ -63,6 +84,9 @@ type vkmConfig struct {
 	// ни разу — теперь это дефолт.
 	stripHeaders   bool
 	expandExponent bool
+	// fieldScale — множитель для конкретных тегов (ключ = имя тега, как
+	// в архивной строке), применяется перед отдачей в ЭС.
+	fieldScale map[string]float64
 }
 
 func defaultVKMConfig() vkmConfig {
@@ -77,8 +101,18 @@ func defaultVKMConfig() vkmConfig {
 		periodFormat:        "datetime",
 		curByteOrderProbe:   false,
 		curByteOrderLogPath: "vkm_byteorder_probe.txt",
-		stripHeaders:        false, // шапки ОСТАВИТЬ (ключи сопоставления для парсера ЭС)
-		expandExponent:      true,  // экспоненту РАЗВЕРНУТЬ (парсер ЭС не понимает e+NN)
+		// Комбинация "шапки убраны + экспонента как есть" даёт стабильное
+		// продвижение ЭС по периодам (без повторов) — ПОДТВЕРЖДЕНО живьём
+		// (2026-08-04). ВАЖНАЯ ОГОВОРКА: продвижение по датам подтверждает
+		// только то, что ЭС не отбраковывает саму строку целиком — это
+		// НЕ доказывает, что значения полей распознаются и попадают на
+		// каналы (проверено отдельно, живым сравнением с БД ЭС: на этой
+		// комбинации каналы оставались пустыми). Причина пустых каналов
+		// оказалась в другом месте — см. NeedMain/State в БД ЭС, не в
+		// формате строки (порядок '=' относительно шапки тоже проверялся
+		// и отклонён — см. doc-комментарий выше файла).
+		stripHeaders:   true,
+		expandExponent: false,
 	}
 }
 
@@ -206,6 +240,31 @@ func parseVKMConfig(text string) vkmConfig {
 				cfg.expandExponent = true
 			} else if v == "false" || v == "0" {
 				cfg.expandExponent = false
+			}
+		case "field_scale":
+			v := stripInlineComment(val)
+			if v == "" {
+				continue
+			}
+			m := make(map[string]float64)
+			for _, pair := range strings.Split(v, ",") {
+				pair = strings.TrimSpace(pair)
+				if pair == "" {
+					continue
+				}
+				kv := strings.SplitN(pair, ":", 2)
+				if len(kv) != 2 {
+					continue
+				}
+				tag := strings.TrimSpace(kv[0])
+				mult, err := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64)
+				if err != nil || tag == "" {
+					continue
+				}
+				m[tag] = mult
+			}
+			if len(m) > 0 {
+				cfg.fieldScale = m
 			}
 		}
 	}
