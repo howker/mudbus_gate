@@ -73,20 +73,19 @@ func persistVKMHourly(ctx context.Context, d *Device, periodStart time.Time, rec
 	return saved
 }
 
-// collectVKMPeriod делает ОДИН полный танец запись/ожидание/чтение архива
-// vkmMaxAnomalyRetries — сколько раз переспрашиваем период, если прибор
-// вернул "чужой" формат строки (Time в секундах вида "839089620-839089800сек"
-// вместо привычной даты "DD/MM/YY..."). Встречается регулярно (не
-// единичный случай — подтверждено живьём несколько раз за один день), и
-// повторный запрос почти всегда даёт нормальный ответ. Без этой проверки
-// такая строка тихо сохранялась бы в базу и позже стопорила ЭС на этом
-// периоде — гораздо дешевле переспросить сразу, чем потом вручную искать
-// проблему по логам northbound.
-const vkmMaxAnomalyRetries = 3
-
-// isVKMTimeAnomalous определяет "чужой" формат по отсутствию '/' в
-// значении поля Time — нормальная дата всегда содержит "ДД/ММ/ГГ", а
-// аномальная запись — просто числа-секунды через дефис.
+// isVKMTimeAnomalous — ИСТОРИЧЕСКАЯ функция, была источником главной
+// ошибки дня (2026-08-10): считала "секундный" формат Time
+// ("839089620-839089800сек") браком и заставляла collectVKMPeriod
+// переспрашивать период, пока прибор не даст "датный" формат
+// ("DD/MM/YY..."). Прозрачный сетевой прокси-эксперимент между ЭС и
+// реальным прибором доказал обратное: именно "секундный" формат (вместе с
+// полной точностью чисел, которую он несёт) ЭС принимает как достоверное
+// значение (State=0); "датный" формат идёт с урезанной точностью и
+// экспоненциальной записью и ЭС его бракует (State=1). Другими словами —
+// не брак прибора, а два ЗАКОННЫХ формата ответа, и мы весь день
+// систематически отбрасывали тот, который реально нужен, добиваясь
+// переспросом того, который не работает. Оставлена только как
+// исторический маркер; больше нигде не вызывается.
 func isVKMTimeAnomalous(raw string) bool {
 	idx := strings.Index(raw, "Time=")
 	if idx < 0 {
@@ -100,9 +99,15 @@ func isVKMTimeAnomalous(raw string) bool {
 	return !strings.Contains(value, "/")
 }
 
+// collectVKMPeriod делает ОДИН полный танец запись/ожидание/чтение архива
 // для окна [periodStart, periodStart+vkmArchivePeriod) и сохраняет то, что
 // пришло. Возвращает, сколько из vkmHourlyParams реально сохранено (0 без
 // ошибки — законный исход: у прибора не было данных за этот период).
+//
+// ВАЖНО (2026-08-10): раньше здесь был цикл переспроса при "аномальном"
+// (секундном) формате Time — см. doc-комментарий isVKMTimeAnomalous. Он
+// убран: секундный формат — не брак, а именно то, что нужно сохранить
+// как есть, с первой же попытки, без всякого переспроса.
 func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, periodStart time.Time) (int, error) {
 	reader, ok := archive.Get(a.Strategy)
 	if !ok {
@@ -124,31 +129,12 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, period
 	}
 	defer release()
 
-	var records []archive.ArchiveRecord
-	var err error
-	for attempt := 1; attempt <= vkmMaxAnomalyRetries; attempt++ {
-		records, err = reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, q)
-		if err != nil {
-			return 0, err
-		}
-		if len(records) == 0 {
-			return 0, nil
-		}
-		if !isVKMTimeAnomalous(string(records[0].Raw)) {
-			break
-		}
-		if attempt == vkmMaxAnomalyRetries {
-			log.Printf("[%s] VKM период %s: после %d попыток прибор так и не дал нормальный формат — сохраняем как есть, потребуется ручная пересборка (--vkm-forget)\n",
-				d.ID, periodStart.Format("02.01.2006 15:04"), vkmMaxAnomalyRetries)
-			break
-		}
-		log.Printf("[%s] VKM период %s: попытка %d — прибор вернул нестандартный формат строки (без даты), переспрашиваем\n",
-			d.ID, periodStart.Format("02.01.2006 15:04"), attempt)
-		select {
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		case <-time.After(time.Second):
-		}
+	records, err := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, q)
+	if err != nil {
+		return 0, err
+	}
+	if len(records) == 0 {
+		return 0, nil
 	}
 
 	// Сырую строку сохраняем отдельно от разобранных полей — она нужна
@@ -157,6 +143,12 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, period
 	// несовпадение периода в ответе и не продвигается дальше, это и было
 	// найдено живьём 2026-08-02). Ошибка сохранения сырой строки не должна
 	// ронять сохранение S/ST — это две независимые вещи.
+	//
+	// records[0].Raw сохраняется здесь БУКВАЛЬНО как пришло от прибора
+	// (parseTaggedString ничего в нём не меняет, кроме обрезки нулевых
+	// байт) — northbound должен отдавать его в ЭС так же нетронуто, без
+	// собственных текстовых преобразований (strip_headers/expand_exponent/
+	// field_scale и т.п. — см. историю в vkm_config.go).
 	if err := d.Repo.SaveVKMRawString(ctx, d.ID, q.Instance, periodStart, string(records[0].Raw)); err != nil {
 		log.Printf("[%s] VKM период %s: ошибка сохранения сырой строки: %v\n",
 			d.ID, periodStart.Format("02.01.2006 15:04"), err)
