@@ -177,6 +177,9 @@ func (s *DBVKMArchiveSource) Archive(pipe int, start, end time.Time, opts uint16
 		if len(cfg.fieldScale) > 0 {
 			out = vkmScaleFields(out, cfg.fieldScale)
 		}
+		if len(cfg.fieldOverride) > 0 {
+			out = vkmOverrideFields(out, cfg.fieldOverride)
+		}
 		out = vkmAddDecimalPoint(out)
 		s.logActiveComboOnChange(cfg.stripHeaders, cfg.expandExponent)
 		return out, true
@@ -498,6 +501,53 @@ func vkmScaleFields(raw string, scale map[string]float64) string {
 			newNum = strconv.FormatFloat(f, 'f', -1, 64)
 		}
 		entries[i] = tag + "=" + header + newNum + valuePart[len(numMatch):]
+	}
+	return strings.Join(entries, ";")
+}
+
+// vkmOverrideFields ЗАМЕНЯЕТ значение конкретных тегов на заданную строку
+// целиком (не масштабирует существующее число, как vkmScaleFields) — для
+// самой чистой диагностики (2026-08-10): подставляет простое целое
+// (например "77") вместо реального значения, исключая любые побочные
+// факторы формы записи (дробность, точность, экспонента), чтобы
+// проверить, дело ли в самой ВЕЛИЧИНЕ числа. Шапка (если есть) сохраняется
+// на месте, единица измерения после числа — тоже; заменяется только сама
+// числовая часть.
+func vkmOverrideFields(raw string, overrides map[string]string) string {
+	if len(overrides) == 0 {
+		return raw
+	}
+	entries := strings.Split(raw, ";")
+	for i, entry := range entries {
+		eq := strings.Index(entry, "=")
+		if eq < 0 {
+			continue
+		}
+		tag := entry[:eq]
+		replacement, ok := overrides[tag]
+		if !ok {
+			continue
+		}
+		rest := entry[eq+1:]
+
+		headerLen := 0
+		if len(rest) > 0 && (rest[0] == '{' || rest[0] == '<') {
+			close := byte('}')
+			if rest[0] == '<' {
+				close = '>'
+			}
+			if idx := strings.IndexByte(rest, close); idx >= 0 {
+				headerLen = idx + 1
+			}
+		}
+		header := rest[:headerLen]
+		valuePart := rest[headerLen:]
+
+		numMatch := numLeadingRe.FindString(valuePart)
+		if numMatch == "" {
+			continue
+		}
+		entries[i] = tag + "=" + header + replacement + valuePart[len(numMatch):]
 	}
 	return strings.Join(entries, ";")
 }

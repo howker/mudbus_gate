@@ -279,3 +279,37 @@ func TestVKMScaleFields_PlainNumber(t *testing.T) {
 		t.Fatalf("S не удвоился корректно: %q", got)
 	}
 }
+
+// TestVKMOverrideFields_ReplacesOnlyNamedTag проверяет прямую подмену
+// значения (не масштабирование) — для чистой диагностики (2026-08-10):
+// подставить простое целое ("77") вместо реального значения ST/Pi,
+// исключая любые побочные факторы формы записи исходного числа.
+func TestVKMOverrideFields_ReplacesOnlyNamedTag(t *testing.T) {
+	raw := "Pi=418657.969Па;S=1279.54846кг;ST=3.75875712e+09Дж;"
+	overrides := map[string]string{"ST": "77", "Pi": "77"}
+
+	got := vkmOverrideFields(raw, overrides)
+
+	if !strings.Contains(got, "ST=77Дж") {
+		t.Fatalf("ST не заменён на 77: %q", got)
+	}
+	if !strings.Contains(got, "Pi=77Па") {
+		t.Fatalf("Pi не заменён на 77: %q", got)
+	}
+	if !strings.Contains(got, "S=1279.54846кг") {
+		t.Fatalf("S не должен был измениться (не указан в overrides): %q", got)
+	}
+}
+
+// TestVKMOverrideFields_PreservesHeader проверяет, что при оставленной
+// шапке подмена трогает только число, шапка остаётся на месте.
+func TestVKMOverrideFields_PreservesHeader(t *testing.T) {
+	raw := "ST={Тепловая энергия }3.75875712e+09Дж;"
+	overrides := map[string]string{"ST": "77"}
+
+	got := vkmOverrideFields(raw, overrides)
+	want := "ST={Тепловая энергия }77Дж;"
+	if got != want {
+		t.Fatalf("получено %q, ожидалось %q", got, want)
+	}
+}

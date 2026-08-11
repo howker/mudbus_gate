@@ -45,6 +45,15 @@ import (
 //	                        # (Дж~1e9 против кг~1e3). Проверка: подобрать
 //	                        # масштаб, при котором драйвер сам перестаёт
 //	                        # считать значение недостоверным.
+//	field_override = ST:77,Pi:77   # ЗАМЕНИТЬ значение тега на заданную
+//	                        # строку целиком (не масштабировать существующее
+//	                        # число, а подставить простое целое) — для
+//	                        # самой чистой диагностики (2026-08-10):
+//	                        # исключает вообще все побочные факторы формы
+//	                        # записи (дробность/точность/экспонента) и
+//	                        # проверяет, дело ли в самой ВЕЛИЧИНЕ числа.
+//	                        # Применяется ПОСЛЕ field_scale (если оба
+//	                        # заданы для одного тега — побеждает override).
 //
 // РАССМОТРЕНО И ОТКЛОНЕНО (2026-08-05): идея переставить '=' на место
 // ПОСЛЕ шапки ("tag{header}=value" вместо текущего "tag={header}value") —
@@ -87,6 +96,13 @@ type vkmConfig struct {
 	// fieldScale — множитель для конкретных тегов (ключ = имя тега, как
 	// в архивной строке), применяется перед отдачей в ЭС.
 	fieldScale map[string]float64
+	// fieldOverride — ПРЯМАЯ ПОДМЕНА значения конкретного тега на заданную
+	// строку (не масштабирование существующего числа) — для чистой
+	// диагностики: подставить простое целое число (например "77") вместо
+	// реального значения, чтобы исключить любые побочные факторы формы
+	// записи (дробность, точность, экспонента) и проверить, дело ли в
+	// самой ВЕЛИЧИНЕ числа.
+	fieldOverride map[string]string
 }
 
 func defaultVKMConfig() vkmConfig {
@@ -275,6 +291,31 @@ func parseVKMConfig(text string) vkmConfig {
 			}
 			if len(m) > 0 {
 				cfg.fieldScale = m
+			}
+		case "field_override":
+			v := stripInlineComment(val)
+			if v == "" {
+				continue
+			}
+			m := make(map[string]string)
+			for _, pair := range strings.Split(v, ",") {
+				pair = strings.TrimSpace(pair)
+				if pair == "" {
+					continue
+				}
+				kv := strings.SplitN(pair, ":", 2)
+				if len(kv) != 2 {
+					continue
+				}
+				tag := strings.TrimSpace(kv[0])
+				value := strings.TrimSpace(kv[1])
+				if tag == "" || value == "" {
+					continue
+				}
+				m[tag] = value
+			}
+			if len(m) > 0 {
+				cfg.fieldOverride = m
 			}
 		}
 	}

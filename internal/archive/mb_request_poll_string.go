@@ -108,8 +108,41 @@ func (r *MBRequestPollString) startRequest(ctx context.Context, tx Transactor, q
 	}
 
 	// Options register is written last and triggers collection.
-	// Bit 2 (include_tags) and bit 1 (include_header) are set so the
+	// Bit 1 (include_header) and bit 2 (include_tags) are set so the
 	// returned string includes tags, per CONTRACTS §6.1 format.
+	//
+	// REVERTED (2026-08-10): a bit 5 ("выдавать все доступные параметры")
+	// was briefly added here, sourced from modbus_uvp280_01.pdf — a
+	// DIFFERENT device's documentation. The real ВКМ-360 register map
+	// (registri_mbrrtu_vkm.pdf, register 7914) documents only bits 0-3
+	// (units / header / tags / max-precision) and explicitly states
+	// "Остальные биты зарезервированы и должны заполняться нулями" —
+	// bit 5 is undocumented/reserved on paper for this device.
+	//
+	// In practice, though, setting it CONFIRMED live (2026-08-10) that the
+	// device does respond to it: the returned string got much longer and
+	// gained real, plausible fields it never sent before — including
+	// ST=3841483300Дж (heat energy), the field this whole investigation
+	// was chasing. So bit 5 is not a no-op on this firmware; it just isn't
+	// in the printed spec.
+	//
+	// It was reverted anyway because sending the FULL expanded string to
+	// Энергосфера broke fields that previously worked: mass (channel
+	// 229960) and temperature (229974) both went from State=0 with real
+	// values to State=0/Value=0 for every period served with bit 5 set —
+	// confirmed against real ЭС SQL data. The working theory is that ЭС's
+	// parser chokes on one or more of the newly-appeared, unfamiliar
+	// fields (Pabs, mvT, mvH, dP1_sens, SrawV, SvSTD, SvWRK, RoSTD, RoWRK,
+	// lastQm, Twrk, Tnss, NSS, ...), not on ST itself.
+	//
+	// NEXT STEP (not yet done): re-enable bit 5 to get the full string,
+	// but have northbound (vkm_live.go) FILTER it down before serving —
+	// keep only the fields ЭС already parses successfully (Time, Pi,
+	// Pbar, T, dP, S, S_ns, H) plus ST (and maybe ST_ns), dropping the
+	// rest. If ЭС still rejects that trimmed set, add fields back one at
+	// a time (the existing vkmVariants/ProbeVariants mechanism in
+	// vkm_live.go is built for exactly this kind of incremental probe)
+	// until the specific field that breaks parsing is isolated.
 	options := uint16(0b0110)
 	if err := r.writeRegistersWithBusyRetry(ctx, tx, vkmArchOptionsReg, []uint16{options}, deadline); err != nil {
 		return fmt.Errorf("write archive options register: %w", err)
