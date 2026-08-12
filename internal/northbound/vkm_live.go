@@ -65,6 +65,74 @@ func NewDBVKMArchiveSource(repo storage.Repo, deviceID string) *DBVKMArchiveSour
 	return &DBVKMArchiveSource{repo: repo, deviceID: deviceID}
 }
 
+// vkmFieldWhitelist — теги, которые безопасно отдавать в ЭС. Ограничение
+// появилось 2026-08-11: southbound теперь запрашивает архив с битом 5
+// options-регистра ("выдавать все доступные параметры" — недокументирован
+// для ВКМ-360, но подтверждено живьём, что прибор его honоurит), из-за
+// чего сырая строка прибора стала намного длиннее и обзавелась полями,
+// которых раньше не было (Pabs, mvT, mvH, dP1_sens, SrawV, SvSTD, SvWRK,
+// RoSTD, RoWRK, lastQm, Twrk, Tnss, NSS, ...).
+//
+// Подтверждено фактом (SQL-выгрузка из ЭС, 2026-08-10 ~22:00): если
+// отдать эту расширенную строку в ЭС как есть, драйвер бракует ВООБЩЕ ВСЁ
+// в записи — сломались даже поля, которые годами стабильно принимались
+// (масса, канал 229960; температура, канал 229974), хотя раньше, с более
+// коротким/старым набором полей, они были State=0. Гипотеза — драйвер ЭС
+// спотыкается на одном или нескольких из новых незнакомых полей и
+// бракует запись целиком, а не только непонятое поле.
+//
+// Поэтому northbound отдаёт в ЭС не сырую строку прибора целиком, а
+// отфильтрованную: только уже проверенно работающий набор (Time, Pi,
+// Pbar, T, dP, S, S_ns, H) плюс ST/ST_ns — то единственное, ради чего
+// битом 5 вообще имело смысл поступиться. Если ЭС не примет и такой
+// урезанный набор — следующий шаг: добавлять по одному полю за раз через
+// vkmVariants/ProbeVariants (уже есть ниже) и смотреть, какое именно
+// новое поле её ломает.
+var vkmFieldWhitelist = map[string]bool{
+	"Time":  true,
+	"Pi":    true,
+	"Pbar":  true,
+	"T":     true,
+	"dP":    true,
+	"S":     true,
+	"S_ns":  true,
+	"H":     true,
+	"ST":    true,
+	"ST_ns": true,
+}
+
+// vkmFilterFields оставляет в сырой строке только теги из
+// vkmFieldWhitelist, отбрасывая всё остальное целиком (весь сегмент
+// "тег{шапка}=значение;", а не только незнакомую часть). Порядок полей
+// сохраняется как в исходной строке. Безусловный шаг (не управляется
+// vkm_config.txt) — это защита ЭС от незнакомых полей, а не диагностика,
+// поэтому включён всегда, а не по флагу.
+func vkmFilterFields(raw string) string {
+	entries := strings.Split(raw, ";")
+	kept := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		trimmed := strings.TrimSpace(entry)
+		if trimmed == "" {
+			continue
+		}
+		eq := strings.Index(trimmed, "=")
+		tag := trimmed
+		if eq >= 0 {
+			tag = trimmed[:eq]
+			if br := strings.IndexAny(tag, "{<"); br >= 0 {
+				tag = tag[:br]
+			}
+		}
+		if vkmFieldWhitelist[strings.TrimSpace(tag)] {
+			kept = append(kept, entry)
+		}
+	}
+	if len(kept) == 0 {
+		return raw
+	}
+	return strings.Join(kept, ";") + ";"
+}
+
 // vkmVariant — одна проверяемая гипотеза: как преобразовать сырую строку
 // прибора перед отдачей в ЭС.
 type vkmVariant struct {
@@ -134,6 +202,13 @@ var vkmVariants = []vkmVariant{
 		why:  "строка соседнего периода с подменённым временем — если примут ЭТО, дело в значениях, а не в структуре",
 		fn:   nil, // особый случай, обрабатывается в Archive()
 	},
+	{
+		name: "9-filtered-fields",
+		why:  "оставлены только Time/Pi/Pbar/T/dP/S/S_ns/H/ST/ST_ns (whitelist) — проверка, примет ли ЭС расширенную (бит5) строку прибора после отсечения незнакомых полей",
+		fn: func(s string) string {
+			return vkmFilterFields(vkmStripLineBreaks(s))
+		},
+	},
 }
 
 // Archive ищет сохранённую строку за период, на который начинается [start,
@@ -166,8 +241,14 @@ func (s *DBVKMArchiveSource) Archive(pipe int, start, end time.Time, opts uint16
 		// Обычный боевой режим: набор преобразований управляется через
 		// vkm_config.txt (strip_headers / expand_exponent / field_scale —
 		// см. vkm_config.go), перечитывается на лету, пересборка не нужна.
+		//
+		// vkmFilterFields — БЕЗУСЛОВНЫЙ шаг, не управляется конфигом (см.
+		// её doc-комментарий): southbound с 2026-08-11 всегда запрашивает
+		// расширенный набор полей у прибора (бит 5), поэтому northbound
+		// обязан отфильтровать его до отправки в ЭС, иначе сломает то,
+		// что раньше стабильно работало (масса/температура).
+		out := vkmFilterFields(vkmStripLineBreaks(raw))
 		cfg := loadVKMConfig()
-		out := vkmStripLineBreaks(raw)
 		if cfg.stripHeaders {
 			out = vkmStripAllHeaders(out)
 		}
@@ -511,8 +592,16 @@ func vkmScaleFields(raw string, scale map[string]float64) string {
 // (например "77") вместо реального значения, исключая любые побочные
 // факторы формы записи (дробность, точность, экспонента), чтобы
 // проверить, дело ли в самой ВЕЛИЧИНЕ числа. Шапка (если есть) сохраняется
-// на месте, единица измерения после числа — тоже; заменяется только сама
-// числовая часть.
+// на месте.
+//
+// РАСШИРЕНО (2026-08-11): теперь replacement заменяет ЧИСЛО И ВСЁ, ЧТО
+// ПОСЛЕ НЕГО (единицу измерения), а не только число с сохранением старой
+// единицы — раньше "field_override=ST:77" всегда давало "ST=77Дж"
+// (единица прибора сохранялась), и проверить гипотезу "дело в единице
+// измерения, не в величине" (прибор на своём же отчёте показывал
+// тепловую энергию в Гкал, а архивная строка всегда отдаёт Дж) было
+// невозможно. Теперь "field_override=ST:0.077Гкал" даёт буквально
+// "ST=0.077Гкал" — можно тестировать единицу измерения напрямую.
 func vkmOverrideFields(raw string, overrides map[string]string) string {
 	if len(overrides) == 0 {
 		return raw
@@ -547,7 +636,7 @@ func vkmOverrideFields(raw string, overrides map[string]string) string {
 		if numMatch == "" {
 			continue
 		}
-		entries[i] = tag + "=" + header + replacement + valuePart[len(numMatch):]
+		entries[i] = tag + "=" + header + replacement
 	}
 	return strings.Join(entries, ";")
 }

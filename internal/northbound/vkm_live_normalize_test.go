@@ -284,17 +284,25 @@ func TestVKMScaleFields_PlainNumber(t *testing.T) {
 // значения (не масштабирование) — для чистой диагностики (2026-08-10):
 // подставить простое целое ("77") вместо реального значения ST/Pi,
 // исключая любые побочные факторы формы записи исходного числа.
+//
+// ОБНОВЛЕНО (2026-08-11): replacement теперь заменяет число И единицу
+// целиком (не сохраняет старую единицу автоматически) — нужно для
+// проверки гипотезы "дело в единице измерения" (ST как Гкал вместо Дж).
+// Раньше "ST:77" всегда давало "ST=77Дж" (единица прибора сохранялась);
+// теперь она заменяется полностью тем, что указано в overrides, поэтому
+// тесты передают replacement уже вместе с нужной единицей ("77Дж",
+// "77Па"), а не голым числом.
 func TestVKMOverrideFields_ReplacesOnlyNamedTag(t *testing.T) {
 	raw := "Pi=418657.969Па;S=1279.54846кг;ST=3.75875712e+09Дж;"
-	overrides := map[string]string{"ST": "77", "Pi": "77"}
+	overrides := map[string]string{"ST": "77Дж", "Pi": "77Па"}
 
 	got := vkmOverrideFields(raw, overrides)
 
 	if !strings.Contains(got, "ST=77Дж") {
-		t.Fatalf("ST не заменён на 77: %q", got)
+		t.Fatalf("ST не заменён на 77Дж: %q", got)
 	}
 	if !strings.Contains(got, "Pi=77Па") {
-		t.Fatalf("Pi не заменён на 77: %q", got)
+		t.Fatalf("Pi не заменён на 77Па: %q", got)
 	}
 	if !strings.Contains(got, "S=1279.54846кг") {
 		t.Fatalf("S не должен был измениться (не указан в overrides): %q", got)
@@ -302,14 +310,28 @@ func TestVKMOverrideFields_ReplacesOnlyNamedTag(t *testing.T) {
 }
 
 // TestVKMOverrideFields_PreservesHeader проверяет, что при оставленной
-// шапке подмена трогает только число, шапка остаётся на месте.
+// шапке подмена трогает число и единицу, а шапка остаётся на месте.
 func TestVKMOverrideFields_PreservesHeader(t *testing.T) {
 	raw := "ST={Тепловая энергия }3.75875712e+09Дж;"
-	overrides := map[string]string{"ST": "77"}
+	overrides := map[string]string{"ST": "77Дж"}
 
 	got := vkmOverrideFields(raw, overrides)
 	want := "ST={Тепловая энергия }77Дж;"
 	if got != want {
 		t.Fatalf("получено %q, ожидалось %q", got, want)
+	}
+}
+
+// TestVKMOverrideFields_ReplacesUnitToo — новый тест (2026-08-11): проверяет
+// именно то, ради чего расширили функцию — замену единицы измерения, не
+// только числа (для проверки гипотезы "ST должен быть в Гкал, не в Дж").
+func TestVKMOverrideFields_ReplacesUnitToo(t *testing.T) {
+	raw := "ST=3.75875712e+09Дж;"
+	overrides := map[string]string{"ST": "0.077Гкал"}
+
+	got := vkmOverrideFields(raw, overrides)
+	want := "ST=0.077Гкал;"
+	if got != want {
+		t.Fatalf("единица не заменена: получено %q, ожидалось %q", got, want)
 	}
 }

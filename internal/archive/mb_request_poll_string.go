@@ -108,42 +108,41 @@ func (r *MBRequestPollString) startRequest(ctx context.Context, tx Transactor, q
 	}
 
 	// Options register is written last and triggers collection.
-	// Bit 1 (include_header) and bit 2 (include_tags) are set so the
-	// returned string includes tags, per CONTRACTS §6.1 format.
 	//
-	// REVERTED (2026-08-10): a bit 5 ("выдавать все доступные параметры")
-	// was briefly added here, sourced from modbus_uvp280_01.pdf — a
-	// DIFFERENT device's documentation. The real ВКМ-360 register map
-	// (registri_mbrrtu_vkm.pdf, register 7914) documents only bits 0-3
-	// (units / header / tags / max-precision) and explicitly states
-	// "Остальные биты зарезервированы и должны заполняться нулями" —
-	// bit 5 is undocumented/reserved on paper for this device.
+	// CONFIRMED live (2026-08-11, transparent-proxy capture of ЭС's own
+	// real УВП280 driver talking directly to the device, tools/vkmproxy):
+	// ЭС itself writes options = 0x000C (bits 2+3: include_tags +
+	// max_precision — "выдавать максимальное количество знаков для
+	// значений с плавающей запятой и время в секундах", per
+	// registri_mbrrtu_vkm.pdf register 7914). Bit 1 (include_header) and
+	// bit 0 (custom units) are OFF.
 	//
-	// In practice, though, setting it CONFIRMED live (2026-08-10) that the
-	// device does respond to it: the returned string got much longer and
-	// gained real, plausible fields it never sent before — including
-	// ST=3841483300Дж (heat energy), the field this whole investigation
-	// was chasing. So bit 5 is not a no-op on this firmware; it just isn't
-	// in the printed spec.
+	// This single value resolves BOTH long-standing problems at once —
+	// confirmed against the captured response string itself:
+	//   Time=839865600-839867400сек;Pi=412115.688Па;Pbar=100924.82Па;
+	//   T=155.373093°С;dP=521.877441Па;S=276.720459кг;S_ns=0кг;
+	//   H=2755423Дж/кг;ST=762482432Дж;ST_ns=0Дж;Twrk=1800сек;Tnss=0сек;NSS=;
+	//   - Pi/Pbar/T/S are FULL DECIMAL PRECISION, no exponent truncation —
+	//     this is exactly the precision loss proven (same day, separate
+	//     byte-for-byte proxy comparison) to make ЭС reject values as
+	//     State=1. Every options value tried before this (0b0110 without
+	//     max-precision; 0b100110 with the undocumented "all params" bit
+	//     5, which ALSO reduced Pi/Pbar/T to ~5-sig-fig scientific
+	//     notation) lacked bit 3 and got the truncated form instead.
+	//   - ST (heat energy) and H (enthalpy) are PRESENT, as plain decimal
+	//     numbers, with NO extra unfamiliar fields — none of Pabs, mvT,
+	//     mvH, dP1_sens, SrawV, SvSTD, SvWRK, RoSTD, RoWRK, lastQm (the
+	//     fields bit 5 added and that broke ЭС's parsing) appear here.
+	//     Bit 5 was never the right lever — max-precision (bit 3) was.
 	//
-	// It was reverted anyway because sending the FULL expanded string to
-	// Энергосфера broke fields that previously worked: mass (channel
-	// 229960) and temperature (229974) both went from State=0 with real
-	// values to State=0/Value=0 for every period served with bit 5 set —
-	// confirmed against real ЭС SQL data. The working theory is that ЭС's
-	// parser chokes on one or more of the newly-appeared, unfamiliar
-	// fields (Pabs, mvT, mvH, dP1_sens, SrawV, SvSTD, SvWRK, RoSTD, RoWRK,
-	// lastQm, Twrk, Tnss, NSS, ...), not on ST itself.
-	//
-	// NEXT STEP (not yet done): re-enable bit 5 to get the full string,
-	// but have northbound (vkm_live.go) FILTER it down before serving —
-	// keep only the fields ЭС already parses successfully (Time, Pi,
-	// Pbar, T, dP, S, S_ns, H) plus ST (and maybe ST_ns), dropping the
-	// rest. If ЭС still rejects that trimmed set, add fields back one at
-	// a time (the existing vkmVariants/ProbeVariants mechanism in
-	// vkm_live.go is built for exactly this kind of incremental probe)
-	// until the specific field that breaks parsing is isolated.
-	options := uint16(0b0110)
+	// No downstream change needed: parseTaggedString below already
+	// handles decimal notation (strconv.ParseFloat parses both forms) and
+	// stores Time verbatim regardless of whether the device returns it as
+	// a date range or a raw seconds range — the Raw field this response
+	// produces (header-free, full precision, ST/H included) can go
+	// straight to northbound once vkm_config.txt's strip_headers/
+	// expand_exponent are set to false (nothing left for them to do).
+	options := uint16(0x000C)
 	if err := r.writeRegistersWithBusyRetry(ctx, tx, vkmArchOptionsReg, []uint16{options}, deadline); err != nil {
 		return fmt.Errorf("write archive options register: %w", err)
 	}
