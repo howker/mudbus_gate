@@ -317,12 +317,39 @@ func (d *Device) PollArchives(ctx context.Context) {
 
 		layout := layoutFromProfile(a)
 
+		// CONFIRMED BUG (2026-08-22): index-based strategies (currently
+		// only akron_archive) read ONLY FromIndex/ToIndex — From/To
+		// (time-based) are irrelevant to them, since the device itself
+		// only understands "give me N rows starting at index i", not a
+		// time window (see archive.AkronArchiveReader.Read: count is
+		// derived from q.ToIndex-q.FromIndex, defaulting to 1 when both
+		// are left at their zero value). Leaving FromIndex/ToIndex unset
+		// here made every regular poll tick fetch exactly ONE record
+		// (i=1, the device's single newest row) regardless of the
+		// intended 24h window below — the periodic sweep was never
+		// actually sweeping; only the separate backfill/gap-scan path
+		// (backfill.go) set these correctly.
+		//
+		// ToIndex uses a.MaxRowsOrDefault()-1 — the SAME authoritative,
+		// per-profile row-count source backfill.go already uses — not a
+		// hardcoded number. This matters: profiles/acron-01.yaml's own
+		// comment documents that this exact class of hardcoded-limit
+		// mistake already happened once (datasheet says 31 rows/request,
+		// real device firmware only accepts 27, confirmed live; 28+ gets
+		// rejected with Modbus exception 0xFC). A hardcoded window size
+		// here would silently drift from whatever a future device/
+		// firmware's confirmed-safe value is, exactly like the datasheet
+		// value did. persistAkronHourly's upsert makes any overlap with
+		// already-stored hours harmless.
+		pageSize := a.MaxRowsOrDefault()
 		q := archive.ArchiveQuery{
 			DeviceID:     d.ID,
 			ArchiveID:    a.ID,
 			Instance:     1,
 			From:         time.Now().Add(-24 * time.Hour),
 			To:           time.Now(),
+			FromIndex:    0,
+			ToIndex:      pageSize - 1,
 			RecordLayout: layout,
 			WordOrder32:  d.Profile.Codec.WordOrder32,
 			WordOrder64:  d.Profile.Codec.WordOrder64,

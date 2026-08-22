@@ -22,6 +22,8 @@ func main() {
 		simulate()
 	case "northbound":
 		runNorthbound()
+	case "es-sync":
+		runESSync()
 	case "install-service":
 		installService()
 	case "--help", "-h", "help":
@@ -43,5 +45,7 @@ func printHelp() {
 	fmt.Println("  cli              Run CLI command")
 	fmt.Println("  simulate         Run device simulator")
 	fmt.Println("  northbound       Start the northbound Modbus TCP slave")
+	fmt.Println("  es-sync          Push heat/mass/temp/pressure straight into the Энергосфера DB")
+	fmt.Println("                   (bypasses ЭС device drivers; see 'mbgw es-sync --help')")
 	fmt.Println("  install-service  Install as OS service")
 }
