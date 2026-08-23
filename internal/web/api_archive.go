@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"sort"
 	"time"
+
+	"mbgw/internal/storage"
 )
 
 // api_archive.go implements the archive-viewer tab's backend: GET
@@ -49,12 +51,34 @@ var devicesParams = map[string][]string{
 var paramLabels = map[string]string{
 	"S":  "Масса, т",
 	"ST": "Тепловая энергия (как хранится)",
-	"V":  "Расход, м³",
+	"V":  "Расход за период, м³",
+}
+
+// paramCumulative marks params whose STORED value is a running counter
+// (общий накопленный объём с начала эксплуатации — как одометр), not an
+// already-computed per-period amount. Confirmed live 2026-08-23: Akron's
+// "V" values in archive_hourly climb by roughly ~110-150 between
+// consecutive hourly rows — that DIFFERENCE matches the known-correct
+// hourly flow (~140 м³/ч, verified earlier against physical plausibility
+// checks), while the raw stored numbers themselves (millions) do not
+// represent any single hour's flow at all. This was mistakenly treated
+// as a data-corruption anomaly for a large part of this project's
+// history (see docs/BACKFILL_DESIGN.md-adjacent investigation) — the
+// underlying data was correct the whole time; the missing step was
+// differencing consecutive readings, not summing them.
+//
+// ВКМ's S/ST are NOT cumulative — they are genuinely already
+// per-period sums, confirmed by direct comparison against the meter's
+// own printed report (see internal/integration/energosphere_sync.go's
+// package doc for that verification) — summing them across a wider
+// bucket (daily/monthly) is correct and stays unchanged.
+var paramCumulative = map[string]bool{
+	"V": true,
 }
 
 type archiveRow struct {
 	Period string             `json:"period"` // formatted per granularity — see formatPeriodLabel
-	Values map[string]float64 `json:"values"` // param -> summed/raw value for this row
+	Values map[string]float64 `json:"values"` // param -> value for this row (delta for cumulative params, sum for additive ones)
 }
 
 type archiveResponse struct {
@@ -107,24 +131,41 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 		}
 	}
 
-	// bucket key -> param -> summed value. A plain map keyed by a
-	// formatted string (not time.Time) sidesteps time-zone/truncation
-	// edge cases entirely — the label IS the bucket identity.
+	// bucket key -> param -> value. Additive params (S/ST) accumulate by
+	// SUM as rows are read (unchanged). Cumulative params (V) instead
+	// keep the LAST raw reading seen in each bucket — a snapshot, not a
+	// sum — which gets converted to a delta-from-previous-bucket in the
+	// second pass below.
 	buckets := make(map[string]map[string]float64)
 	var order []string
 
 	for _, param := range params {
-		rows, err := s.repo.GetHourlyArchiveRange(r.Context(), deviceID, "", param, from, to)
+		// Для накопительных параметров нужна ОДНА дополнительная запись
+		// ДО начала окна — иначе для самой первой точки/суток/месяца в
+		// выборке не с чем вычесть разницу. Расширяем окно запроса на
+		// глубину периода назад и просто не включаем эту затравочную
+		// точку в итоговые строки — она нужна только для вычитания.
+		queryFrom := from
+		if paramCumulative[param] {
+			queryFrom = from.Add(-31 * 24 * time.Hour) // с запасом даже для "по месяцам"
+		}
+
+		rows, err := s.repo.GetHourlyArchiveRange(r.Context(), deviceID, "", param, queryFrom, to)
 		if err != nil {
 			return archiveResponse{}, fmt.Errorf("чтение архива (%s): %w", param, err)
 		}
-		for _, row := range rows {
-			key := formatPeriodLabel(row.TsHour, granularity)
-			if _, ok := buckets[key]; !ok {
-				buckets[key] = make(map[string]float64)
-				order = append(order, key)
+
+		if paramCumulative[param] {
+			applyCumulativeDelta(rows, param, from, granularity, buckets, &order)
+		} else {
+			for _, row := range rows {
+				key := formatPeriodLabel(row.TsHour, granularity)
+				if _, ok := buckets[key]; !ok {
+					buckets[key] = make(map[string]float64)
+					order = append(order, key)
+				}
+				buckets[key][param] += row.Value
 			}
-			buckets[key][param] += row.Value
 		}
 	}
 
@@ -157,6 +198,63 @@ func formatPeriodLabel(t time.Time, granularity string) string {
 		return t.Format("2006-01")
 	default: // "raw" — native stored step (hourly for Akron, 30-min for ВКМ)
 		return t.Format("2006-01-02 15:04")
+	}
+}
+
+// applyCumulativeDelta превращает СЫРЫЕ показания накопительного счётчика
+// (rows, по возрастанию времени, включая "затравочные" точки ДО from —
+// см. вызов выше) в РАЗНИЦУ между соседними показаниями, и раскладывает
+// результат по тем же корзинам (bucket), что и обычные суммируемые
+// параметры — buckets/order изменяются на месте (передаются по указателю
+// на срез, т.к. append может выделить новый массив).
+//
+// Логика: берём последнее показание в каждой корзине (снимок на конец
+// периода), затем разница со снимком ПРЕДЫДУЩЕЙ корзины — это и есть
+// "сколько прошло за период". Самая первая корзина строго ДО from
+// (затравочная) в итоговые строки не попадает — она нужна только чтобы
+// было с чем сравнить первую реальную корзину в окне запроса.
+func applyCumulativeDelta(rows []storage.HourlyArchiveRecord, param string, from time.Time, granularity string, buckets map[string]map[string]float64, order *[]string) {
+	if len(rows) == 0 {
+		return
+	}
+
+	// Снимок (последнее показание) на каждую корзину, включая
+	// затравочные корзины до from.
+	snapshots := make(map[string]float64)
+	var snapshotOrder []string
+	for _, row := range rows {
+		key := formatPeriodLabel(row.TsHour, granularity)
+		if _, ok := snapshots[key]; !ok {
+			snapshotOrder = append(snapshotOrder, key)
+		}
+		snapshots[key] = row.Value // последнее по времени значение в корзине (rows уже по возрастанию)
+	}
+	sort.Strings(snapshotOrder)
+
+	fromKey := formatPeriodLabel(from, granularity)
+	var prevValue float64
+	havePrev := false
+	for _, key := range snapshotOrder {
+		current := snapshots[key]
+		if key < fromKey {
+			// затравочная корзина до окна запроса — не показываем,
+			// только запоминаем как базу для вычитания
+			prevValue = current
+			havePrev = true
+			continue
+		}
+		if havePrev {
+			if _, ok := buckets[key]; !ok {
+				buckets[key] = make(map[string]float64)
+				*order = append(*order, key)
+			}
+			buckets[key][param] = current - prevValue
+		}
+		// если havePrev==false — это первая корзина вообще в истории
+		// прибора (нет более ранних записей), разницу посчитать не из
+		// чего — строка для этого param просто не создаётся здесь
+		prevValue = current
+		havePrev = true
 	}
 }
 
@@ -208,7 +306,7 @@ func (s *Server) handleArchiveExport(w http.ResponseWriter, r *http.Request) {
 				record = append(record, "")
 				continue
 			}
-			record = append(record, fmt.Sprintf("%g", v))
+			record = append(record, fmt.Sprintf("%.3f", v)) // фиксированный формат, не научная нотация — важно для Excel и для читаемости
 		}
 		_ = cw.Write(record)
 	}

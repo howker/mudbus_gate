@@ -90,6 +90,36 @@ func (w *MainsWriter) Ping(ctx context.Context) error {
 	return w.db.PingContext(ctx)
 }
 
+// ListDatabases returns the non-system database names visible to this
+// connection — used by the Web UI's "Подключение к ЭС" test button to
+// offer a dropdown of real databases instead of the operator typing a
+// name blind (fix for 2026-08-23 feedback: "данные должны идти из
+// выпадающего списка автоматом если это возможно"). System databases
+// (master/tempdb/model/msdb) are excluded — matches the manual
+// sys.databases query already used to find CSD_Astrakhan earlier in this
+// project's SSMS sessions.
+func (w *MainsWriter) ListDatabases(ctx context.Context) ([]string, error) {
+	rows, err := w.db.QueryContext(ctx, `
+SELECT name FROM sys.databases
+WHERE name NOT IN ('master', 'tempdb', 'model', 'msdb')
+ORDER BY name
+`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
 // PointExists checks whether Mains already holds a row for (channel, ts).
 // WITH (NOLOCK) and an exact-key probe keep this cheap and off the ЭС DB's
 // back — never a scan.

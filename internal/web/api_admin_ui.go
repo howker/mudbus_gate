@@ -202,11 +202,21 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <div id="panel-esconn" class="panel">
     <div class="section">
       <h3>Подключение к БД Энергосферы (SQL Server)</h3>
-      <div class="form-row"><label>Сервер</label><input id="es_server" type="text" placeholder="localhost"></div>
-      <div class="form-row"><label>База данных</label><input id="es_database" type="text" placeholder="CSD_Astrakhan"></div>
-      <div class="form-row"><label>Логин</label><input id="es_user" type="text" placeholder="AdminBaz"></div>
-      <div class="form-row"><label>Пароль</label><input id="es_password" type="password" placeholder="(введите пароль)"></div>
-      <div class="form-row"><label>Порт</label><input id="es_port" type="text" placeholder="1433"></div>
+      <div id="es_status_configured" style="display:none;background:#1e3d1e;border:1px solid #2d5a2d;color:#4caf50;padding:10px;border-radius:4px;margin-bottom:15px;">
+        Подключение настроено (сервер: <span id="es_status_server"></span>, база: <span id="es_status_db"></span>).
+      </div>
+      <div id="es_status_not_configured" style="display:none;background:#3d1e1e;border:1px solid #5a2d2d;color:#f44336;padding:10px;border-radius:4px;margin-bottom:15px;">
+        Подключение ещё НЕ настроено — заполните поля ниже и нажмите «Сохранить».
+      </div>
+      <div class="form-row"><label>Сервер</label><input id="es_server" type="text"></div>
+      <p class="small-note" style="margin-left:220px;margin-top:-8px;">например: localhost</p>
+      <div class="form-row"><label>База данных</label>
+        <select id="es_database_select" style="display:none;"></select>
+        <input id="es_database" type="text">
+      </div>
+      <div class="form-row"><label>Логин</label><input id="es_user" type="text"></div>
+      <div class="form-row"><label>Пароль</label><input id="es_password" type="password"></div>
+      <div class="form-row"><label>Порт</label><input id="es_port" type="text" value="1433"></div>
       <p class="small-note" id="es_password_note"></p>
       <p>
         <button class="btn secondary" onclick="testESConnection()">Проверить подключение</button>
@@ -529,7 +539,7 @@ function renderArchiveTable(data) {
       bodyHtml += '<tr><td>' + row.period + '</td>';
       for (var c = 0; c < data.params.length; c++) {
         var v = row.values[data.params[c]];
-        bodyHtml += '<td>' + (v === undefined ? '' : v) + '</td>';
+        bodyHtml += '<td>' + (v === undefined ? '' : v.toFixed(3)) + '</td>';
       }
       bodyHtml += '</tr>';
     }
@@ -795,13 +805,20 @@ function loadESConnection() {
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
     var c = JSON.parse(xhr.responseText);
+    var configured = !!c.password_set;
+    document.getElementById('es_status_configured').style.display = configured ? 'block' : 'none';
+    document.getElementById('es_status_not_configured').style.display = configured ? 'none' : 'block';
+    if (configured) {
+      document.getElementById('es_status_server').innerText = c.sql_server;
+      document.getElementById('es_status_db').innerText = c.sql_database;
+    }
     document.getElementById('es_server').value = c.sql_server || '';
     document.getElementById('es_database').value = c.sql_database || '';
     document.getElementById('es_user').value = c.sql_user || '';
-    document.getElementById('es_port').value = c.sql_port || '';
-    document.getElementById('es_password_note').innerText = c.password_set ?
+    document.getElementById('es_port').value = c.sql_port || '1433';
+    document.getElementById('es_password_note').innerText = configured ?
       'Пароль уже сохранён (не показывается). Введите новый, только если хотите его изменить.' :
-      'Пароль ещё не задан.';
+      'Пароль ещё не задан — введите его для сохранения.';
   };
   xhr.send();
 }
@@ -826,8 +843,24 @@ function testESConnection() {
     if (xhr.readyState !== 4) { return; }
     var data;
     try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('esTestMsg', false, 'Ошибка ответа сервера'); return; }
-    if (data.ok) { showMsg('esTestMsg', true, 'Подключение успешно.'); }
-    else { showMsg('esTestMsg', false, 'Ошибка: ' + data.error); }
+    if (data.ok) {
+      showMsg('esTestMsg', true, 'Подключение успешно.');
+      if (data.databases && data.databases.length > 0) {
+        var sel = document.getElementById('es_database_select');
+        var html = '';
+        for (var i = 0; i < data.databases.length; i++) {
+          html += '<option value="' + data.databases[i] + '">' + data.databases[i] + '</option>';
+        }
+        sel.innerHTML = html;
+        sel.style.display = 'inline-block';
+        sel.value = document.getElementById('es_database').value || data.databases[0];
+        document.getElementById('es_database').style.display = 'none';
+        sel.onchange = function() { document.getElementById('es_database').value = sel.value; };
+        document.getElementById('es_database').value = sel.value;
+      }
+    } else {
+      showMsg('esTestMsg', false, 'Ошибка: ' + data.error);
+    }
   };
   xhr.send(JSON.stringify(body));
 }
@@ -874,6 +907,19 @@ function saveAkronAddr() {
   xhr.send(JSON.stringify({ device_id: deviceId, listen_addr: addr }));
 }
 
+var pointLabels = {
+  'V': 'Скорость потока',
+  'Q': 'Расход',
+  'am': 'Амплитуда сигнала',
+  'acc_time': 'Время наработки',
+  'second': 'Секунда (часы прибора)',
+  'minute': 'Минута (часы прибора)',
+  'hour': 'Час (часы прибора)',
+  'date': 'День (часы прибора)',
+  'month': 'Месяц (часы прибора)',
+  'year': 'Год (часы прибора)'
+};
+
 function loadCurrentData() {
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/api/current', true);
@@ -886,7 +932,8 @@ function loadCurrentData() {
       var t = r.Timestamp ? new Date(r.Timestamp).toLocaleTimeString('ru-RU') : '-';
       var qClass = r.Quality === 'VALID' ? 'status-good' : 'status-bad';
       var qText = r.Quality === 'VALID' ? 'Достоверно' : 'Недостоверно';
-      rows += '<tr><td>' + r.DeviceID + '</td><td>' + r.PointID + '</td><td>' + r.Instance +
+      var label = pointLabels[r.PointID] || r.PointID;
+      rows += '<tr><td>' + r.DeviceID + '</td><td>' + label + '</td><td>' + r.Instance +
         '</td><td>' + r.Value + '</td><td>' + r.Unit + '</td><td class="' + qClass + '">' +
         qText + '</td><td>' + t + '</td></tr>';
     }
@@ -915,7 +962,7 @@ function loadSettings() {
       conflictBox.style.display = 'none';
     }
 
-    var note = 'Изменение вступит в силу после перезапуска mbgw server (или службы mbgw_service).';
+    var note = 'Смена порта применяется сразу, без перезапуска. Отладочный лог тоже применяется сразу.';
     document.getElementById('s_port_note').innerText = note;
   };
   xhr.send();
@@ -924,7 +971,7 @@ function loadSettings() {
 function adoptActualPort() {
   var actual = document.getElementById('s_port_actual').innerText;
   document.getElementById('s_port').value = actual;
-  showMsg('settingsMsg', true, 'Порт ' + actual + ' подставлен в поле — нажмите "Сохранить", чтобы закрепить его.');
+  saveSettings(); // сохраняет сразу, без отдельного клика — раньше требовало двух действий и путало
 }
 
 function saveSettings() {
@@ -937,8 +984,19 @@ function saveSettings() {
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
     if (xhr.status === 200) {
-      showMsg('settingsMsg', true, 'Сохранено. Изменения вступят в силу после перезапуска mbgw server (или службы mbgw_service).');
-      loadSettings();
+      var resp = {};
+      try { resp = JSON.parse(xhr.responseText); } catch (e) {}
+      showMsg('settingsMsg', true, resp.note || 'Сохранено.');
+      // если порт реально сменился, страница теперь обращается к
+      // старому (уже закрытому) серверу — переходим на новый адрес
+      // автоматически, вместо того чтобы оператор гадал, куда идти
+      if (resp.note && resp.note.indexOf('уже работает на новом порту') >= 0) {
+        setTimeout(function() {
+          window.location = 'http://127.0.0.1:' + port + '/admin';
+        }, 800);
+      } else {
+        loadSettings();
+      }
     } else {
       showMsg('settingsMsg', false, 'Ошибка: HTTP ' + xhr.status);
     }

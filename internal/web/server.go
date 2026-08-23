@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	sqliterepo "mbgw/internal/storage/sqlite"
@@ -32,6 +34,13 @@ type Server struct {
 	// that manual polling isn't wired (e.g. a context that only serves the
 	// dashboard read-only), rather than panicking.
 	onManualPoll func()
+
+	// mu protects httpSrv/mux/port for Rebind — called from an HTTP
+	// handler goroutine (settings save), while Start's own goroutine also
+	// touches httpSrv. Без этого — гонка данных.
+	mu      sync.Mutex
+	httpSrv *http.Server
+	mux     *http.ServeMux
 }
 
 func NewServer(repo *sqliterepo.Repo, port int) *Server {
@@ -68,8 +77,12 @@ func (s *Server) Start(ctx context.Context) {
 
 	mux.HandleFunc("/", s.handleDashboard)
 
+	s.mu.Lock()
+	s.mux = mux
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
 	srv := &http.Server{Addr: addr, Handler: mux}
+	s.httpSrv = srv
+	s.mu.Unlock()
 
 	go func() {
 		log.Printf("[WEB] сервер диагностики запущен на http://%s\n", addr)
@@ -79,9 +92,50 @@ func (s *Server) Start(ctx context.Context) {
 	}()
 
 	<-ctx.Done()
+	s.mu.Lock()
+	current := s.httpSrv
+	s.mu.Unlock()
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(shutdownCtx)
+	_ = current.Shutdown(shutdownCtx)
+}
+
+// Rebind переключает веб-сервер на новый порт ВНУТРИ работающего
+// процесса, без перезапуска всего mbgw.exe — вызывается из обработчика
+// сохранения настроек (POST /api/settings), когда оператор меняет порт
+// через UI. Сначала открывает слушатель на НОВОМ порту (если порт занят
+// — Rebind вернёт ошибку, ничего не сломав), и только потом закрывает
+// старый — так что если новый порт недоступен, старое соединение с UI
+// не обрывается, оператор просто увидит ошибку сохранения.
+func (s *Server) Rebind(newPort int) error {
+	addr := fmt.Sprintf("127.0.0.1:%d", newPort)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("порт %d недоступен: %w", newPort, err)
+	}
+
+	s.mu.Lock()
+	newSrv := &http.Server{Addr: addr, Handler: s.mux}
+	oldSrv := s.httpSrv
+	s.httpSrv = newSrv
+	s.port = newPort
+	s.mu.Unlock()
+
+	go func() {
+		log.Printf("[WEB] переключение на порт %d\n", newPort)
+		if err := newSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			log.Printf("[WEB] ошибка после переключения порта: %v\n", err)
+		}
+	}()
+
+	if oldSrv != nil {
+		go func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = oldSrv.Shutdown(shutdownCtx)
+		}()
+	}
+	return nil
 }
 
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {

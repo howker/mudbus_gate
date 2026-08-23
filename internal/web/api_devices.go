@@ -343,8 +343,14 @@ func (s *Server) handleESConnectionTest(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "некорректный JSON: "+err.Error())
 		return
 	}
-	if body.SQLServer == "" || body.SQLDatabase == "" || body.SQLUser == "" || body.SQLPassword == "" {
-		writeError(w, http.StatusBadRequest, "поля sql_server, sql_database, sql_user, sql_password обязательны")
+	// SQLDatabase НЕ обязателен здесь (в отличие от сохранения) — тест
+	// подключения нужен ДО того, как оператор выбрал базу, именно чтобы
+	// предложить ему список реальных баз вместо ручного ввода вслепую
+	// (см. ListDatabases ниже). Подключение без указанной базы обычно
+	// уходит на базу по умолчанию для этого логина — этого достаточно,
+	// чтобы прочитать sys.databases.
+	if body.SQLServer == "" || body.SQLUser == "" || body.SQLPassword == "" {
+		writeError(w, http.StatusBadRequest, "поля sql_server, sql_user, sql_password обязательны")
 		return
 	}
 	port := body.SQLPort
@@ -368,7 +374,17 @@ func (s *Server) handleESConnectionTest(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+
+	// Список баз — необязательная часть ответа: если прочитать не
+	// получилось (например, у логина нет прав на sys.databases), тест
+	// подключения всё равно считается успешным, просто без выпадающего
+	// списка — оператор допишет имя базы вручную.
+	databases, err := writer.ListDatabases(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "databases": databases})
 }
 
 // handleAkronNorthbound: GET ?device_id=xxx returns the configured listen
