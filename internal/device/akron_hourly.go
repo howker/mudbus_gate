@@ -10,6 +10,19 @@ import (
 	"mbgw/internal/storage"
 )
 
+// prevValueChecker — узкий локальный интерфейс с ОДНИМ методом, который
+// умеет только *sqliterepo.Repo (см. internal/storage/sqlite/
+// repo_archive_range.go, GetPreviousHourlyValue). Сделан отдельным
+// маленьким интерфейсом, а не добавлением метода в общий storage.Repo
+// (внешний контракт, который меняется только сознательно) — Go сам
+// проверит через приведение типа (type assertion), поддерживает ли
+// переданный repo этот метод; для боевого *sqliterepo.Repo — да,
+// проверка сработает; для тестовых заглушек без этого метода — проверка
+// просто тихо пропускается, ничего не ломая.
+type prevValueChecker interface {
+	GetPreviousHourlyValue(ctx context.Context, deviceID, channel, param string, before time.Time) (value float64, found bool, err error)
+}
+
 // persistAkronHourly turns the decoded rows of an Akron command-104
 // (hourly) archive read into HourlyArchiveRecord rows and saves them, so
 // the upstream carrier (northbound) can later re-emit them to
@@ -32,6 +45,20 @@ import (
 // Rows whose BCD calendar is out of range (empty ring-buffer slots read
 // back as 0x00/0xFF filler, or a decode error) are skipped with a log
 // line rather than poisoning the store with a bogus 0000-00-00 timestamp.
+//
+// ПРОВЕРКА ПРАВДОПОДОБИЯ ЗНАЧЕНИЯ (добавлено 2026-08-23): поле "V" у
+// Akron — накопительный счётчик (одометр), он физически не может
+// уменьшаться со временем. Реальный случай в проде: помеха на линии
+// RS-485 дала испорченное, заниженное показание для одного часа, оно
+// сохранилось (BCD-дата была корректной, проверку akronRowTime прошла),
+// и один раз ушло в Энергосферу до того, как следующий, чистый опрос
+// исправил значение в нашей базе — ЭС же больше не переспрашивает уже
+// "полученный" час, ошибка осталась зафиксированной у неё навсегда. Эта
+// проверка не даёт такому попасть в базу вообще: если новое показание
+// МЕНЬШЕ показания предыдущего (по времени) часа — это почти наверняка
+// испорченное чтение, а не реальные данные, строка отбраковывается с
+// громким логом вместо тихого сохранения.
+//
 // Returns the number of rows actually persisted.
 func persistAkronHourly(ctx context.Context, repo storage.Repo, deviceID string, a profile.Archive, records []archive.ArchiveRecord) int {
 	unit := "m3"
@@ -40,6 +67,8 @@ func persistAkronHourly(ctx context.Context, repo storage.Repo, deviceID string,
 			unit = f.Unit
 		}
 	}
+
+	checker, canCheckMonotonic := repo.(prevValueChecker)
 
 	saved := 0
 	for i, rec := range records {
@@ -55,6 +84,18 @@ func persistAkronHourly(ctx context.Context, repo storage.Repo, deviceID string,
 			log.Printf("[%s] архив %s: строка %d — нет поля volume, пропуск (поля=%v)\n",
 				deviceID, a.ID, i, rec.Fields)
 			continue
+		}
+
+		if canCheckMonotonic {
+			prevValue, found, err := checker.GetPreviousHourlyValue(ctx, deviceID, "", "V", ts)
+			if err != nil {
+				log.Printf("[%s] архив %s: строка %d — не удалось проверить правдоподобие (%v), сохраняю как есть\n",
+					deviceID, a.ID, i, err)
+			} else if found && value < prevValue {
+				log.Printf("[%s] архив %s: строка %d (час %s) — ОТБРАКОВАНО: новое значение %v МЕНЬШЕ предыдущего часа %v — похоже на испорченное чтение (помеха на линии), а не реальное уменьшение счётчика\n",
+					deviceID, a.ID, i, ts.Format("02.01.2006 15:04"), value, prevValue)
+				continue
+			}
 		}
 
 		if err := repo.SaveHourlyArchive(ctx, storage.HourlyArchiveRecord{

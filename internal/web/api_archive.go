@@ -208,18 +208,24 @@ func formatPeriodLabel(t time.Time, granularity string) string {
 // параметры — buckets/order изменяются на месте (передаются по указателю
 // на срез, т.к. append может выделить новый массив).
 //
-// Логика: берём последнее показание в каждой корзине (снимок на конец
-// периода), затем разница со снимком ПРЕДЫДУЩЕЙ корзины — это и есть
-// "сколько прошло за период". Самая первая корзина строго ДО from
-// (затравочная) в итоговые строки не попадает — она нужна только чтобы
-// было с чем сравнить первую реальную корзину в окне запроса.
+// Логика: прибор хранит СНИМОК счётчика на момент наступления часа.
+// Разница между снимком на 17:00 и снимком на 16:00 — это расход ЗА ЧАС
+// С 16 ДО 17:00, и подписывается меткой СНИМКА-КОНЦА («17:00»), не
+// началом интервала — так это устроено и в родной программе учёта
+// прибора, и в самой Энергосфере: строка «17:00» показывает готовый
+// расход только когда сам час [16:00,17:00) уже завершился и был заново
+// опрошен; пока идёт ТЕКУЩИЙ, ещё не завершённый час — для него значения
+// попросту ещё нет ни у нас, ни в ЭС.
+//
+// ВАЖНО (уточнено 2026-08-23 после ошибочной правки в этом же файле):
+// метка НЕ сдвигается на предыдущий период ни для одной группировки —
+// раньше здесь была неверная логика "raw -> метка начала интервала",
+// отклонённая явно, отменена.
 func applyCumulativeDelta(rows []storage.HourlyArchiveRecord, param string, from time.Time, granularity string, buckets map[string]map[string]float64, order *[]string) {
 	if len(rows) == 0 {
 		return
 	}
 
-	// Снимок (последнее показание) на каждую корзину, включая
-	// затравочные корзины до from.
 	snapshots := make(map[string]float64)
 	var snapshotOrder []string
 	for _, row := range rows {
@@ -227,7 +233,7 @@ func applyCumulativeDelta(rows []storage.HourlyArchiveRecord, param string, from
 		if _, ok := snapshots[key]; !ok {
 			snapshotOrder = append(snapshotOrder, key)
 		}
-		snapshots[key] = row.Value // последнее по времени значение в корзине (rows уже по возрастанию)
+		snapshots[key] = row.Value
 	}
 	sort.Strings(snapshotOrder)
 
@@ -237,8 +243,8 @@ func applyCumulativeDelta(rows []storage.HourlyArchiveRecord, param string, from
 	for _, key := range snapshotOrder {
 		current := snapshots[key]
 		if key < fromKey {
-			// затравочная корзина до окна запроса — не показываем,
-			// только запоминаем как базу для вычитания
+			// затравочная точка ДО окна запроса — не показываем, только
+			// запоминаем как базу для вычитания первой реальной точки
 			prevValue = current
 			havePrev = true
 			continue
@@ -250,9 +256,6 @@ func applyCumulativeDelta(rows []storage.HourlyArchiveRecord, param string, from
 			}
 			buckets[key][param] = current - prevValue
 		}
-		// если havePrev==false — это первая корзина вообще в истории
-		// прибора (нет более ранних записей), разницу посчитать не из
-		// чего — строка для этого param просто не создаётся здесь
 		prevValue = current
 		havePrev = true
 	}

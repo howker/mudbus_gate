@@ -2,39 +2,41 @@ package web
 
 import "net/http"
 
-// api_admin_ui.go serves the T14 minimal-slice admin UI at /admin — a
-// single self-contained ES5 HTML page (XMLHttpRequest, var, string
-// concatenation — see handleDashboard's doc comment on why: IE on
-// Windows Server 2008 R2/2012 has neither Fetch nor async/await, and this
-// project builds no separate frontend toolchain). It talks only to the
-// JSON API already implemented in api_devices.go/api_probe.go.
+// api_admin_ui.go отдаёт минимальный административный веб-интерфейс на
+// /admin — одна цельная HTML-страница на чистом ES5 (XMLHttpRequest, var,
+// конкатенация строк — см. пояснение в handleDashboard: на Windows
+// Server 2008 R2/2012 единственный доступный браузер — Internet Explorer,
+// у него нет ни Fetch, ни async/await, а отдельной сборки фронтенда в
+// проекте нет). Работает только с уже реализованным JSON API
+// (api_devices.go/api_probe.go и другие api_*.go).
 //
-// Deliberately served at /admin, not /: the existing read-only dashboard
-// at / (handleDashboard) is untouched and keeps working exactly as
-// before — this is a new, additive screen, not a replacement, so nothing
-// that already works can be broken by it.
+// Намеренно отдаётся на /admin, а не на /: старый диагностический
+// дашборд на / (handleDashboard) не трогается и продолжает работать как
+// раньше — это новый, дополнительный экран, а не замена, поэтому ничего
+// уже работающего сломать нельзя.
 //
-// Layout: one HTML page, five tab panels toggled by show/hide (no
-// client-side router, no page reloads):
-//  1. Приборы       — list + add/edit form (incl. "Проверить прибор" ->
-//     POST /api/devices/probe) + delete.
-//  2. Каналы ЭС     — per-device 4-row (ST/S/T/Pi) tag->channel+factor
-//     table, only meaningful for kind=vkm360 devices.
-//  3. Подключение к ЭС — single SQL Server connection form + "Проверить
-//     подключение" (POST /api/es-connection/test, saves nothing).
-//  4. Akron northbound — per-device listen address, only meaningful for
-//     kind=akron devices.
-//  5. Текущие данные — same read-only table the / dashboard shows,
-//     reusing GET /api/current, so the operator doesn't need to flip
-//     between /admin and / to see both configuration and live data.
+// Структура: одна HTML-страница, вкладки переключаются показом/скрытием
+// блоков (без отдельного роутера, без перезагрузки страницы):
+//  1. Приборы — список + форма добавления/редактирования (включая
+//     «Проверить прибор» -> POST /api/devices/probe) + удаление.
+//  2. Каналы ЭС — таблица тег->канал+множитель для одного прибора,
+//     имеет смысл только для приборов типа vkm360.
+//  3. Подключение к ЭС — форма подключения к SQL Server + «Проверить
+//     подключение» (POST /api/es-connection/test, ничего не сохраняет).
+//  4. Приём Акрона (ЭС) — адрес прослушивания для конкретного прибора,
+//     имеет смысл только для приборов типа akron.
+//  5. Текущие данные — та же таблица только для чтения, что показывает
+//     дашборд на /, использует тот же GET /api/current, чтобы оператору
+//     не приходилось переключаться между /admin и / для просмотра и
+//     настроек, и живых данных.
 func (s *Server) handleAdminUI(w http.ResponseWriter, r *http.Request) {
-	// No caching, ever — this page has been edited many times in one
-	// day during active development, and a stale cached copy (browser
-	// showing OLD JS logic while the operator believes they're testing
-	// the LATEST fix) is indistinguishable from a real bug without this
-	// header. Cheap to always set; the page is small and reads live data
-	// via XHR anyway, so there's no real performance cost to never
-	// caching the HTML shell itself.
+	// Запрет кеширования — постоянно, без условий: за один день эту
+	// страницу правили много раз, и устаревшая закешированная копия
+	// (браузер показывает СТАРЫЙ JS-код, а оператор думает, что тестирует
+	// ПОСЛЕДНИЙ фикс) неотличима от настоящего бага без этого заголовка.
+	// Ничего не стоит держать всегда включённым — страница маленькая,
+	// живые данные и так читаются отдельными XHR-запросами, реальной
+	// потери в скорости от отказа от кеша самой HTML-оболочки нет.
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -293,6 +295,19 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <tbody id="archiveTableBody"><tr><td>Выберите прибор и период, затем нажмите «Показать»</td></tr></tbody>
       </table>
     </div>
+
+    <div class="section" id="reloadSection" style="display:none;">
+      <h3>Принудительный переопрос</h3>
+      <p class="small-note">Заново спрашивает прибор за указанный период и ПЕРЕЗАПИСЫВАЕТ уже сохранённые данные — используйте, если в архиве обнаружено заведомо неверное значение (например, из-за помехи на линии связи). Обычный дозабор такое не исправляет, поскольку строка для этого периода уже существует.</p>
+      <div class="form-row"><label>Переопросить с</label>
+        <input id="rl_from" type="datetime-local">
+      </div>
+      <div class="form-row" id="rl_to_row"><label>По (только для ВКМ)</label>
+        <input id="rl_to" type="datetime-local">
+      </div>
+      <p><button class="btn danger" onclick="forceReload()">Переопросить принудительно</button></p>
+      <div id="reloadMsg" class="msg"></div>
+    </div>
   </div>
 
   <!-- ===================== НАСТРОЙКИ ===================== -->
@@ -365,11 +380,12 @@ function showMsg(elId, ok, text) {
 function onKindChange() {
   var kind = document.getElementById('d_kind').value;
   var idField = document.getElementById('d_id');
-  // Confirm before changing the type of an EXISTING device mid-edit — this
-  // exact action (switch "Тип прибора" while editing a saved device) is
-  // what silently turned a saved Akron device into a ВКМ device sharing
-  // the same ID on 2026-08-23. A brand-new device (d_id not disabled) has
-  // nothing to lose here, so no confirmation is needed for it.
+  // Подтверждение перед сменой типа УЖЕ СУЩЕСТВУЮЩЕГО прибора посреди
+  // редактирования — именно это действие (смена «Тип прибора» во время
+  // редактирования сохранённого прибора) однажды тихо превратило
+  // сохранённый прибор Akron в прибор ВКМ с тем же ID, 2026-08-23. У
+  // совсем нового прибора (d_id ещё не отключено) терять нечего,
+  // подтверждение не нужно.
   if (idField.disabled && editingOriginalKind && kind !== editingOriginalKind) {
     var ok = confirm('Вы редактируете существующий прибор и меняете его тип с "' + editingOriginalKind +
       '" на "' + kind + '". Это изменит СУЩЕСТВУЮЩИЙ прибор, а не создаст новый. Продолжить?');
@@ -428,14 +444,15 @@ function slugify(s) {
   return t;
 }
 
-// autoFillID keeps a hidden d_id field (the actual value submitted to the
-// API) in sync with the visible "Название" field, so the operator never
-// has to think about or type an ID by hand — see this file's other
-// comments on the 2026-08-23 placeholder-vs-value incident that prompted
-// simplifying this form wherever possible. Only auto-fills for a NEW
-// device (d_id not disabled); editDevice() disables it for existing
-// devices, whose ID must never change once saved (it's how es_vkm_channels/
-// es_akron_northbound rows reference the device).
+// autoFillID держит скрытое поле d_id (то самое значение, что реально
+// отправляется в API) синхронизированным с видимым полем «Название» —
+// оператору никогда не нужно самому думать об ID или вводить его руками
+// (см. другие комментарии в этом файле про случай 2026-08-23 с
+// подсказкой-вместо-значения, который и подтолкнул максимально упростить
+// эту форму). Автозаполнение работает только для НОВОГО прибора (d_id ещё
+// не отключено); editDevice() отключает поле для уже существующих
+// приборов, чей ID никогда не должен меняться после сохранения (именно
+// на него ссылаются строки es_vkm_channels/es_akron_northbound).
 function autoFillID() {
   var idField = document.getElementById('d_id');
   if (idField.disabled) { return; } // editing an existing device — ID is fixed
@@ -448,18 +465,19 @@ function autoFillID() {
 function intOrZero(v) { var n = parseInt(v, 10); return isNaN(n) ? 0 : n; }
 function floatOrOne(v) { var n = parseFloat(v); return isNaN(n) ? 1.0 : n; }
 
-// validateTransportFields checks the ONE field that has no sensible
-// default and genuinely must be typed by hand (COM port for serial
-// transports, IP host for TCP transports) — returns an error message, or
-// '' if OK. This exists because of a real incident (2026-08-23): fields
-// showing example text via the HTML placeholder attribute LOOK filled in
-// a screenshot but are actually empty strings until the operator clicks
-// in and types something themselves — sending that silently to the
-// server produced a confusing downstream transport error instead of a
-// clear "you forgot to fill this in" message right where the mistake was
-// made. Every OTHER field in the form now has a real default VALUE (not
-// just a placeholder hint), so this check only needs to cover the two
-// fields that cannot have a sensible default filled in automatically.
+// validateTransportFields проверяет ОДНО поле, у которого нет разумного
+// значения по умолчанию и которое реально нужно ввести руками (COM-порт
+// для последовательных транспортов, IP для TCP) — возвращает текст
+// ошибки, или пустую строку, если всё в порядке. Появилось из-за
+// реального случая (2026-08-23): поля с текстом-подсказкой (атрибут
+// placeholder) НА ВИД выглядят заполненными на скриншоте, а на самом деле
+// пустая строка, пока оператор реально не кликнет и не введёт что-то
+// сам — отправка такого молча на сервер давала непонятную ошибку
+// транспорта вместо чёткого «вы забыли заполнить это поле» прямо там, где
+// была допущена ошибка. У всех ОСТАЛЬНЫХ полей формы теперь реальное
+// значение по умолчанию (не просто подсказка), так что эта проверка
+// нужна только для двух полей, для которых разумного значения по
+// умолчанию в принципе не бывает.
 function validateTransportFields(body) {
   if (body.transport_kind === 'modbus_tcp') {
     if (!body.host) { return 'Заполните поле "IP-адрес"'; }
@@ -470,8 +488,41 @@ function validateTransportFields(body) {
 }
 
 function onArchiveDeviceChange() {
-  // placeholder — reserved for future per-device defaults (e.g. auto-pick
-  // a sensible default period based on the device's own archive depth)
+  var deviceId = document.getElementById('ar_device').value;
+  var d = findDevice(deviceId);
+  var showReload = !!(d && (d.kind === 'akron' || d.kind === 'vkm360'));
+  document.getElementById('reloadSection').style.display = showReload ? 'block' : 'none';
+  // поле "по" нужно только ВКМ (архив адресуется по времени напрямую) —
+  // у Akron переопрос всегда идёт "с указанной даты и до сейчас"
+  // (архив адресуется по индексу вглубь от текущей вершины, конкретную
+  // верхнюю границу задать нельзя)
+  var isVKM = !!(d && d.kind === 'vkm360');
+  document.getElementById('rl_to_row').style.display = isVKM ? 'block' : 'none';
+}
+
+function forceReload() {
+  var deviceId = document.getElementById('ar_device').value;
+  var fromVal = document.getElementById('rl_from').value; // формат из <input type=datetime-local>: ГГГГ-ММ-ДДTЧЧ:ММ
+  var toVal = document.getElementById('rl_to').value;
+  if (!deviceId) { showMsg('reloadMsg', false, 'Выберите прибор'); return; }
+  if (!fromVal) { showMsg('reloadMsg', false, 'Укажите дату и время начала'); return; }
+  if (!confirm('Это ПЕРЕЗАПИШЕТ уже сохранённые данные архива за этот период данными, заново прочитанными с прибора. Продолжить?')) { return; }
+
+  document.getElementById('reloadMsg').className = 'msg';
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/devices/reload-archive', true);
+  xhr.setRequestHeader('Content-Type', 'application/json');
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    var data;
+    try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('reloadMsg', false, 'Ошибка ответа сервера'); return; }
+    if (data.ok) {
+      showMsg('reloadMsg', true, 'Готово, перезаписано записей: ' + data.saved + '. Нажмите «Показать», чтобы увидеть обновлённые данные.');
+    } else {
+      showMsg('reloadMsg', false, 'Ошибка: ' + (data.error || 'неизвестная') + ' (перезаписано до сбоя: ' + data.saved + ')');
+    }
+  };
+  xhr.send(JSON.stringify({ device_id: deviceId, from: fromVal, to: toVal }));
 }
 
 function pad2(n) { return (n < 10 ? '0' : '') + n; }
@@ -483,7 +534,7 @@ function setArchivePreset(preset) {
   var to = new Date();
   var from = new Date();
   if (preset === 'today') {
-    // from stays = today
+    // from остаётся = сегодня
   } else if (preset === 'week') {
     from.setDate(from.getDate() - 7);
   } else if (preset === 'month') {
@@ -683,12 +734,13 @@ function currentDeviceFormAsJSON() {
 function saveDevice() {
   var body = currentDeviceFormAsJSON();
   if (!body.id) { showMsg('deviceMsg', false, 'Заполните поле "Название"'); return; }
-  // ID COLLISION GUARD (fix for 2026-08-23 incident: saving a VKM device
-  // silently overwrote an already-saved Akron device because both
-  // happened to auto-generate the same ID from similar names). Only
-  // applies when adding a NEW device (d_id not disabled) — editDevice()
-  // disables the field precisely because an EXISTING device's own ID is
-  // expected to match itself on save, that's not a collision.
+  // ЗАЩИТА ОТ КОЛЛИЗИИ ID (фикс случая 2026-08-23: сохранение прибора
+  // ВКМ тихо перезаписало уже сохранённый прибор Akron, потому что оба
+  // случайно сгенерировали одинаковый ID из похожих названий). Действует
+  // только при добавлении НОВОГО прибора (d_id ещё не отключено) —
+  // editDevice() отключает поле именно потому, что для СУЩЕСТВУЮЩЕГО
+  // прибора его собственный ID и должен совпадать сам с собой при
+  // сохранении, это не коллизия.
   var isNew = !document.getElementById('d_id').disabled;
   if (isNew && findDevice(body.id)) {
     showMsg('deviceMsg', false, 'Прибор с таким же ID ("' + body.id +

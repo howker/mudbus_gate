@@ -279,6 +279,11 @@ func runServer() {
 	eventBus := monitor.NewBus(nil)
 	sched := scheduler.New(eventBus)
 	devices := make(map[string]*device.Device)
+	// deviceKinds хранит тип каждого прибора (akron/vkm360) отдельно от
+	// devices — нужно колбэку принудительного переопроса (ниже), чтобы
+	// решить, какой именно метод вызывать (ForceReloadAkronHourly или
+	// ForceReloadVKMHourly), сам *device.Device своего "типа" не хранит.
+	deviceKinds := make(map[string]string)
 
 	// Devices come from the devices table (UpsertDevice/ListDevices,
 	// internal/storage/sqlite/repo_device_config.go) instead of
@@ -371,6 +376,7 @@ func runServer() {
 			dev.GapScanWindowHours = devRec.GapScanWindowHours
 		}
 		devices[devRec.ID] = dev
+		deviceKinds[devRec.ID] = devRec.Kind
 
 		// Same blocking-backfill-before-scheduler-register reasoning as
 		// run.go/serve.go — see those files' identical comment for the
@@ -418,6 +424,32 @@ func runServer() {
 			}
 		}
 	})
+
+	// Принудительный переопрос архива с UI (см. internal/device/
+	// akron_reload.go, internal/device/vkm_reload.go и internal/web/
+	// api_reload.go) — идёт НАПРЯМУЮ к конкретному прибору, в обход
+	// планировщика: это разовое, явно запрошенное оператором действие с
+	// указанным периодом, а не часть обычного расписания опроса. Работает
+	// для обоих типов приборов — какой метод вызвать, решаем по
+	// deviceKinds.
+	webServer.SetForceReload(func(deviceID string, from, to time.Time) (int, error) {
+		dev, ok := devices[deviceID]
+		if !ok {
+			return 0, fmt.Errorf("прибор %s не найден среди работающих (сохранён ли он и запущен ли server?)", deviceID)
+		}
+		kind := deviceKinds[deviceID]
+		log.Printf("[WEB] принудительный переопрос архива %s (%s) с %s по %s\n",
+			deviceID, kind, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
+		switch kind {
+		case "akron":
+			return dev.ForceReloadAkronHourly(ctx, from)
+		case "vkm360":
+			return dev.ForceReloadVKMHourly(ctx, from, to)
+		default:
+			return 0, fmt.Errorf("принудительный переопрос не реализован для типа прибора %q", kind)
+		}
+	})
+
 	go webServer.Start(ctx)
 
 	pl := poller.New(sched, devices, 1*time.Second)

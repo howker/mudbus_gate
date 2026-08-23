@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -46,4 +47,28 @@ ORDER BY ts_hour ASC
 		out = append(out, rec)
 	}
 	return out, rows.Err()
+}
+
+// GetPreviousHourlyValue возвращает значение последней (по времени)
+// записи СТРОГО ДО указанного момента — используется для проверки
+// правдоподобия нового показания накопительного счётчика Akron (V):
+// счётчик — одометр, он физически не может уменьшаться, поэтому новое
+// показание, которое оказывается МЕНЬШЕ показания предыдущего часа —
+// почти наверняка испорченное чтение (помеха на линии RS-485), а не
+// реальные данные. found=false (без ошибки), если для устройства ещё
+// нет ни одной более ранней записи — тогда сравнивать не с чем, это не
+// ошибка.
+func (r *Repo) GetPreviousHourlyValue(ctx context.Context, deviceID, channel, param string, before time.Time) (value float64, found bool, err error) {
+	err = r.db.QueryRowContext(ctx, `
+SELECT value FROM archive_hourly
+WHERE device_id = ? AND channel = ? AND param = ? AND ts_hour < ?
+ORDER BY ts_hour DESC LIMIT 1
+`, deviceID, channel, param, before).Scan(&value)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("get previous hourly value: %w", err)
+	}
+	return value, true, nil
 }

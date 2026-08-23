@@ -35,6 +35,13 @@ type Server struct {
 	// dashboard read-only), rather than panicking.
 	onManualPoll func()
 
+	// onForceReload, если задан, вызывается для принудительного
+	// переопроса архива с указанного периода — см. api_reload.go и
+	// SetForceReload. nil означает, что этот режим запуска не умеет
+	// принудительно переопрашивать (например, старый диагностический
+	// дашборд без полного набора приборов).
+	onForceReload func(deviceID string, from, to time.Time) (int, error)
+
 	// mu protects httpSrv/mux/port for Rebind — called from an HTTP
 	// handler goroutine (settings save), while Start's own goroutine also
 	// touches httpSrv. Без этого — гонка данных.
@@ -52,6 +59,15 @@ func NewServer(repo *sqliterepo.Repo, port int) *Server {
 // NewServer so the web package doesn't need to import scheduler/device.
 func (s *Server) SetManualPoll(fn func()) {
 	s.onManualPoll = fn
+}
+
+// SetForceReload подключает возможность принудительного переопроса
+// архива — вызывается из cmd/mbgw/server.go после того, как приборы
+// созданы и открыты (см. runServer). Работает для обоих типов приборов
+// (Akron и ВКМ) — какой именно метод вызывать, решает сам callback по
+// типу конкретного прибора.
+func (s *Server) SetForceReload(fn func(deviceID string, from, to time.Time) (int, error)) {
+	s.onForceReload = fn
 }
 
 func (s *Server) Start(ctx context.Context) {
@@ -73,6 +89,7 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/profiles", s.handleProfiles)
 	mux.HandleFunc("/api/archive", s.handleArchive)
 	mux.HandleFunc("/api/archive/export", s.handleArchiveExport)
+	mux.HandleFunc("/api/devices/reload-archive", s.handleForceReload)
 	mux.HandleFunc("/admin", s.handleAdminUI)
 
 	mux.HandleFunc("/", s.handleDashboard)
