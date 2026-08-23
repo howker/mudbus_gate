@@ -411,7 +411,7 @@ func runServer() {
 		case "akron":
 			startAkronNorthboundForDevice(ctx, repo, devRec.ID)
 		case "vkm360":
-			startESyncForDevice(ctx, repo, devRec.ID)
+			startESyncForDevice(ctx, repo, devRec.ID, dbPath)
 		}
 	}
 
@@ -533,7 +533,21 @@ func startAkronNorthboundForDevice(ctx context.Context, repo *sqliterepo.Repo, d
 // connection (es_connection) AND at least one channel mapping
 // (es_vkm_channels) for it — same "opt-in, missing config = skip with a
 // log line, not a fatal error" principle as the Akron branch above.
-func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID string) {
+// startESyncForDevice starts the ВКМ→Энергосфера direct-DB sync loop for
+// one device, IF the operator has configured both the SQL Server
+// connection (es_connection) AND at least one channel mapping
+// (es_vkm_channels) for it — same "opt-in, missing config = skip with a
+// log line, not a fatal error" principle as the Akron branch above.
+//
+// dbPath — путь к ЕДИНОЙ базе процесса server (та же, что открыта в
+// runServer как repo), а не отдельный "mbgw_vkm.db". Раньше здесь стоял
+// захардкоженный "mbgw_vkm.db" — рабочий путь в старой схеме "четыре
+// окна", где southbound ВКМ реально писал в отдельный файл с этим именем.
+// В единой базе server всё (включая archive_vkm_raw) пишется в ОДИН
+// файл, путь к которому передаётся через --db при запуске — es-sync
+// обязан читать оттуда же, иначе получает "no such table: archive_vkm_raw"
+// (подтверждено живьём, 2026-08-23).
+func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, dbPath string) {
 	conn, found, err := repo.GetESConnection(ctx)
 	if err != nil {
 		log.Printf("[ERROR] прибор %s: ошибка чтения параметров подключения к БД ЭС: %v\n", deviceID, err)
@@ -584,15 +598,7 @@ func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID st
 
 	go func() {
 		log.Printf("[OK] es-sync для %s: старт (сервер БД ЭС=%s, база=%s)\n", deviceID, conn.SQLServer, conn.SQLDatabase)
-		// NOTE: RunEnergosphereSync currently opens its OWN
-		// mbgw_vkm.db/repo connection internally rather than sharing this
-		// process's repo — matches its existing signature
-		// (RunEnergosphereSync(ctx, sqlitePath, cfg)) unchanged from the
-		// standalone `mbgw es-sync` command, so as not to touch a module
-		// that is already confirmed working in production. Sharing the
-		// connection is a reasonable future cleanup, not required for
-		// this step to work.
-		if err := integration.RunEnergosphereSync(ctx, "mbgw_vkm.db", cfg); err != nil {
+		if err := integration.RunEnergosphereSync(ctx, dbPath, cfg); err != nil {
 			log.Printf("[ERROR] es-sync %s: %v\n", deviceID, err)
 		}
 	}()

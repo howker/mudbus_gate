@@ -47,11 +47,26 @@ var devicesParams = map[string][]string{
 }
 
 // paramLabels gives each raw param code a Russian display name for the
-// table header.
+// table header (уже с учётом единиц ПОСЛЕ пересчёта — см. paramDisplayFactor).
 var paramLabels = map[string]string{
 	"S":  "Масса, т",
-	"ST": "Тепловая энергия (как хранится)",
+	"ST": "Тепловая энергия, Гкал",
 	"V":  "Расход за период, м³",
+}
+
+// paramDisplayFactor — множитель, который переводит СЫРОЕ хранимое
+// значение (то, в чём его отдаёт сам прибор) в единицы, привычные
+// оператору и совпадающие с тем, что показывает родная программа учёта
+// прибора. Проверено сверкой (2026-08-23): наша сырая масса за час,
+// делённая на 1000, совпадает с "т" родной программы с точностью до
+// третьего знака; тепло переводится тем же коэффициентом, что уже
+// подтверждён сверкой с официальным отчётом прибора в
+// internal/integration/energosphere_sync.go (4.1868e9 Дж в одной Гкал).
+// Отсутствие ключа = множитель 1 (без пересчёта) — так остаётся, например,
+// для "V" (Akron), которое уже в м³ как есть.
+var paramDisplayFactor = map[string]float64{
+	"S":  1.0 / 1000.0,   // кг -> т
+	"ST": 1.0 / 4.1868e9, // Дж -> Гкал
 }
 
 // paramCumulative marks params whose STORED value is a running counter
@@ -181,7 +196,21 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 
 	out := make([]archiveRow, 0, len(uniqueOrder))
 	for _, key := range uniqueOrder {
-		out = append(out, archiveRow{Period: key, Values: buckets[key]})
+		// Применяем коэффициент пересчёта единиц (paramDisplayFactor)
+		// один раз, здесь — единственное место, через которое проходят
+		// ВСЕ итоговые значения, независимо от того, аддитивный параметр
+		// или накопительный. Значения в buckets до этого момента остаются
+		// в СЫРЫХ единицах прибора — так проще было считать сумму/разницу
+		// выше, не путая единицы измерения с арифметикой.
+		converted := make(map[string]float64, len(buckets[key]))
+		for param, v := range buckets[key] {
+			factor := paramDisplayFactor[param]
+			if factor == 0 {
+				factor = 1.0
+			}
+			converted[param] = v * factor
+		}
+		out = append(out, archiveRow{Period: key, Values: converted})
 	}
 
 	return archiveResponse{DeviceID: deviceID, Params: params, ParamLabels: labels, Rows: out}, nil

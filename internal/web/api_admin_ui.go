@@ -837,7 +837,7 @@ function loadChannels() {
   xhr.send();
 }
 
-function saveChannels() {
+function saveChannels(force) {
   var deviceId = document.getElementById('ch_device').value;
   if (!deviceId) { showMsg('channelsMsg', false, 'Выберите прибор'); return; }
   var tags = ['ST', 'S', 'T', 'Pi'];
@@ -853,10 +853,24 @@ function saveChannels() {
   xhr.setRequestHeader('Content-Type', 'application/json');
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
-    if (xhr.status === 200) { showMsg('channelsMsg', true, 'Каналы сохранены.'); }
-    else { showMsg('channelsMsg', false, 'Ошибка: HTTP ' + xhr.status); }
+    if (xhr.status === 200) {
+      showMsg('channelsMsg', true, 'Каналы сохранены.');
+    } else if (xhr.status === 409) {
+      // конфликт номеров каналов с другим прибором — показываем
+      // предупреждение и даём явно подтвердить сохранение всё равно
+      var data = {};
+      try { data = JSON.parse(xhr.responseText); } catch (e) {}
+      var msg = (data.error || 'Обнаружен конфликт каналов.') + ' Сохранить всё равно?';
+      if (confirm(msg)) {
+        saveChannels(true);
+      } else {
+        showMsg('channelsMsg', false, 'Сохранение отменено — исправьте номер канала.');
+      }
+    } else {
+      showMsg('channelsMsg', false, 'Ошибка: HTTP ' + xhr.status);
+    }
   };
-  xhr.send(JSON.stringify({ device_id: deviceId, channels: channels }));
+  xhr.send(JSON.stringify({ device_id: deviceId, channels: channels, force: !!force }));
 }
 
 function loadESConnection() {

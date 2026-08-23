@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"mbgw/internal/integration"
@@ -251,6 +252,7 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			DeviceID string           `json:"device_id"`
 			Channels []vkmChannelJSON `json:"channels"`
+			Force    bool             `json:"force"` // явное подтверждение "да, я знаю про конфликт, сохранить всё равно"
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, "некорректный JSON: "+err.Error())
@@ -261,6 +263,7 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rows := make([]sqliterepo.VKMChannelRecord, 0, len(body.Channels))
+		channelIDs := make([]int, 0, len(body.Channels))
 		for _, c := range body.Channels {
 			factor := c.Factor
 			if factor == 0 {
@@ -269,7 +272,37 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 			rows = append(rows, sqliterepo.VKMChannelRecord{
 				DeviceID: body.DeviceID, Tag: c.Tag, ESChannelID: c.ESChannelID, Factor: factor,
 			})
+			if c.ESChannelID != 0 {
+				channelIDs = append(channelIDs, c.ESChannelID)
+			}
 		}
+
+		// Защита от случайного ввода номера канала, который уже занят
+		// ДРУГИМ прибором — если оба прибора начнут писать в один канал
+		// ЭС, данные одного будут затирать данные другого, и заметить
+		// это по внешним признакам не всегда просто. Force=true
+		// позволяет явно подтвердить и сохранить всё равно (например,
+		// если оператор осознанно переносит канал с одного прибора на
+		// другой).
+		if !body.Force {
+			conflicts, err := s.repo.FindChannelConflicts(r.Context(), body.DeviceID, channelIDs)
+			if err != nil {
+				writeError(w, http.StatusInternalServerError, "не удалось проверить занятость каналов: "+err.Error())
+				return
+			}
+			if len(conflicts) > 0 {
+				parts := make([]string, 0, len(conflicts))
+				for ch, owner := range conflicts {
+					parts = append(parts, fmt.Sprintf("канал %d уже занят прибором %q", ch, owner))
+				}
+				writeJSON(w, http.StatusConflict, map[string]any{
+					"error":     "Обнаружено совпадение номеров каналов с другим прибором: " + strings.Join(parts, "; "),
+					"conflicts": conflicts,
+				})
+				return
+			}
+		}
+
 		if err := s.repo.SetVKMChannels(r.Context(), body.DeviceID, rows); err != nil {
 			writeError(w, http.StatusInternalServerError, "не удалось сохранить каналы: "+err.Error())
 			return

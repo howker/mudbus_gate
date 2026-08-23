@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -302,6 +303,50 @@ type VKMChannelRecord struct {
 // form submits the whole 4-row table for a device at once, not one tag
 // at a time, so this matches that shape instead of requiring 4 separate
 // upsert calls plus a separate "did the operator remove a row" diff.
+// FindChannelConflicts проверяет, не заняты ли уже перечисленные номера
+// каналов ЭС (ID_Channel) КАКИМ-ТО ДРУГИМ прибором (не тем, для которого
+// сейчас сохраняются каналы) — защита от случайной ошибки при ручном
+// вводе номера канала: если один и тот же канал ЭС окажется привязан
+// сразу к двум разным нашим приборам, данные одного будут затирать
+// данные другого в базе Энергосферы, и заметить это сразу непросто.
+// Возвращает карту "номер канала -> ID прибора, которому он уже
+// принадлежит" — пустая карта означает конфликтов нет.
+func (r *Repo) FindChannelConflicts(ctx context.Context, deviceID string, channelIDs []int) (map[int]string, error) {
+	conflicts := make(map[int]string)
+	if len(channelIDs) == 0 {
+		return conflicts, nil
+	}
+
+	placeholders := make([]string, len(channelIDs))
+	args := make([]any, 0, len(channelIDs)+1)
+	for i, ch := range channelIDs {
+		placeholders[i] = "?"
+		args = append(args, ch)
+	}
+	args = append(args, deviceID)
+
+	query := fmt.Sprintf(`
+SELECT es_channel_id, device_id FROM es_vkm_channels
+WHERE es_channel_id IN (%s) AND device_id != ?
+`, strings.Join(placeholders, ","))
+
+	rows, err := r.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("find channel conflicts: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var chID int
+		var otherDeviceID string
+		if err := rows.Scan(&chID, &otherDeviceID); err != nil {
+			return nil, fmt.Errorf("scan channel conflict: %w", err)
+		}
+		conflicts[chID] = otherDeviceID
+	}
+	return conflicts, rows.Err()
+}
+
 func (r *Repo) SetVKMChannels(ctx context.Context, deviceID string, rows []VKMChannelRecord) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
