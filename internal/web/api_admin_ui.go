@@ -110,8 +110,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 
     <div class="section">
       <h3 id="deviceFormTitle">Добавить прибор</h3>
-      <div class="form-row"><label>ID (латиницей, без пробелов)</label><input id="d_id" type="text"></div>
-      <div class="form-row"><label>Название</label><input id="d_name" type="text"></div>
+      <div class="form-row"><label>Название</label><input id="d_name" type="text" onkeyup="autoFillID()"></div>
+      <p class="small-note" style="margin-left:220px;margin-top:-8px;">ID: <span id="d_id_display">—</span> <input id="d_id" type="text" style="display:none;"></p>
       <div class="form-row"><label>Тип прибора</label>
         <select id="d_kind" onchange="onKindChange()">
           <option value="vkm360">ВКМ-360</option>
@@ -128,20 +128,27 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       </div>
       <div id="tcpFields">
         <div class="form-row"><label>IP-адрес</label><input id="d_host" type="text" placeholder="10.48.228.126"></div>
-        <div class="form-row"><label>Порт</label><input id="d_port" type="text" placeholder="502"></div>
+        <div class="form-row"><label>Порт</label><input id="d_port" type="text" value="502"></div>
       </div>
       <div id="serialFields">
         <div class="form-row"><label>COM-порт</label><input id="d_com" type="text" placeholder="COM105"></div>
-        <div class="form-row"><label>Скорость (бод)</label><input id="d_baudrate" type="text" placeholder="9600"></div>
+        <div class="form-row"><label>Скорость (бод)</label><input id="d_baudrate" type="text" value="9600"></div>
         <div class="form-row"><label>Чётность</label>
           <select id="d_parity"><option value="none">none</option><option value="even">even</option><option value="odd">odd</option></select>
         </div>
-        <div class="form-row"><label>Стоп-биты</label><input id="d_stopbits" type="text" placeholder="1"></div>
+        <div class="form-row"><label>Стоп-биты</label><input id="d_stopbits" type="text" value="1"></div>
       </div>
-      <div class="form-row"><label>Адрес на линии (unit id)</label><input id="d_unit_id" type="text" placeholder="1"></div>
-      <div class="form-row"><label>Таймаут (мс)</label><input id="d_timeout_ms" type="text" placeholder="1000"></div>
-      <div class="form-row"><label>Опрос текущих (сек)</label><input id="d_current_poll_seconds" type="text" placeholder="3600"></div>
+      <div class="form-row"><label>Адрес на линии (unit id)</label><input id="d_unit_id" type="text" value="1"></div>
+      <div class="form-row"><label>Таймаут (мс)</label><input id="d_timeout_ms" type="text" value="1000"></div>
+      <div class="form-row"><label>Количество повторов при ошибке</label><input id="d_retries" type="text" value="3"></div>
+      <p class="small-note" style="margin-left:220px;margin-top:-8px;">При сбое запрос повторяется с растущей паузой (0.2с, 0.4с, 0.8с) — полезно на нестабильной линии (RS-485 с помехами, обрывы).</p>
       <div class="form-row"><label>Включён</label><input id="d_enabled" type="checkbox" checked></div>
+
+      <p><a href="#" onclick="toggleAdvanced(); return false;" style="color:#0e639c;font-size:13px;" id="advancedToggle">▸ Дополнительные настройки</a></p>
+      <div id="advancedFields" style="display:none;">
+        <div class="form-row"><label>Опрос текущих (сек)</label><input id="d_current_poll_seconds" type="text" value="3600"></div>
+        <p class="small-note">Как часто опрашивать мгновенные показания (не архив). Раз в час обычно достаточно — этот шлюз собирает архив, не ведёт непрерывную телеметрию.</p>
+      </div>
 
       <p>
         <button class="btn secondary" onclick="probeDevice()">Проверить прибор</button>
@@ -261,8 +268,15 @@ function showMsg(elId, ok, text) {
 function onKindChange() {
   var kind = document.getElementById('d_kind').value;
   var tk = document.getElementById('d_transport_kind');
-  if (kind === 'vkm360') { tk.value = 'modbus_tcp'; }
-  if (kind === 'akron') { tk.value = 'rtu_serial'; }
+  var profileEl = document.getElementById('d_profile');
+  if (kind === 'vkm360') {
+    tk.value = 'modbus_tcp';
+    if (!profileEl.value) { profileEl.value = 'profiles/vkm360.yaml'; }
+  }
+  if (kind === 'akron') {
+    tk.value = 'rtu_serial';
+    if (!profileEl.value) { profileEl.value = 'profiles/acron-01.yaml'; }
+  }
   onTransportKindChange();
 }
 function onTransportKindChange() {
@@ -273,8 +287,76 @@ function onTransportKindChange() {
   document.getElementById('serialFields').style.display = showSerial ? 'block' : 'none';
 }
 
+function toggleAdvanced() {
+  var el = document.getElementById('advancedFields');
+  var link = document.getElementById('advancedToggle');
+  var showing = el.style.display !== 'none';
+  el.style.display = showing ? 'none' : 'block';
+  link.innerText = showing ? '▸ Дополнительные настройки' : '▾ Дополнительные настройки';
+}
+
+function transliterate(s) {
+  var map = {
+    'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh','з':'z','и':'i',
+    'й':'y','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t',
+    'у':'u','ф':'f','х':'h','ц':'ts','ч':'ch','ш':'sh','щ':'sch','ъ':'','ы':'y','ь':'',
+    'э':'e','ю':'yu','я':'ya'
+  };
+  var out = '';
+  s = s.toLowerCase();
+  for (var i = 0; i < s.length; i++) {
+    var c = s.charAt(i);
+    out += (map[c] !== undefined) ? map[c] : c;
+  }
+  return out;
+}
+
+function slugify(s) {
+  var t = transliterate(s);
+  t = t.replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return t;
+}
+
+// autoFillID keeps a hidden d_id field (the actual value submitted to the
+// API) in sync with the visible "Название" field, so the operator never
+// has to think about or type an ID by hand — see this file's other
+// comments on the 2026-08-23 placeholder-vs-value incident that prompted
+// simplifying this form wherever possible. Only auto-fills for a NEW
+// device (d_id not disabled); editDevice() disables it for existing
+// devices, whose ID must never change once saved (it's how es_vkm_channels/
+// es_akron_northbound rows reference the device).
+function autoFillID() {
+  var idField = document.getElementById('d_id');
+  if (idField.disabled) { return; } // editing an existing device — ID is fixed
+  var name = document.getElementById('d_name').value;
+  var id = slugify(name);
+  idField.value = id;
+  document.getElementById('d_id_display').innerText = id || '—';
+}
+
 function intOrZero(v) { var n = parseInt(v, 10); return isNaN(n) ? 0 : n; }
 function floatOrOne(v) { var n = parseFloat(v); return isNaN(n) ? 1.0 : n; }
+
+// validateTransportFields checks the ONE field that has no sensible
+// default and genuinely must be typed by hand (COM port for serial
+// transports, IP host for TCP transports) — returns an error message, or
+// '' if OK. This exists because of a real incident (2026-08-23): fields
+// showing example text via the HTML placeholder attribute LOOK filled in
+// a screenshot but are actually empty strings until the operator clicks
+// in and types something themselves — sending that silently to the
+// server produced a confusing downstream transport error instead of a
+// clear "you forgot to fill this in" message right where the mistake was
+// made. Every OTHER field in the form now has a real default VALUE (not
+// just a placeholder hint), so this check only needs to cover the two
+// fields that cannot have a sensible default filled in automatically.
+function validateTransportFields(body) {
+  if (body.transport_kind === 'modbus_tcp') {
+    if (!body.host) { return 'Заполните поле "IP-адрес"'; }
+  } else {
+    if (!body.com) { return 'Заполните поле "COM-порт"'; }
+  }
+  return '';
+}
 
 function loadDevices() {
   var xhr = new XMLHttpRequest();
@@ -315,6 +397,7 @@ function editDevice(id) {
   document.getElementById('deviceFormTitle').innerText = 'Редактировать прибор: ' + id;
   document.getElementById('d_id').value = d.id;
   document.getElementById('d_id').disabled = true;
+  document.getElementById('d_id_display').innerText = d.id;
   document.getElementById('d_name').value = d.name;
   document.getElementById('d_kind').value = d.kind;
   document.getElementById('d_profile').value = d.profile;
@@ -327,6 +410,7 @@ function editDevice(id) {
   document.getElementById('d_stopbits').value = d.stopbits || '';
   document.getElementById('d_unit_id').value = d.unit_id || '';
   document.getElementById('d_timeout_ms').value = d.timeout_ms || '';
+  document.getElementById('d_retries').value = d.retries || '3';
   document.getElementById('d_current_poll_seconds').value = d.current_poll_seconds || '';
   document.getElementById('d_enabled').checked = !!d.enabled;
   onTransportKindChange();
@@ -338,19 +422,21 @@ function resetDeviceForm() {
   document.getElementById('deviceFormTitle').innerText = 'Добавить прибор';
   document.getElementById('d_id').value = '';
   document.getElementById('d_id').disabled = false;
+  document.getElementById('d_id_display').innerText = '—';
   document.getElementById('d_name').value = '';
   document.getElementById('d_kind').value = 'vkm360';
-  document.getElementById('d_profile').value = '';
+  document.getElementById('d_profile').value = 'profiles/vkm360.yaml';
   document.getElementById('d_transport_kind').value = 'modbus_tcp';
   document.getElementById('d_host').value = '';
-  document.getElementById('d_port').value = '';
+  document.getElementById('d_port').value = '502';
   document.getElementById('d_com').value = '';
-  document.getElementById('d_baudrate').value = '';
+  document.getElementById('d_baudrate').value = '9600';
   document.getElementById('d_parity').value = 'none';
-  document.getElementById('d_stopbits').value = '';
-  document.getElementById('d_unit_id').value = '';
-  document.getElementById('d_timeout_ms').value = '';
-  document.getElementById('d_current_poll_seconds').value = '';
+  document.getElementById('d_stopbits').value = '1';
+  document.getElementById('d_unit_id').value = '1';
+  document.getElementById('d_timeout_ms').value = '1000';
+  document.getElementById('d_retries').value = '3';
+  document.getElementById('d_current_poll_seconds').value = '3600';
   document.getElementById('d_enabled').checked = true;
   onTransportKindChange();
   document.getElementById('probeMsg').className = 'msg';
@@ -372,6 +458,7 @@ function currentDeviceFormAsJSON() {
     stopbits: intOrZero(document.getElementById('d_stopbits').value),
     timeout_ms: intOrZero(document.getElementById('d_timeout_ms').value),
     unit_id: intOrZero(document.getElementById('d_unit_id').value),
+    retries: intOrZero(document.getElementById('d_retries').value),
     current_poll_seconds: intOrZero(document.getElementById('d_current_poll_seconds').value),
     backfill_max_depth_hours: 0,
     gap_scan_window_hours: 0,
@@ -382,7 +469,9 @@ function currentDeviceFormAsJSON() {
 
 function saveDevice() {
   var body = currentDeviceFormAsJSON();
-  if (!body.id) { showMsg('deviceMsg', false, 'Поле ID обязательно'); return; }
+  if (!body.id) { showMsg('deviceMsg', false, 'Заполните поле "Название"'); return; }
+  var validationErr = validateTransportFields(body);
+  if (validationErr) { showMsg('deviceMsg', false, validationErr); return; }
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/devices', true);
   xhr.setRequestHeader('Content-Type', 'application/json');
@@ -415,6 +504,8 @@ function deleteDevice(id) {
 function probeDevice() {
   var body = currentDeviceFormAsJSON();
   document.getElementById('probeMsg').className = 'msg';
+  var validationErr = validateTransportFields(body);
+  if (validationErr) { showMsg('probeMsg', false, validationErr); return; }
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/devices/probe', true);
   xhr.setRequestHeader('Content-Type', 'application/json');

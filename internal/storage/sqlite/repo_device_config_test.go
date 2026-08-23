@@ -35,6 +35,7 @@ func TestUpsertGetListDevice(t *testing.T) {
 		Host:               "10.0.0.1",
 		Port:               502,
 		UnitID:             2,
+		Retries:            3,
 		CurrentPollSeconds: 3600,
 		ArchiveAtMinute:    -1, // unset sentinel
 		Enabled:            true,

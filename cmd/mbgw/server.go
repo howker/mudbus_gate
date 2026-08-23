@@ -263,6 +263,10 @@ func runServer() {
 			continue
 		}
 
+		retries := devRec.Retries
+		if retries <= 0 {
+			retries = 3 // matches devices table's DEFAULT and protocol/modbus/core.go's own fallback expectation
+		}
 		trParams := transport.Params{
 			Kind:            transport.Kind(devRec.TransportKind),
 			Host:            devRec.Host,
@@ -272,6 +276,7 @@ func runServer() {
 			Parity:          devRec.Parity,
 			StopBits:        devRec.StopBits,
 			ResponseTimeout: time.Duration(devRec.TimeoutMs) * time.Millisecond,
+			Retries:         retries,
 		}
 		tr, err := transport.New(trParams)
 		if err != nil {

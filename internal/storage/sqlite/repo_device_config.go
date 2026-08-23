@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS devices (
     stopbits                 INTEGER NOT NULL DEFAULT 1,
     timeout_ms               INTEGER NOT NULL DEFAULT 1000,
     unit_id                  INTEGER NOT NULL DEFAULT 1,
+    retries                  INTEGER NOT NULL DEFAULT 3,   -- see internal/protocol/modbus/core.go's
+                                                             -- Transact: retries with a fixed 200/400/800ms
+                                                             -- backoff between attempts (not itself configurable
+                                                             -- yet — see this column's doc note in DeviceRecord).
     current_poll_seconds     INTEGER NOT NULL DEFAULT 0,   -- 0 -> config.CurrentPollDefault
     backfill_max_depth_hours INTEGER NOT NULL DEFAULT 0,   -- 0 -> "variant В" (fill everything missing)
     gap_scan_window_hours    INTEGER NOT NULL DEFAULT 0,   -- 0 -> config.GapScanDefault
@@ -99,6 +103,17 @@ CREATE TABLE IF NOT EXISTS es_akron_northbound (
 	if err != nil {
 		return fmt.Errorf("init device config schema: %w", err)
 	}
+
+	// Lightweight migration for a devices table created before the
+	// `retries` column existed (e.g. a dev-machine mbgw_server.db from
+	// before 2026-08-23). CREATE TABLE IF NOT EXISTS above is a no-op on
+	// an already-existing table, so a column added later needs its own
+	// ALTER TABLE. The error is deliberately ignored: SQLite has no
+	// "ADD COLUMN IF NOT EXISTS", and the only way ALTER TABLE ADD COLUMN
+	// fails here is "duplicate column name" (harmless — means a fresh
+	// install's CREATE TABLE above already included it).
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN retries INTEGER NOT NULL DEFAULT 3`)
+
 	return nil
 }
 
@@ -121,6 +136,7 @@ type DeviceRecord struct {
 	StopBits              int
 	TimeoutMs             int
 	UnitID                int
+	Retries               int
 	CurrentPollSeconds    int
 	BackfillMaxDepthHours int
 	GapScanWindowHours    int
@@ -141,10 +157,10 @@ func (r *Repo) UpsertDevice(ctx context.Context, d DeviceRecord) error {
 	_, err := r.db.ExecContext(ctx, `
 INSERT INTO devices (
     id, name, kind, profile, transport_kind, host, port, com, baudrate,
-    parity, stopbits, timeout_ms, unit_id, current_poll_seconds,
+    parity, stopbits, timeout_ms, unit_id, retries, current_poll_seconds,
     backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
     enabled, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     name = excluded.name,
     kind = excluded.kind,
@@ -158,6 +174,7 @@ ON CONFLICT(id) DO UPDATE SET
     stopbits = excluded.stopbits,
     timeout_ms = excluded.timeout_ms,
     unit_id = excluded.unit_id,
+    retries = excluded.retries,
     current_poll_seconds = excluded.current_poll_seconds,
     backfill_max_depth_hours = excluded.backfill_max_depth_hours,
     gap_scan_window_hours = excluded.gap_scan_window_hours,
@@ -165,7 +182,7 @@ ON CONFLICT(id) DO UPDATE SET
     enabled = excluded.enabled,
     updated_at = excluded.updated_at
 `, d.ID, d.Name, d.Kind, d.Profile, d.TransportKind, d.Host, d.Port, d.COM,
-		d.Baudrate, d.Parity, d.StopBits, d.TimeoutMs, d.UnitID, d.CurrentPollSeconds,
+		d.Baudrate, d.Parity, d.StopBits, d.TimeoutMs, d.UnitID, d.Retries, d.CurrentPollSeconds,
 		d.BackfillMaxDepthHours, d.GapScanWindowHours, d.ArchiveAtMinute,
 		enabled, now, now)
 	if err != nil {
@@ -181,7 +198,7 @@ ON CONFLICT(id) DO UPDATE SET
 func (r *Repo) ListDevices(ctx context.Context) ([]DeviceRecord, error) {
 	rows, err := r.db.QueryContext(ctx, `
 SELECT id, name, kind, profile, transport_kind, host, port, com, baudrate,
-       parity, stopbits, timeout_ms, unit_id, current_poll_seconds,
+       parity, stopbits, timeout_ms, unit_id, retries, current_poll_seconds,
        backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
        enabled
 FROM devices ORDER BY id
@@ -197,7 +214,7 @@ FROM devices ORDER BY id
 		var enabled int
 		if err := rows.Scan(&d.ID, &d.Name, &d.Kind, &d.Profile, &d.TransportKind,
 			&d.Host, &d.Port, &d.COM, &d.Baudrate, &d.Parity, &d.StopBits,
-			&d.TimeoutMs, &d.UnitID, &d.CurrentPollSeconds, &d.BackfillMaxDepthHours,
+			&d.TimeoutMs, &d.UnitID, &d.Retries, &d.CurrentPollSeconds, &d.BackfillMaxDepthHours,
 			&d.GapScanWindowHours, &d.ArchiveAtMinute, &enabled); err != nil {
 			return nil, fmt.Errorf("scan device: %w", err)
 		}
@@ -214,13 +231,13 @@ func (r *Repo) GetDevice(ctx context.Context, id string) (DeviceRecord, bool, er
 	var enabled int
 	err := r.db.QueryRowContext(ctx, `
 SELECT id, name, kind, profile, transport_kind, host, port, com, baudrate,
-       parity, stopbits, timeout_ms, unit_id, current_poll_seconds,
+       parity, stopbits, timeout_ms, unit_id, retries, current_poll_seconds,
        backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
        enabled
 FROM devices WHERE id = ?
 `, id).Scan(&d.ID, &d.Name, &d.Kind, &d.Profile, &d.TransportKind,
 		&d.Host, &d.Port, &d.COM, &d.Baudrate, &d.Parity, &d.StopBits,
-		&d.TimeoutMs, &d.UnitID, &d.CurrentPollSeconds, &d.BackfillMaxDepthHours,
+		&d.TimeoutMs, &d.UnitID, &d.Retries, &d.CurrentPollSeconds, &d.BackfillMaxDepthHours,
 		&d.GapScanWindowHours, &d.ArchiveAtMinute, &enabled)
 	if err == sql.ErrNoRows {
 		return DeviceRecord{}, false, nil

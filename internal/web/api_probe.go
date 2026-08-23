@@ -111,6 +111,16 @@ func probeAkron(ctx context.Context, req probeRequest) probeResponse {
 		Parity:          req.Parity,
 		StopBits:        req.StopBits,
 		ResponseTimeout: time.Duration(timeoutMs) * time.Millisecond,
+		// Explicit, not left at Go's zero value: protocol/modbus.Transact
+		// reads maxAttempts from this field directly (see core.go) — an
+		// unset Retries could mean "zero attempts" depending on that
+		// loop's exact semantics, silently breaking every probe
+		// regardless of whether the device is actually reachable. A
+		// one-shot diagnostic probe doesn't need the operator's real
+		// configured retry count (that's for steady-state polling); a
+		// small fixed value here is simply "give it a fair chance to
+		// respond," not a setting worth exposing in the probe UI.
+		Retries: 3,
 	})
 	if err != nil {
 		return probeResponse{OK: false, Error: "не удалось создать транспорт: " + err.Error()}

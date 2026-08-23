@@ -47,6 +47,7 @@ type deviceJSON struct {
 	StopBits              int    `json:"stopbits"`
 	TimeoutMs             int    `json:"timeout_ms"`
 	UnitID                int    `json:"unit_id"`
+	Retries               int    `json:"retries"`
 	CurrentPollSeconds    int    `json:"current_poll_seconds"`
 	BackfillMaxDepthHours int    `json:"backfill_max_depth_hours"`
 	GapScanWindowHours    int    `json:"gap_scan_window_hours"`
@@ -59,7 +60,7 @@ func deviceToJSON(d sqliterepo.DeviceRecord) deviceJSON {
 		ID: d.ID, Name: d.Name, Kind: d.Kind, Profile: d.Profile,
 		TransportKind: d.TransportKind, Host: d.Host, Port: d.Port, COM: d.COM,
 		Baudrate: d.Baudrate, Parity: d.Parity, StopBits: d.StopBits,
-		TimeoutMs: d.TimeoutMs, UnitID: d.UnitID,
+		TimeoutMs: d.TimeoutMs, UnitID: d.UnitID, Retries: d.Retries,
 		CurrentPollSeconds: d.CurrentPollSeconds, BackfillMaxDepthHours: d.BackfillMaxDepthHours,
 		GapScanWindowHours: d.GapScanWindowHours, ArchiveAtMinute: d.ArchiveAtMinute,
 		Enabled: d.Enabled,
@@ -71,7 +72,7 @@ func deviceFromJSON(j deviceJSON) sqliterepo.DeviceRecord {
 		ID: j.ID, Name: j.Name, Kind: j.Kind, Profile: j.Profile,
 		TransportKind: j.TransportKind, Host: j.Host, Port: j.Port, COM: j.COM,
 		Baudrate: j.Baudrate, Parity: j.Parity, StopBits: j.StopBits,
-		TimeoutMs: j.TimeoutMs, UnitID: j.UnitID,
+		TimeoutMs: j.TimeoutMs, UnitID: j.UnitID, Retries: j.Retries,
 		CurrentPollSeconds: j.CurrentPollSeconds, BackfillMaxDepthHours: j.BackfillMaxDepthHours,
 		GapScanWindowHours: j.GapScanWindowHours, ArchiveAtMinute: j.ArchiveAtMinute,
 		Enabled: j.Enabled,
