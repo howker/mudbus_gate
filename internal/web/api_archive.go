@@ -287,6 +287,7 @@ func (s *Server) handleArchiveExport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filename := fmt.Sprintf("archive_%s.csv", resp.DeviceID)
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 	_, _ = w.Write([]byte{0xEF, 0xBB, 0xBF}) // UTF-8 BOM

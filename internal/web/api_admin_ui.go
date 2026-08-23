@@ -235,7 +235,14 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <div class="form-row"><label>Прибор</label>
         <select id="ak_device" onchange="loadAkronAddr()"></select>
       </div>
-      <div class="form-row"><label>Адрес (IP:порт)</label><input id="ak_addr" type="text" placeholder="127.0.0.1:15021"></div>
+      <div id="ak_status_configured" style="display:none;background:#1e3d1e;border:1px solid #2d5a2d;color:#4caf50;padding:10px;border-radius:4px;margin-bottom:15px;">
+        Адрес настроен: <span id="ak_status_addr"></span>
+      </div>
+      <div id="ak_status_not_configured" style="display:none;background:#3d1e1e;border:1px solid #5a2d2d;color:#f44336;padding:10px;border-radius:4px;margin-bottom:15px;">
+        Адрес ещё НЕ настроен — заполните поле ниже и нажмите «Сохранить».
+      </div>
+      <div class="form-row"><label>Адрес (IP:порт)</label><input id="ak_addr" type="text"></div>
+      <p class="small-note" style="margin-left:220px;margin-top:-8px;">например: 127.0.0.1:15021</p>
       <p><button class="btn" onclick="saveAkronAddr()">Сохранить</button></p>
       <div id="akronMsg" class="msg"></div>
     </div>
@@ -887,7 +894,12 @@ function loadAkronAddr() {
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
     var data = JSON.parse(xhr.responseText);
-    document.getElementById('ak_addr').value = data.listen_addr || '';
+    var addr = data.listen_addr || '';
+    document.getElementById('ak_addr').value = addr;
+    var configured = !!addr;
+    document.getElementById('ak_status_configured').style.display = configured ? 'block' : 'none';
+    document.getElementById('ak_status_not_configured').style.display = configured ? 'none' : 'block';
+    if (configured) { document.getElementById('ak_status_addr').innerText = addr; }
   };
   xhr.send();
 }

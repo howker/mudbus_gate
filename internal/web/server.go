@@ -139,6 +139,12 @@ func (s *Server) Rebind(newPort int) error {
 }
 
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
+	// Запрет кеширования — та же причина, что и в writeJSON
+	// (api_devices.go): без него браузер мог отдавать устаревший ответ
+	// на повторный запрос того же URL, что и объясняет жалобу на
+	// «несвежие» текущие данные (2026-08-23).
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Content-Type", "application/json")
 	deviceID := r.URL.Query().Get("device_id")
 	readings, _ := s.repo.GetLatestReadings(r.Context(), deviceID)

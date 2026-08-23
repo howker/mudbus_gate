@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -90,6 +91,19 @@ func deviceFromJSON(j deviceJSON) sqliterepo.DeviceRecord {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	// Запрет кеширования — ОБЯЗАТЕЛЕН для всех ответов API. Без него
+	// браузер может закешировать GET-запрос (например, к /api/archive с
+	// конкретными датами) и повторно отдать СТАРЫЙ ответ на идентичный
+	// запрос даже после того, как логика на сервере изменилась — именно
+	// это произошло 2026-08-23: запрос архива за «сегодня» уже
+	// выполнялся ДО фикса расчёта расхода, браузер закешировал старый
+	// (сырые показания) ответ и продолжал его отдавать; запрос за
+	// «неделю» с другими датами кеша не имел и показал уже исправленные
+	// данные. Раньше запрет кеша стоял только на HTML-странице /admin
+	// (см. handleAdminUI) — этого было недостаточно, кешируются и сами
+	// JSON-ответы API.
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
@@ -129,10 +143,12 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, `поле kind должно быть "vkm360" или "akron"`)
 			return
 		}
-		if existing, found, err := s.repo.GetDevice(r.Context(), j.ID); err != nil {
+		existing, existsAlready, err := s.repo.GetDevice(r.Context(), j.ID)
+		if err != nil {
 			writeError(w, http.StatusInternalServerError, "не удалось проверить существующий прибор: "+err.Error())
 			return
-		} else if found && !j.Overwrite {
+		}
+		if existsAlready && !j.Overwrite {
 			writeJSON(w, http.StatusConflict, map[string]string{
 				"error": fmt.Sprintf("прибор с ID %q уже существует (название: %q) — это другой прибор, а не редактирование; используйте другое название", j.ID, existing.Name),
 			})
@@ -154,6 +170,18 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 		if err := s.repo.UpsertDevice(r.Context(), deviceFromJSON(j)); err != nil {
 			writeError(w, http.StatusInternalServerError, "не удалось сохранить прибор: "+err.Error())
 			return
+		}
+		// Пересохранение УЖЕ существующего прибора чистит его старые
+		// текущие показания (readings_current) — иначе, если тип прибора
+		// (или профиль) когда-либо менялся, показания с прошлыми именами
+		// точек остаются висеть в базе рядом со свежими навсегда и
+		// показываются на экране вперемешку (см. doc-комментарий
+		// DeleteCurrentReadings). Для НОВОГО прибора чистить нечего —
+		// показаний ещё не было.
+		if existsAlready {
+			if err := s.repo.DeleteCurrentReadings(r.Context(), j.ID); err != nil {
+				log.Printf("[WEB] не удалось очистить старые показания прибора %s: %v\n", j.ID, err)
+			}
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 

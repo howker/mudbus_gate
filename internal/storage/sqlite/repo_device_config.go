@@ -262,6 +262,30 @@ func (r *Repo) DeleteDevice(ctx context.Context, id string) error {
 	if _, err := r.db.ExecContext(ctx, `DELETE FROM es_akron_northbound WHERE device_id = ?`, id); err != nil {
 		return fmt.Errorf("delete device akron northbound: %w", err)
 	}
+	if err := r.DeleteCurrentReadings(ctx, id); err != nil {
+		return fmt.Errorf("delete device current readings: %w", err)
+	}
+	return nil
+}
+
+// DeleteCurrentReadings удаляет ВСЕ текущие показания (readings_current)
+// для прибора — вызывается при удалении прибора, а также при сохранении
+// УЖЕ СУЩЕСТВУЮЩЕГО прибора через UI (см. handleDevices в api_devices.go).
+// Причина: readings_current хранит строки по (device_id, point_id,
+// instance) — если у прибора когда-либо менялся тип (например, ВКМ360 →
+// Akron), старые показания под именами точек предыдущего профиля (масса,
+// давление...) никуда не деваются сами по себе и остаются в базе рядом
+// со свежими показаниями нового профиля навсегда, показываясь на экране
+// «Текущие данные» вперемешку — реальный случай, воспроизведённый
+// 2026-08-23 (прибор был кратко сохранён как ВКМ, затем пересохранён как
+// Akron, старые показания массы/давления/температуры остались висеть).
+// history (readings_history) НЕ трогаем — это архив всех прошлых
+// опросов, его чистить не нужно и не должно.
+func (r *Repo) DeleteCurrentReadings(ctx context.Context, deviceID string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM readings_current WHERE device_id = ?`, deviceID)
+	if err != nil {
+		return fmt.Errorf("delete current readings: %w", err)
+	}
 	return nil
 }
 
