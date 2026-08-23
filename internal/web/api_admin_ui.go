@@ -28,6 +28,15 @@ import "net/http"
 //     reusing GET /api/current, so the operator doesn't need to flip
 //     between /admin and / to see both configuration and live data.
 func (s *Server) handleAdminUI(w http.ResponseWriter, r *http.Request) {
+	// No caching, ever — this page has been edited many times in one
+	// day during active development, and a stale cached copy (browser
+	// showing OLD JS logic while the operator believes they're testing
+	// the LATEST fix) is indistinguishable from a real bug without this
+	// header. Cheap to always set; the page is small and reads live data
+	// via XHR anyway, so there's no real performance cost to never
+	// caching the HTML shell itself.
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write([]byte(adminUIHTML))
 }
@@ -93,6 +102,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <button class="tab-btn" onclick="showTab('esconn')">Подключение к ЭС</button>
   <button class="tab-btn" onclick="showTab('akron')">Akron northbound</button>
   <button class="tab-btn" onclick="showTab('settings')">Настройки</button>
+  <button class="tab-btn" onclick="showTab('archive')">Архив</button>
   <button class="tab-btn" onclick="showTab('current')">Текущие данные</button>
 </div>
 
@@ -110,6 +120,11 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 
     <div class="section">
       <h3 id="deviceFormTitle">Добавить прибор</h3>
+      <div id="editWarning" style="display:none;background:#4d3800;border:1px solid #8a6d00;color:#ffd479;padding:10px;border-radius:4px;margin-bottom:15px;">
+        Вы редактируете СУЩЕСТВУЮЩИЙ прибор «<span id="editWarningName"></span>» (ID: <span id="editWarningID"></span>).
+        Сохранение изменит именно этот прибор, а не создаст новый.
+        <button class="btn secondary" style="margin-left:10px;" onclick="resetDeviceForm()">Отменить и создать новый</button>
+      </div>
       <div class="form-row"><label>Название</label><input id="d_name" type="text" onkeyup="autoFillID()"></div>
       <p class="small-note" style="margin-left:220px;margin-top:-8px;">ID: <span id="d_id_display">—</span> <input id="d_id" type="text" style="display:none;"></p>
       <div class="form-row"><label>Тип прибора</label>
@@ -221,8 +236,44 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
     <div class="section">
       <h3>Текущие данные</h3>
       <table>
-        <thead><tr><th>Device ID</th><th>Point ID</th><th>Instance</th><th>Value</th><th>Unit</th><th>Quality</th><th>Time</th></tr></thead>
+        <thead><tr><th>Прибор</th><th>Параметр</th><th>№</th><th>Значение</th><th>Ед.изм.</th><th>Статус</th><th>Время</th></tr></thead>
         <tbody id="currentData"><tr><td colspan="7">Загрузка...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ===================== АРХИВ ===================== -->
+  <div id="panel-archive" class="panel">
+    <div class="section">
+      <h3>Архив по прибору</h3>
+      <div class="form-row"><label>Прибор</label>
+        <select id="ar_device" onchange="onArchiveDeviceChange()"></select>
+      </div>
+      <div class="form-row"><label>Период</label>
+        <input id="ar_from" type="date" style="width:150px;">
+        &nbsp;—&nbsp;
+        <input id="ar_to" type="date" style="width:150px;">
+      </div>
+      <div class="form-row"><label></label>
+        <button class="btn secondary" onclick="setArchivePreset('today')">Сегодня</button>
+        <button class="btn secondary" onclick="setArchivePreset('week')">Неделя</button>
+        <button class="btn secondary" onclick="setArchivePreset('month')">Месяц</button>
+      </div>
+      <div class="form-row"><label>Группировка</label>
+        <select id="ar_granularity">
+          <option value="raw">Подробно (как хранится)</option>
+          <option value="daily">По суткам (сумма за день)</option>
+          <option value="monthly">По месяцам (сумма за месяц)</option>
+        </select>
+      </div>
+      <p>
+        <button class="btn" onclick="loadArchiveTable()">Показать</button>
+        <button class="btn secondary" onclick="exportArchiveCSV()">Выгрузить в Excel (CSV)</button>
+      </p>
+      <div id="archiveMsg" class="msg"></div>
+      <table>
+        <thead id="archiveTableHead"><tr><th>Период</th></tr></thead>
+        <tbody id="archiveTableBody"><tr><td>Выберите прибор и период, затем нажмите «Показать»</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -232,6 +283,11 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
     <div class="section">
       <h3>Настройки</h3>
       <div class="form-row"><label>Порт веб-интерфейса</label><input id="s_port" type="text" placeholder="8080"></div>
+      <div id="s_port_conflict" style="display:none;background:#4d3800;border:1px solid #8a6d00;color:#ffd479;padding:10px;border-radius:4px;margin-bottom:15px;">
+        Настроенный порт занят чем-то другим на сервере — сейчас реально работаете на порту <b id="s_port_actual"></b>.
+        Если порт <span id="s_port_configured_repeat"></span> занят постоянно, есть смысл сделать рабочий порт основным:
+        <button class="btn secondary" style="margin-left:10px;" onclick="adoptActualPort()">Использовать <span id="s_port_actual2"></span> как основной</button>
+      </div>
       <p class="small-note" id="s_port_note"></p>
       <div class="form-row"><label>Отладочный лог (подробные байты)</label><input id="s_debug" type="checkbox"></div>
       <p class="small-note">Включает подробный вывод сырых байт обмена с приборами в лог-файл — полезно при диагностике, но создаёт много лишних записей при обычной работе.</p>
@@ -245,6 +301,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 <script>
 var allDevices = [];
 var allProfiles = [];
+var editingOriginalKind = null; // set by editDevice(), cleared by resetDeviceForm() — used to warn if the operator changes "Тип прибора" while editing an EXISTING device (root cause of the 2026-08-23 incident: switching kind mid-edit silently repurposed one device's saved row into a different device).
 
 function loadProfiles() {
   var xhr = new XMLHttpRequest();
@@ -279,6 +336,7 @@ function showTab(name) {
   if (name === 'akron') { populateDeviceSelect('ak_device', 'akron'); }
   if (name === 'esconn') { loadESConnection(); }
   if (name === 'settings') { loadSettings(); }
+  if (name === 'archive') { populateDeviceSelect('ar_device', null); setArchivePreset('week'); }
 }
 
 function showMsg(elId, ok, text) {
@@ -289,6 +347,20 @@ function showMsg(elId, ok, text) {
 
 function onKindChange() {
   var kind = document.getElementById('d_kind').value;
+  var idField = document.getElementById('d_id');
+  // Confirm before changing the type of an EXISTING device mid-edit — this
+  // exact action (switch "Тип прибора" while editing a saved device) is
+  // what silently turned a saved Akron device into a ВКМ device sharing
+  // the same ID on 2026-08-23. A brand-new device (d_id not disabled) has
+  // nothing to lose here, so no confirmation is needed for it.
+  if (idField.disabled && editingOriginalKind && kind !== editingOriginalKind) {
+    var ok = confirm('Вы редактируете существующий прибор и меняете его тип с "' + editingOriginalKind +
+      '" на "' + kind + '". Это изменит СУЩЕСТВУЮЩИЙ прибор, а не создаст новый. Продолжить?');
+    if (!ok) {
+      document.getElementById('d_kind').value = editingOriginalKind;
+      return;
+    }
+  }
   var tk = document.getElementById('d_transport_kind');
   var profileEl = document.getElementById('d_profile');
   if (kind === 'vkm360') {
@@ -380,6 +452,101 @@ function validateTransportFields(body) {
   return '';
 }
 
+function onArchiveDeviceChange() {
+  // placeholder — reserved for future per-device defaults (e.g. auto-pick
+  // a sensible default period based on the device's own archive depth)
+}
+
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+function dateToInputValue(d) {
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+
+function setArchivePreset(preset) {
+  var to = new Date();
+  var from = new Date();
+  if (preset === 'today') {
+    // from stays = today
+  } else if (preset === 'week') {
+    from.setDate(from.getDate() - 7);
+  } else if (preset === 'month') {
+    from.setMonth(from.getMonth() - 1);
+  }
+  document.getElementById('ar_from').value = dateToInputValue(from);
+  document.getElementById('ar_to').value = dateToInputValue(to);
+}
+
+function archiveQueryString() {
+  var deviceId = document.getElementById('ar_device').value;
+  var from = document.getElementById('ar_from').value;
+  var to = document.getElementById('ar_to').value;
+  var granularity = document.getElementById('ar_granularity').value;
+  return 'device_id=' + encodeURIComponent(deviceId) +
+    '&from=' + encodeURIComponent(from) +
+    '&to=' + encodeURIComponent(to) +
+    '&granularity=' + encodeURIComponent(granularity);
+}
+
+function loadArchiveTable() {
+  var deviceId = document.getElementById('ar_device').value;
+  if (!deviceId) { showMsg('archiveMsg', false, 'Выберите прибор'); return; }
+  if (!document.getElementById('ar_from').value || !document.getElementById('ar_to').value) {
+    showMsg('archiveMsg', false, 'Укажите период (с и по)');
+    return;
+  }
+  document.getElementById('archiveMsg').className = 'msg';
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/archive?' + archiveQueryString(), true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    if (xhr.status !== 200) {
+      var err = 'HTTP ' + xhr.status;
+      try { err = JSON.parse(xhr.responseText).error; } catch (e) {}
+      showMsg('archiveMsg', false, 'Ошибка: ' + err);
+      return;
+    }
+    var data = JSON.parse(xhr.responseText);
+    renderArchiveTable(data);
+  };
+  xhr.send();
+}
+
+function renderArchiveTable(data) {
+  var headHtml = '<tr><th>Период</th>';
+  for (var i = 0; i < data.param_labels.length; i++) {
+    headHtml += '<th>' + data.param_labels[i] + '</th>';
+  }
+  headHtml += '</tr>';
+  document.getElementById('archiveTableHead').innerHTML = headHtml;
+
+  var bodyHtml = '';
+  if (!data.rows || data.rows.length === 0) {
+    bodyHtml = '<tr><td colspan="' + (data.params.length + 1) + '">Нет данных за выбранный период</td></tr>';
+  } else {
+    for (var r = 0; r < data.rows.length; r++) {
+      var row = data.rows[r];
+      bodyHtml += '<tr><td>' + row.period + '</td>';
+      for (var c = 0; c < data.params.length; c++) {
+        var v = row.values[data.params[c]];
+        bodyHtml += '<td>' + (v === undefined ? '' : v) + '</td>';
+      }
+      bodyHtml += '</tr>';
+    }
+  }
+  document.getElementById('archiveTableBody').innerHTML = bodyHtml;
+}
+
+function exportArchiveCSV() {
+  var deviceId = document.getElementById('ar_device').value;
+  if (!deviceId) { showMsg('archiveMsg', false, 'Выберите прибор'); return; }
+  if (!document.getElementById('ar_from').value || !document.getElementById('ar_to').value) {
+    showMsg('archiveMsg', false, 'Укажите период (с и по)');
+    return;
+  }
+  window.location = '/api/archive/export?' + archiveQueryString();
+}
+
 function loadDevices() {
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/api/devices', true);
@@ -416,6 +583,10 @@ function findDevice(id) {
 function editDevice(id) {
   var d = findDevice(id);
   if (!d) { return; }
+  editingOriginalKind = d.kind;
+  document.getElementById('editWarning').style.display = 'block';
+  document.getElementById('editWarningName').innerText = d.name;
+  document.getElementById('editWarningID').innerText = d.id;
   document.getElementById('deviceFormTitle').innerText = 'Редактировать прибор: ' + id;
   document.getElementById('d_id').value = d.id;
   document.getElementById('d_id').disabled = true;
@@ -441,6 +612,8 @@ function editDevice(id) {
 }
 
 function resetDeviceForm() {
+  editingOriginalKind = null;
+  document.getElementById('editWarning').style.display = 'none';
   document.getElementById('deviceFormTitle').innerText = 'Добавить прибор';
   document.getElementById('d_id').value = '';
   document.getElementById('d_id').disabled = false;
@@ -565,11 +738,10 @@ function populateDeviceSelect(selectId, kindFilter) {
   var sel = document.getElementById(selectId);
   var html = '';
   for (var i = 0; i < allDevices.length; i++) {
-    if (allDevices[i].kind === kindFilter) {
-      html += '<option value="' + allDevices[i].id + '">' + allDevices[i].name + ' (' + allDevices[i].id + ')</option>';
-    }
+    if (kindFilter && allDevices[i].kind !== kindFilter) { continue; }
+    html += '<option value="' + allDevices[i].id + '">' + allDevices[i].name + ' (' + allDevices[i].id + ')</option>';
   }
-  if (html === '') { html = '<option value="">— нет приборов типа ' + kindFilter + ' —</option>'; }
+  if (html === '') { html = '<option value="">— нет подходящих приборов —</option>'; }
   sel.innerHTML = html;
   if (selectId === 'ch_device') { loadChannels(); }
   if (selectId === 'ak_device') { loadAkronAddr(); }
@@ -713,9 +885,10 @@ function loadCurrentData() {
       var r = data[i];
       var t = r.Timestamp ? new Date(r.Timestamp).toLocaleTimeString('ru-RU') : '-';
       var qClass = r.Quality === 'VALID' ? 'status-good' : 'status-bad';
+      var qText = r.Quality === 'VALID' ? 'Достоверно' : 'Недостоверно';
       rows += '<tr><td>' + r.DeviceID + '</td><td>' + r.PointID + '</td><td>' + r.Instance +
         '</td><td>' + r.Value + '</td><td>' + r.Unit + '</td><td class="' + qClass + '">' +
-        r.Quality + '</td><td>' + t + '</td></tr>';
+        qText + '</td><td>' + t + '</td></tr>';
     }
     if (rows === '') { rows = '<tr><td colspan="7">Нет данных</td></tr>'; }
     document.getElementById('currentData').innerHTML = rows;
@@ -731,15 +904,27 @@ function loadSettings() {
     var s = JSON.parse(xhr.responseText);
     document.getElementById('s_port').value = s.configured_port || '';
     document.getElementById('s_debug').checked = !!s.debug_log_enabled;
-    var note = 'Настроенный порт: ' + s.configured_port + '.';
+
+    var conflictBox = document.getElementById('s_port_conflict');
     if (s.actual_port && s.actual_port !== s.configured_port) {
-      note += ' ВНИМАНИЕ: сервер сейчас фактически работает на порту ' + s.actual_port +
-        ' (настроенный порт был занят при запуске).';
+      document.getElementById('s_port_actual').innerText = s.actual_port;
+      document.getElementById('s_port_actual2').innerText = s.actual_port;
+      document.getElementById('s_port_configured_repeat').innerText = s.configured_port;
+      conflictBox.style.display = 'block';
+    } else {
+      conflictBox.style.display = 'none';
     }
-    note += ' Изменение вступит в силу после перезапуска mbgw server (или службы mbgw_service).';
+
+    var note = 'Изменение вступит в силу после перезапуска mbgw server (или службы mbgw_service).';
     document.getElementById('s_port_note').innerText = note;
   };
   xhr.send();
+}
+
+function adoptActualPort() {
+  var actual = document.getElementById('s_port_actual').innerText;
+  document.getElementById('s_port').value = actual;
+  showMsg('settingsMsg', true, 'Порт ' + actual + ' подставлен в поле — нажмите "Сохранить", чтобы закрепить его.');
 }
 
 function saveSettings() {
