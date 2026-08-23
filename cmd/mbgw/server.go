@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"syscall"
 	"time"
@@ -27,6 +28,38 @@ import (
 	"mbgw/internal/transport"
 	"mbgw/internal/web"
 )
+
+// nextToExe resolves a bare filename (e.g. "mbgw_server.db") to a path
+// next to the running executable, so every file this process creates
+// (database, log, web-address marker) lands in whatever folder the
+// operator installed the exe into — NOT wherever the process happened to
+// be started from. This matters specifically for the Windows Service
+// case: a service's working directory is not guaranteed to be the exe's
+// own folder, so relying on relative paths + cwd was fragile. If a
+// caller passes an ALREADY-absolute or already-directory-qualified path
+// (e.g. --db D:\somewhere\custom.db), that explicit choice is respected
+// as-is — this only fills in a directory for a bare filename.
+//
+// Practical effect: install mbgw_vkm.exe into its own folder (e.g.
+// C:\mbgw\), and every file it creates (mbgw_server.db, mbgw_server.log,
+// mbgw_web_address.txt) appears right there next to it — no scattered
+// files in C:\, no extra flags to remember, regardless of how the
+// process is launched (double-click, PowerShell from any directory, or
+// as a Windows Service).
+func nextToExe(name string) string {
+	if filepath.IsAbs(name) || filepath.Dir(name) != "." {
+		return name // caller gave an explicit path — leave it alone
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		return name // fall back to cwd-relative if we can't even find ourselves
+	}
+	exeDir, err := filepath.Abs(filepath.Dir(exePath))
+	if err != nil {
+		return name
+	}
+	return filepath.Join(exeDir, name)
+}
 
 // server is the target single-process command (T14 minimal-slice step 2):
 // ONE mbgw process that reads its device list from the DATABASE (not
@@ -53,12 +86,16 @@ import (
 //
 // Usage:
 //
+//	mbgw server
 //	mbgw server --db mbgw_server.db --port 8080
 //
-// --port is optional (default 8080) — override it if that port conflicts
-// with something else already running on the server (this exact machine
-// has previously hit a "bind: access forbidden" conflict on a different
-// port — see mbgw.log history — so this is not a hypothetical concern).
+// --db and --port are both optional (defaults: mbgw_server.db, port
+// 8080). A bare filename for --db (no directory) resolves next to the
+// executable (see nextToExe) — same for the log file and the
+// mbgw_web_address.txt marker this writes at startup. Practical effect:
+// install the exe into its OWN folder (e.g. C:\mbgw\, not C:\ directly)
+// and every file this process creates appears right there, regardless of
+// how it's launched.
 func runServer() {
 	dbPath := "mbgw_server.db"
 	// portFlagGiven distinguishes "--port was explicitly typed" from "not
@@ -84,7 +121,9 @@ func runServer() {
 		}
 	}
 
-	logFile, _ := os.OpenFile("mbgw_server.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	dbPath = nextToExe(dbPath)
+
+	logFile, _ := os.OpenFile(nextToExe("mbgw_server.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	defer logFile.Close()
 	multiWriter := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(multiWriter)
@@ -172,7 +211,7 @@ func runServer() {
 	// always answerable by opening ONE known file, regardless of whether
 	// this is the first run, a port-conflict fallback, or a deliberate
 	// port change from Settings.
-	addrFile := "mbgw_web_address.txt"
+	addrFile := nextToExe("mbgw_web_address.txt")
 	addrLine := fmt.Sprintf("http://127.0.0.1:%d/admin\n", webPort)
 	if err := os.WriteFile(addrFile, []byte(addrLine), 0644); err != nil {
 		log.Printf("[ERROR] не удалось записать %s: %v\n", addrFile, err)
