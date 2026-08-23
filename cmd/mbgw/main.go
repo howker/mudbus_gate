@@ -16,6 +16,8 @@ func main() {
 		run()
 	case "serve":
 		serve()
+	case "server":
+		runServer()
 	case "cli":
 		cli()
 	case "simulate":
@@ -42,6 +44,8 @@ func printHelp() {
 	fmt.Println("  run              Start the gateway server (southbound only)")
 	fmt.Println("  serve            Start southbound + northbound Akron carrier in one process")
 	fmt.Println("                   (needs northbound_akron: section in --config; see config.akron_real.yaml)")
+	fmt.Println("  server           Single-process server, device list + ES channels from the DB")
+	fmt.Println("                   (mbgw server --db mbgw_server.db) — replaces the 4-window setup")
 	fmt.Println("  cli              Run CLI command")
 	fmt.Println("  simulate         Run device simulator")
 	fmt.Println("  northbound       Start the northbound Modbus TCP slave")

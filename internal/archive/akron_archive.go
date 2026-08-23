@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
-	"log"
 
+	"mbgw/internal/dbg"
 	"mbgw/internal/protocol/akron"
 )
 
@@ -108,7 +108,7 @@ func (r *AkronArchiveReader) Read(ctx context.Context, sess ArchiveSession, tx T
 	// wire bytes the NEXT time it happens, instead of reasoning from the
 	// decoded value alone. Deliberately logs the readable request/response
 	// bytes only — no behavior change.
-	log.Printf("[akron_archive] запрос: kind=%s startIndex=%d count=%d pdu=%s\n",
+	dbg.Printf("[akron_archive] запрос: kind=%s startIndex=%d count=%d pdu=%s\n",
 		kind, startIndex, count, hex.EncodeToString(reqPDU))
 
 	respPDU, err := tx.Transact(ctx, reqPDU)
@@ -116,7 +116,7 @@ func (r *AkronArchiveReader) Read(ctx context.Context, sess ArchiveSession, tx T
 		return nil, err
 	}
 
-	log.Printf("[akron_archive] ответ: pdu=%s\n", hex.EncodeToString(respPDU))
+	dbg.Printf("[akron_archive] ответ: pdu=%s\n", hex.EncodeToString(respPDU))
 
 	_, data, err := akron.ParseResponsePDU(respPDU)
 	if err != nil {
@@ -139,7 +139,7 @@ func (r *AkronArchiveReader) Read(ctx context.Context, sess ArchiveSession, tx T
 		// next time a value like the 2026-08-21 22:00 anomaly (V≈2.19e6
 		// m3, ~15000x a normal hourly reading — physically impossible,
 		// confirmed by the operator) shows up.
-		log.Printf("[akron_archive] строка %d: raw=%s поля=%v\n", i, hex.EncodeToString(raw), fields)
+		dbg.Printf("[akron_archive] строка %d: raw=%s поля=%v\n", i, hex.EncodeToString(raw), fields)
 
 		records = append(records, ArchiveRecord{
 			Raw:    append([]byte(nil), raw...),

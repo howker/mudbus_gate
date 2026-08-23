@@ -8,11 +8,22 @@ import (
 	"net/http"
 	"time"
 
-	"mbgw/internal/storage"
+	sqliterepo "mbgw/internal/storage/sqlite"
 )
 
+// Server's repo field is *sqliterepo.Repo (a concrete type), not the
+// storage.Repo interface it used to hold. WHY: the device-config API
+// below (devices/channels/es-connection/akron-northbound) needs the new
+// methods added in repo_device_config.go (UpsertDevice, ListDevices,
+// SetVKMChannels, ...), which are NOT part of storage.Repo — and
+// storage.go is treated as a stable contract file here, not something to
+// widen casually. Every actual caller of NewServer (run.go, serve.go,
+// cmd/mbgw/server.go) already constructs a *sqliterepo.Repo via
+// sqliterepo.New(...) and was only passing it through the interface, so
+// this is a compile-compatible narrowing at the call sites — no caller
+// needs to change.
 type Server struct {
-	repo storage.Repo
+	repo *sqliterepo.Repo
 	port int
 	// onManualPoll, when set, is invoked by POST /api/poll — the
 	// dashboard's "Опросить сейчас" button and the equivalent curl call.
@@ -23,7 +34,7 @@ type Server struct {
 	onManualPoll func()
 }
 
-func NewServer(repo storage.Repo, port int) *Server {
+func NewServer(repo *sqliterepo.Repo, port int) *Server {
 	return &Server{repo: repo, port: port}
 }
 
@@ -38,6 +49,20 @@ func (s *Server) Start(ctx context.Context) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/current", s.handleAPI)
 	mux.HandleFunc("/api/poll", s.handlePoll)
+
+	// Device configuration API (T14 minimal slice, step 3). See
+	// api_devices.go for handler bodies — kept in a separate file so this
+	// file stays focused on the pre-existing diagnostic dashboard.
+	mux.HandleFunc("/api/devices", s.handleDevices)
+	mux.HandleFunc("/api/devices/delete", s.handleDeviceDelete)
+	mux.HandleFunc("/api/devices/probe", s.handleDeviceProbe)
+	mux.HandleFunc("/api/vkm-channels", s.handleVKMChannels)
+	mux.HandleFunc("/api/es-connection", s.handleESConnection)
+	mux.HandleFunc("/api/es-connection/test", s.handleESConnectionTest)
+	mux.HandleFunc("/api/akron-northbound", s.handleAkronNorthbound)
+	mux.HandleFunc("/api/settings", s.handleSettings)
+	mux.HandleFunc("/admin", s.handleAdminUI)
+
 	mux.HandleFunc("/", s.handleDashboard)
 
 	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
@@ -65,7 +90,7 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 
 // handlePoll triggers an immediate operator-requested poll (archive +
 // current) on all devices. Wired to the dashboard "Опросить сейчас" button
-// and callable directly, e.g. from PowerShell 2.0 on the ЭС server:
+// and callable directly, e.g. from PowerShell 2.0 on the сам server:
 //
 //	(New-Object System.Net.WebClient).UploadString('http://127.0.0.1:8080/api/poll','POST','')
 //
@@ -74,16 +99,16 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "используйте POST"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "только POST"})
 		return
 	}
 	if s.onManualPoll == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "ручной опрос не подключён в этом режиме"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "ручной опрос не подключён в этом режиме запуска"})
 		return
 	}
 	s.onManualPoll()
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "опрос запрошен (архив + текущие)"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "опрос запущен (результат появится через несколько секунд)"})
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -97,20 +122,12 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	// (Windows Server 2008 R2 / 2012, per FINAL_TRD.md section 2) only
 	// reliably ships Internet Explorer, which implements NEITHER the
 	// Fetch API NOR async/await (no IE version ever added them — this
-	// is a hard platform fact, not a version-specific quirk). The
-	// earlier version of this page used `async function` + `await
-	// fetch(...)`, which IE silently fails to even parse/run, so the
-	// page never got past "жидание данных..." despite the backend and
-	// database working correctly (confirmed live: the API returned
-	// valid JSON with real Akron readings via WebClient.DownloadString
-	// while the page showed nothing in IE).
-	//
+	// is a hard platform fact, not a version-specific quirk).
 	// Fix: plain ES5 — XMLHttpRequest instead of fetch, a callback
 	// instead of async/await, string concatenation instead of template
-	// literals (already the case before), `var` instead of
-	// let/const/arrow functions. This runs in IE8+ as well as every
-	// modern browser, so nothing is lost for operators who do have a
-	// modern browser available.
+	// literals, `var` instead of let/const/arrow functions. This runs in
+	// IE8+ as well as every modern browser, so nothing is lost for
+	// operators who do have a modern browser available.
 	fmt.Fprint(w, `<!DOCTYPE html>
 <html>
 <head>
@@ -140,7 +157,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 </p>
 <table>
 <thead><tr><th>Device ID</th><th>Point ID</th><th>Instance</th><th>Value</th><th>Unit</th><th>Quality</th><th>Time</th></tr></thead>
-<tbody id="data"><tr><td colspan="7" style="text-align: center; padding: 20px;">ожидание данных...</td></tr></tbody>
+<tbody id="data"><tr><td colspan="7" style="text-align: center; padding: 20px;">Загрузка данных...</td></tr></tbody>
 </table>
 <p class="time-text">Last Update: <span id="time">-</span></p>
 
@@ -151,7 +168,6 @@ function loadData() {
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
     if (xhr.status !== 200) {
-      // eslint-disable-next-line no-console
       if (window.console) { console.log('Fetch error: HTTP ' + xhr.status); }
       return;
     }
@@ -187,17 +203,17 @@ function pollNow() {
   var btn = document.getElementById('pollBtn');
   var status = document.getElementById('pollStatus');
   btn.disabled = true;
-  status.innerText = 'запрос отправлен...';
+  status.innerText = 'Опрос запущен...';
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/poll', true);
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
     btn.disabled = false;
     if (xhr.status === 200) {
-      status.innerText = 'опрос запрошен — данные появятся в таблице через несколько секунд';
+      status.innerText = 'Опрос запущен (данные обновятся через несколько секунд)';
       setTimeout(loadData, 4000);
     } else {
-      status.innerText = 'ошибка: HTTP ' + xhr.status;
+      status.innerText = 'Ошибка: HTTP ' + xhr.status;
     }
   };
   xhr.send('');

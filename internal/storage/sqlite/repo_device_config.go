@@ -1,0 +1,387 @@
+package sqlite
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+	"time"
+)
+
+// This file adds device/channel CONFIGURATION storage to Repo — separate
+// from repo_archive.go's DATA storage (archive_hourly, archive_vkm_raw).
+// It exists so the future Web UI (T14, minimal slice) has somewhere to
+// write "add a device" / "map ВКМ tag X to Энергосфера channel N" instead
+// of the operator hand-editing config.yaml/es_sync.txt on the server.
+//
+// Deliberately NOT the full FINAL_TRD §7 domain model (sites, device_
+// profiles, poll_schedules, users, roles, audit_log, ...) — that is a much
+// larger, currently-unimplemented contract (sql/schema.sql does not exist
+// in this repo). This is the minimal slice actually needed right now: one
+// devices table shared by both device kinds (vkm360/akron), plus two
+// kind-specific child tables for how each kind's data reaches Энергосфера
+// (see ADR: ВКМ writes directly into Энергосфера's SQL Server Mains table
+// via internal/integration; Akron is instead served upstream through a
+// device-emulating northbound carrier that Энергосфера's own driver
+// polls). Growing toward the full FINAL_TRD model later does not require
+// reworking this — it is additive, matching the same "queries live beside
+// the schema that answers them" pattern repo_archive.go already
+// established for archive_hourly/archive_vkm_raw.
+
+// InitDeviceConfigSchema creates the device-configuration tables. Call
+// once at startup, alongside InitSchema/InitArchiveSchema:
+//
+//	if err := repo.InitSchema(ctx); err != nil { ... }
+//	if err := repo.InitArchiveSchema(ctx); err != nil { ... }
+//	if err := repo.InitDeviceConfigSchema(ctx); err != nil { ... }
+func (r *Repo) InitDeviceConfigSchema(ctx context.Context) error {
+	_, err := r.db.ExecContext(ctx, `
+CREATE TABLE IF NOT EXISTS devices (
+    id                       TEXT PRIMARY KEY,
+    name                     TEXT NOT NULL DEFAULT '',
+    kind                     TEXT NOT NULL,              -- 'vkm360' | 'akron'
+    profile                  TEXT NOT NULL DEFAULT '',
+    transport_kind           TEXT NOT NULL DEFAULT '',   -- 'modbus_tcp' | 'rtu_serial' | 'tcp_serial'
+    host                     TEXT NOT NULL DEFAULT '',
+    port                     INTEGER NOT NULL DEFAULT 0,
+    com                      TEXT NOT NULL DEFAULT '',
+    baudrate                 INTEGER NOT NULL DEFAULT 0,
+    parity                   TEXT NOT NULL DEFAULT 'none',
+    stopbits                 INTEGER NOT NULL DEFAULT 1,
+    timeout_ms               INTEGER NOT NULL DEFAULT 1000,
+    unit_id                  INTEGER NOT NULL DEFAULT 1,
+    current_poll_seconds     INTEGER NOT NULL DEFAULT 0,   -- 0 -> config.CurrentPollDefault
+    backfill_max_depth_hours INTEGER NOT NULL DEFAULT 0,   -- 0 -> "variant В" (fill everything missing)
+    gap_scan_window_hours    INTEGER NOT NULL DEFAULT 0,   -- 0 -> config.GapScanDefault
+    archive_at_minute        INTEGER NOT NULL DEFAULT -1,  -- -1 sentinel = "unset" -> config.ArchiveAtMinuteDefault
+    enabled                  INTEGER NOT NULL DEFAULT 1,   -- 0/1: poll paused without deleting the device
+    created_at               DATETIME NOT NULL,
+    updated_at               DATETIME NOT NULL
+);
+
+-- Per-tag mapping of a ВКМ device's archive values into Энергосфера
+-- Mains channels — one row per (device, tag). Read by
+-- internal/integration/energosphere_sync.go instead of es_sync.txt's
+-- chan_heat/chan_mass/chan_temp/chan_pressure/factor_* keys.
+CREATE TABLE IF NOT EXISTS es_vkm_channels (
+    device_id     TEXT NOT NULL,
+    tag           TEXT NOT NULL,           -- 'ST' | 'S' | 'T' | 'Pi'
+    es_channel_id INTEGER NOT NULL,
+    factor        REAL NOT NULL DEFAULT 1.0,
+    PRIMARY KEY (device_id, tag)
+);
+
+-- Single-row table: the one Энергосфера SQL Server connection every
+-- ВКМ device's es_vkm_channels rows are written through. Not per-device
+-- because there is exactly one Энергосфера instance in this deployment
+-- (see FINAL_TRD's platform notes) — modeled as a table rather than a
+-- bare config value so it can be edited the same way (INSERT/UPDATE)
+-- as everything else here, and so a future multi-ЭС deployment has
+-- somewhere to grow into without a schema rewrite (add an id column and
+-- a fk from devices at that point — not needed now).
+CREATE TABLE IF NOT EXISTS es_connection (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),  -- enforces single row
+    sql_server    TEXT NOT NULL DEFAULT 'localhost',
+    sql_database  TEXT NOT NULL DEFAULT '',
+    sql_user      TEXT NOT NULL DEFAULT '',
+    sql_password  TEXT NOT NULL DEFAULT '',
+    sql_port      INTEGER NOT NULL DEFAULT 1433,
+    updated_at    DATETIME NOT NULL
+);
+
+-- Where an Akron device's northbound carrier listens for Энергосфера's
+-- own АКРОН-01-1 driver to connect (Raw TCP тип связи — see
+-- docs/M3_DISCOVERY_FINDINGS_akron.md). One row per akron device.
+CREATE TABLE IF NOT EXISTS es_akron_northbound (
+    device_id   TEXT PRIMARY KEY,
+    listen_addr TEXT NOT NULL  -- e.g. "127.0.0.1:15021"
+);
+`)
+	if err != nil {
+		return fmt.Errorf("init device config schema: %w", err)
+	}
+	return nil
+}
+
+// DeviceRecord is one row of the devices table — the DB-backed
+// replacement for config.DeviceConfig, minus the YAML tags. Field names
+// deliberately mirror DeviceConfig's so callers converting between the
+// two (see cmd/mbgw's future server command) stay a straight field-by-
+// field copy, not a reinterpretation.
+type DeviceRecord struct {
+	ID                    string
+	Name                  string
+	Kind                  string // "vkm360" | "akron"
+	Profile               string
+	TransportKind         string
+	Host                  string
+	Port                  int
+	COM                   string
+	Baudrate              int
+	Parity                string
+	StopBits              int
+	TimeoutMs             int
+	UnitID                int
+	CurrentPollSeconds    int
+	BackfillMaxDepthHours int
+	GapScanWindowHours    int
+	ArchiveAtMinute       int // -1 = unset, matches BackfillConfig.ArchiveAtMinute's *int nil sentinel
+	Enabled               bool
+}
+
+// UpsertDevice inserts or replaces a device by ID — the Web UI's "add/
+// edit device" form maps directly onto this (edit re-submits every field,
+// not a partial patch; simpler and sufficient for a single-operator admin
+// screen).
+func (r *Repo) UpsertDevice(ctx context.Context, d DeviceRecord) error {
+	now := time.Now()
+	enabled := 0
+	if d.Enabled {
+		enabled = 1
+	}
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO devices (
+    id, name, kind, profile, transport_kind, host, port, com, baudrate,
+    parity, stopbits, timeout_ms, unit_id, current_poll_seconds,
+    backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
+    enabled, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    name = excluded.name,
+    kind = excluded.kind,
+    profile = excluded.profile,
+    transport_kind = excluded.transport_kind,
+    host = excluded.host,
+    port = excluded.port,
+    com = excluded.com,
+    baudrate = excluded.baudrate,
+    parity = excluded.parity,
+    stopbits = excluded.stopbits,
+    timeout_ms = excluded.timeout_ms,
+    unit_id = excluded.unit_id,
+    current_poll_seconds = excluded.current_poll_seconds,
+    backfill_max_depth_hours = excluded.backfill_max_depth_hours,
+    gap_scan_window_hours = excluded.gap_scan_window_hours,
+    archive_at_minute = excluded.archive_at_minute,
+    enabled = excluded.enabled,
+    updated_at = excluded.updated_at
+`, d.ID, d.Name, d.Kind, d.Profile, d.TransportKind, d.Host, d.Port, d.COM,
+		d.Baudrate, d.Parity, d.StopBits, d.TimeoutMs, d.UnitID, d.CurrentPollSeconds,
+		d.BackfillMaxDepthHours, d.GapScanWindowHours, d.ArchiveAtMinute,
+		enabled, now, now)
+	if err != nil {
+		return fmt.Errorf("upsert device: %w", err)
+	}
+	return nil
+}
+
+// ListDevices returns every configured device, for the Web UI's device
+// list screen and for the future single-process server to build its
+// southbound poll set from at startup (replacing config.yaml's
+// Devices []DeviceConfig).
+func (r *Repo) ListDevices(ctx context.Context) ([]DeviceRecord, error) {
+	rows, err := r.db.QueryContext(ctx, `
+SELECT id, name, kind, profile, transport_kind, host, port, com, baudrate,
+       parity, stopbits, timeout_ms, unit_id, current_poll_seconds,
+       backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
+       enabled
+FROM devices ORDER BY id
+`)
+	if err != nil {
+		return nil, fmt.Errorf("list devices: %w", err)
+	}
+	defer rows.Close()
+
+	var out []DeviceRecord
+	for rows.Next() {
+		var d DeviceRecord
+		var enabled int
+		if err := rows.Scan(&d.ID, &d.Name, &d.Kind, &d.Profile, &d.TransportKind,
+			&d.Host, &d.Port, &d.COM, &d.Baudrate, &d.Parity, &d.StopBits,
+			&d.TimeoutMs, &d.UnitID, &d.CurrentPollSeconds, &d.BackfillMaxDepthHours,
+			&d.GapScanWindowHours, &d.ArchiveAtMinute, &enabled); err != nil {
+			return nil, fmt.Errorf("scan device: %w", err)
+		}
+		d.Enabled = enabled != 0
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// GetDevice returns one device by ID. found=false (nil error) if it
+// doesn't exist.
+func (r *Repo) GetDevice(ctx context.Context, id string) (DeviceRecord, bool, error) {
+	var d DeviceRecord
+	var enabled int
+	err := r.db.QueryRowContext(ctx, `
+SELECT id, name, kind, profile, transport_kind, host, port, com, baudrate,
+       parity, stopbits, timeout_ms, unit_id, current_poll_seconds,
+       backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
+       enabled
+FROM devices WHERE id = ?
+`, id).Scan(&d.ID, &d.Name, &d.Kind, &d.Profile, &d.TransportKind,
+		&d.Host, &d.Port, &d.COM, &d.Baudrate, &d.Parity, &d.StopBits,
+		&d.TimeoutMs, &d.UnitID, &d.CurrentPollSeconds, &d.BackfillMaxDepthHours,
+		&d.GapScanWindowHours, &d.ArchiveAtMinute, &enabled)
+	if err == sql.ErrNoRows {
+		return DeviceRecord{}, false, nil
+	}
+	if err != nil {
+		return DeviceRecord{}, false, fmt.Errorf("get device: %w", err)
+	}
+	d.Enabled = enabled != 0
+	return d, true, nil
+}
+
+// DeleteDevice removes a device and its channel mappings (both kinds —
+// harmless no-op deletes on whichever table doesn't apply to this
+// device's kind).
+func (r *Repo) DeleteDevice(ctx context.Context, id string) error {
+	if _, err := r.db.ExecContext(ctx, `DELETE FROM devices WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete device: %w", err)
+	}
+	if _, err := r.db.ExecContext(ctx, `DELETE FROM es_vkm_channels WHERE device_id = ?`, id); err != nil {
+		return fmt.Errorf("delete device vkm channels: %w", err)
+	}
+	if _, err := r.db.ExecContext(ctx, `DELETE FROM es_akron_northbound WHERE device_id = ?`, id); err != nil {
+		return fmt.Errorf("delete device akron northbound: %w", err)
+	}
+	return nil
+}
+
+// VKMChannelRecord is one tag->ЭС-channel mapping row.
+type VKMChannelRecord struct {
+	DeviceID    string
+	Tag         string // "ST" | "S" | "T" | "Pi"
+	ESChannelID int
+	Factor      float64
+}
+
+// SetVKMChannels replaces every channel mapping for a device in one call
+// (delete-then-insert inside a transaction) — the Web UI's "channels"
+// form submits the whole 4-row table for a device at once, not one tag
+// at a time, so this matches that shape instead of requiring 4 separate
+// upsert calls plus a separate "did the operator remove a row" diff.
+func (r *Repo) SetVKMChannels(ctx context.Context, deviceID string, rows []VKMChannelRecord) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("set vkm channels: begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM es_vkm_channels WHERE device_id = ?`, deviceID); err != nil {
+		return fmt.Errorf("set vkm channels: clear existing: %w", err)
+	}
+	for _, row := range rows {
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO es_vkm_channels (device_id, tag, es_channel_id, factor)
+VALUES (?, ?, ?, ?)
+`, deviceID, row.Tag, row.ESChannelID, row.Factor); err != nil {
+			return fmt.Errorf("set vkm channels: insert %s: %w", row.Tag, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("set vkm channels: commit: %w", err)
+	}
+	return nil
+}
+
+// GetVKMChannels returns the channel mappings configured for a device
+// (empty slice, not an error, if none are set yet).
+func (r *Repo) GetVKMChannels(ctx context.Context, deviceID string) ([]VKMChannelRecord, error) {
+	rows, err := r.db.QueryContext(ctx, `
+SELECT device_id, tag, es_channel_id, factor
+FROM es_vkm_channels WHERE device_id = ? ORDER BY tag
+`, deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("get vkm channels: %w", err)
+	}
+	defer rows.Close()
+
+	var out []VKMChannelRecord
+	for rows.Next() {
+		var v VKMChannelRecord
+		if err := rows.Scan(&v.DeviceID, &v.Tag, &v.ESChannelID, &v.Factor); err != nil {
+			return nil, fmt.Errorf("scan vkm channel: %w", err)
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// ESConnection holds the single Энергосфера SQL Server connection every
+// ВКМ device's channel mappings are written through.
+type ESConnection struct {
+	SQLServer   string
+	SQLDatabase string
+	SQLUser     string
+	SQLPassword string
+	SQLPort     int
+}
+
+// SetESConnection upserts the single connection row (id=1 always — see
+// the es_connection table's CHECK constraint).
+func (r *Repo) SetESConnection(ctx context.Context, c ESConnection) error {
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO es_connection (id, sql_server, sql_database, sql_user, sql_password, sql_port, updated_at)
+VALUES (1, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+    sql_server = excluded.sql_server,
+    sql_database = excluded.sql_database,
+    sql_user = excluded.sql_user,
+    sql_password = excluded.sql_password,
+    sql_port = excluded.sql_port,
+    updated_at = excluded.updated_at
+`, c.SQLServer, c.SQLDatabase, c.SQLUser, c.SQLPassword, c.SQLPort, time.Now())
+	if err != nil {
+		return fmt.Errorf("set es connection: %w", err)
+	}
+	return nil
+}
+
+// GetESConnection returns the configured connection. found=false (nil
+// error) if the operator hasn't set it up yet — the Web UI/server should
+// treat this as "ES sync not configured", not an error.
+func (r *Repo) GetESConnection(ctx context.Context) (ESConnection, bool, error) {
+	var c ESConnection
+	err := r.db.QueryRowContext(ctx, `
+SELECT sql_server, sql_database, sql_user, sql_password, sql_port
+FROM es_connection WHERE id = 1
+`).Scan(&c.SQLServer, &c.SQLDatabase, &c.SQLUser, &c.SQLPassword, &c.SQLPort)
+	if err == sql.ErrNoRows {
+		return ESConnection{}, false, nil
+	}
+	if err != nil {
+		return ESConnection{}, false, fmt.Errorf("get es connection: %w", err)
+	}
+	return c, true, nil
+}
+
+// SetAkronNorthboundAddr upserts the listen address an Akron device's
+// northbound carrier binds to.
+func (r *Repo) SetAkronNorthboundAddr(ctx context.Context, deviceID, listenAddr string) error {
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO es_akron_northbound (device_id, listen_addr)
+VALUES (?, ?)
+ON CONFLICT(device_id) DO UPDATE SET listen_addr = excluded.listen_addr
+`, deviceID, listenAddr)
+	if err != nil {
+		return fmt.Errorf("set akron northbound addr: %w", err)
+	}
+	return nil
+}
+
+// GetAkronNorthboundAddr returns the configured listen address.
+// found=false (nil error) if not set yet.
+func (r *Repo) GetAkronNorthboundAddr(ctx context.Context, deviceID string) (string, bool, error) {
+	var addr string
+	err := r.db.QueryRowContext(ctx, `
+SELECT listen_addr FROM es_akron_northbound WHERE device_id = ?
+`, deviceID).Scan(&addr)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("get akron northbound addr: %w", err)
+	}
+	return addr, true, nil
+}
