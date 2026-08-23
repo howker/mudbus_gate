@@ -814,6 +814,7 @@ function populateDeviceSelect(selectId, kindFilter) {
   sel.innerHTML = html;
   if (selectId === 'ch_device') { loadChannels(); }
   if (selectId === 'ak_device') { loadAkronAddr(); }
+  if (selectId === 'ar_device') { onArchiveDeviceChange(); }
 }
 
 function loadChannels() {
