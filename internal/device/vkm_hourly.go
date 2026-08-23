@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"mbgw/internal/archive"
+	"mbgw/internal/dbg"
 	"mbgw/internal/profile"
 	"mbgw/internal/storage"
 )
@@ -221,12 +222,15 @@ func (d *Device) backfillVKMHourly(ctx context.Context, a profile.Archive, opts 
 		return
 	}
 	if len(missing) == 0 {
-		log.Printf("[%s] VKM дозабор %s: пропусков в пределах %dч (%d периодов по 30 мин) нет\n",
+		// Тихо — это штатный, часто повторяющийся исход ("нечего
+		// добирать"), а не событие, интересное при обычной работе.
+		// Полная детализация доступна через dbg (отладочный лог).
+		dbg.Printf("[%s] VKM дозабор %s: пропусков в пределах %dч (%d периодов по 30 мин) нет\n",
 			d.ID, a.ID, depthHours, periodsCount)
 		return
 	}
 
-	log.Printf("[%s] VKM дозабор %s: старт, пропущено периодов: %d из %d (по одному запросу на получас — дороже, чем у Акрона, наберись терпения)\n",
+	log.Printf("[%s] VKM дозабор %s: старт, пропущено периодов: %d из %d\n",
 		d.ID, a.ID, len(missing), periodsCount)
 
 	periodsFilled := 0
@@ -248,7 +252,11 @@ func (d *Device) backfillVKMHourly(ctx context.Context, a profile.Archive, opts 
 		if saved > 0 {
 			periodsFilled++
 		}
-		log.Printf("[%s] VKM дозабор %s: период %s: сохранено полей: %d/%d\n",
+		// Построчный прогресс дозабора (до полусотни строк за один запуск)
+		// — это диагностическая детализация, не нужна при обычной работе,
+		// только итоговая сводка ниже. Полный построчный вывод доступен
+		// через отладочный лог (вкладка «Настройки» в /admin).
+		dbg.Printf("[%s] VKM дозабор %s: период %s: сохранено полей: %d/%d\n",
 			d.ID, a.ID, period.Format("02.01.2006 15:04"), saved, len(vkmHourlyParams))
 	}
 	log.Printf("[%s] VKM дозабор %s: готово, заполнено периодов: %d/%d\n", d.ID, a.ID, periodsFilled, len(missing))

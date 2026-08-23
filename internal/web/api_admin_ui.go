@@ -118,7 +118,9 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
           <option value="akron">Акрон</option>
         </select>
       </div>
-      <div class="form-row"><label>Путь к профилю</label><input id="d_profile" type="text" placeholder="profiles/acron-01.yaml"></div>
+      <div class="form-row"><label>Путь к профилю</label>
+        <select id="d_profile"></select>
+      </div>
       <div class="form-row"><label>Тип связи</label>
         <select id="d_transport_kind" onchange="onTransportKindChange()">
           <option value="modbus_tcp">TCP (modbus_tcp)</option>
@@ -242,6 +244,26 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 
 <script>
 var allDevices = [];
+var allProfiles = [];
+
+function loadProfiles() {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/profiles', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
+    allProfiles = JSON.parse(xhr.responseText) || [];
+    var sel = document.getElementById('d_profile');
+    var current = sel.value;
+    var html = '';
+    for (var i = 0; i < allProfiles.length; i++) {
+      html += '<option value="' + allProfiles[i] + '">' + allProfiles[i] + '</option>';
+    }
+    if (html === '') { html = '<option value="">— папка profiles/ пуста или не найдена —</option>'; }
+    sel.innerHTML = html;
+    if (current) { sel.value = current; } // preserve selection across a reload
+  };
+  xhr.send();
+}
 
 function showTab(name) {
   var panels = document.getElementsByClassName('panel');
@@ -463,13 +485,26 @@ function currentDeviceFormAsJSON() {
     backfill_max_depth_hours: 0,
     gap_scan_window_hours: 0,
     archive_at_minute: -1,
-    enabled: document.getElementById('d_enabled').checked
+    enabled: document.getElementById('d_enabled').checked,
+    overwrite: document.getElementById('d_id').disabled // true only when editing an existing device
   };
 }
 
 function saveDevice() {
   var body = currentDeviceFormAsJSON();
   if (!body.id) { showMsg('deviceMsg', false, 'Заполните поле "Название"'); return; }
+  // ID COLLISION GUARD (fix for 2026-08-23 incident: saving a VKM device
+  // silently overwrote an already-saved Akron device because both
+  // happened to auto-generate the same ID from similar names). Only
+  // applies when adding a NEW device (d_id not disabled) — editDevice()
+  // disables the field precisely because an EXISTING device's own ID is
+  // expected to match itself on save, that's not a collision.
+  var isNew = !document.getElementById('d_id').disabled;
+  if (isNew && findDevice(body.id)) {
+    showMsg('deviceMsg', false, 'Прибор с таким же ID ("' + body.id +
+      '") уже есть — измените "Название" так, чтобы оно отличалось (например, добавьте номер).');
+    return;
+  }
   var validationErr = validateTransportFields(body);
   if (validationErr) { showMsg('deviceMsg', false, validationErr); return; }
   var xhr = new XMLHttpRequest();
@@ -727,6 +762,7 @@ function saveSettings() {
 }
 
 loadDevices();
+loadProfiles();
 resetDeviceForm();
 </script>
 </body>

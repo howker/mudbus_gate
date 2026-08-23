@@ -61,6 +61,7 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/es-connection/test", s.handleESConnectionTest)
 	mux.HandleFunc("/api/akron-northbound", s.handleAkronNorthbound)
 	mux.HandleFunc("/api/settings", s.handleSettings)
+	mux.HandleFunc("/api/profiles", s.handleProfiles)
 	mux.HandleFunc("/admin", s.handleAdminUI)
 
 	mux.HandleFunc("/", s.handleDashboard)

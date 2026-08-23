@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -53,6 +54,15 @@ type deviceJSON struct {
 	GapScanWindowHours    int    `json:"gap_scan_window_hours"`
 	ArchiveAtMinute       int    `json:"archive_at_minute"` // -1 = unset/default
 	Enabled               bool   `json:"enabled"`
+	// Overwrite must be explicitly true to upsert over an ID that already
+	// exists. Defense in depth against the 2026-08-23 incident (saving a
+	// new device silently overwrote a different, already-saved one that
+	// happened to auto-generate the same ID from a similar name) — the
+	// Web UI already guards against this client-side (see saveDevice's
+	// isNew/findDevice check in api_admin_ui.go), but a client-side check
+	// alone can't catch a stale device list (e.g. two operators/tabs) or
+	// a direct API call bypassing the UI entirely.
+	Overwrite bool `json:"overwrite"`
 }
 
 func deviceToJSON(d sqliterepo.DeviceRecord) deviceJSON {
@@ -117,6 +127,15 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 		}
 		if j.Kind != "vkm360" && j.Kind != "akron" {
 			writeError(w, http.StatusBadRequest, `поле kind должно быть "vkm360" или "akron"`)
+			return
+		}
+		if existing, found, err := s.repo.GetDevice(r.Context(), j.ID); err != nil {
+			writeError(w, http.StatusInternalServerError, "не удалось проверить существующий прибор: "+err.Error())
+			return
+		} else if found && !j.Overwrite {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": fmt.Sprintf("прибор с ID %q уже существует (название: %q) — это другой прибор, а не редактирование; используйте другое название", j.ID, existing.Name),
+			})
 			return
 		}
 		if j.ArchiveAtMinute == 0 {
