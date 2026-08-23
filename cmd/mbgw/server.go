@@ -22,12 +22,63 @@ import (
 	"mbgw/internal/pollcore"
 	"mbgw/internal/poller"
 	"mbgw/internal/profile"
+	"mbgw/internal/protocol/akron"
 	"mbgw/internal/scheduler"
 	"mbgw/internal/session"
+	"mbgw/internal/storage"
 	sqliterepo "mbgw/internal/storage/sqlite"
 	"mbgw/internal/transport"
 	"mbgw/internal/web"
 )
+
+// collectAkronPassport делает один короткий обмен командой 101
+// (идентификация) через УЖЕ ОТКРЫТЫЙ транспорт прибора и сохраняет
+// результат (заводской номер, тип, версия прошивки) в БД как паспорт —
+// см. подробное объяснение в месте вызова, в основном цикле регистрации
+// приборов выше. Ошибка здесь НЕ прерывает запуск сервера и не мешает
+// опросу самого прибора (текущие значения/архив всё равно будут
+// работать) — только карьер для ЭС не сможет ответить на 101 без
+// паспорта, о чём и так будет видно по логу самого carrier'а.
+//
+// Формат версии прошивки: строка "мажор.минор" (например "3.7"), СТАРШИЙ
+// нибл байта = мажорная версия, младший = минорная — именно так, в
+// обратную сторону, её потом собирает akron_live.go при ответе ЭС
+// (firmwareToBCD: byte(maj<<4 | min)). Обычное BCD-разложение числа
+// (десятки+единицы через codec.DecodeBCDByte) здесь НЕ подходит — даёт
+// другое число (0x37 → «37», а не «3.7»), это не то же самое.
+func collectAkronPassport(ctx context.Context, repo *sqliterepo.Repo, deviceID string, reader *pollcore.Reader) {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	resp, err := reader.Transact(probeCtx, akron.BuildIdentificationPDU())
+	if err != nil {
+		log.Printf("[ERROR] прибор %s: не удалось получить паспорт (команда 101): %v\n", deviceID, err)
+		return
+	}
+	_, data, err := akron.ParseResponsePDU(resp)
+	if err != nil || len(data) < 6 {
+		log.Printf("[ERROR] прибор %s: не удалось разобрать ответ идентификации: %v\n", deviceID, err)
+		return
+	}
+
+	devType := data[0]
+	fwBCD := data[1]
+	firmware := fmt.Sprintf("%d.%d", fwBCD>>4, fwBCD&0x0F)
+	serial := uint32(data[2]) | uint32(data[3])<<8 | uint32(data[4])<<16 | uint32(data[5])<<24
+
+	err = repo.SaveDevicePassport(ctx, storage.DevicePassport{
+		DeviceID:   deviceID,
+		Serial:     serial,
+		DeviceType: devType,
+		Firmware:   firmware,
+		UpdatedAt:  time.Now(),
+	})
+	if err != nil {
+		log.Printf("[ERROR] прибор %s: не удалось сохранить паспорт: %v\n", deviceID, err)
+		return
+	}
+	log.Printf("[OK] прибор %s: паспорт собран (заводской №%d, тип=%d, прошивка=%s)\n", deviceID, serial, devType, firmware)
+}
 
 // nextToExe resolves a bare filename (e.g. "mbgw_server.db") to a path
 // next to the running executable, so every file this process creates
@@ -298,6 +349,23 @@ func runServer() {
 			unitID = 1
 		}
 		reader := pollcore.New(tr, isTCP, uint8(unitID))
+
+		// Сбор паспорта прибора (заводской номер, тип, версия прошивки) —
+		// ОБЯЗАТЕЛЬНЫЙ шаг для Akron перед запуском приёма данных для ЭС:
+		// northbound-эмулятор (internal/northbound/akron_live.go) отвечает
+		// на команду идентификации (101) ТОЛЬКО если паспорт уже сохранён
+		// в БД — иначе молча игнорирует запрос, и ЭС никогда не проходит
+		// дальше первого шага опроса (см. живой лог 2026-08-23: ЭС раз за
+		// разом шлёт 101, carrier печатает «паспорт ещё не собран — на 101
+		// молчим»). Раньше паспорт собирала отдельная ручная утилита
+		// (akronread --save-passport); в едином процессе server этот шаг
+		// нужно делать здесь, автоматически, при каждой регистрации
+		// Akron-прибора — используя уже открытый транспорт, без отдельного
+		// подключения.
+		if devRec.Kind == "akron" {
+			collectAkronPassport(ctx, repo, devRec.ID, reader)
+		}
+
 		dev := device.New(devRec.ID, p, reader, sess, repo, leaseMgr)
 		if devRec.GapScanWindowHours > 0 {
 			dev.GapScanWindowHours = devRec.GapScanWindowHours

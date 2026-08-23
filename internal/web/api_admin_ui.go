@@ -100,7 +100,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <button class="tab-btn active" onclick="showTab('devices')">Приборы</button>
   <button class="tab-btn" onclick="showTab('channels')">Каналы ЭС</button>
   <button class="tab-btn" onclick="showTab('esconn')">Подключение к ЭС</button>
-  <button class="tab-btn" onclick="showTab('akron')">Akron northbound</button>
+  <button class="tab-btn" onclick="showTab('akron')">Приём Акрона (ЭС)</button>
   <button class="tab-btn" onclick="showTab('settings')">Настройки</button>
   <button class="tab-btn" onclick="showTab('archive')">Архив</button>
   <button class="tab-btn" onclick="showTab('current')">Текущие данные</button>
@@ -230,12 +230,12 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <!-- ===================== AKRON NORTHBOUND ===================== -->
   <div id="panel-akron" class="panel">
     <div class="section">
-      <h3>Адрес отдачи данных для Akron (northbound)</h3>
+      <h3>Адрес приёма данных Акрона для Энергосферы</h3>
       <p class="small-note">ЭС сама подключается по этому адресу через свой драйвер АКРОН-01-1 (тип связи Raw TCP).</p>
       <div class="form-row"><label>Прибор</label>
         <select id="ak_device" onchange="loadAkronAddr()"></select>
       </div>
-      <div class="form-row"><label>Адрес (host:port)</label><input id="ak_addr" type="text" placeholder="127.0.0.1:15021"></div>
+      <div class="form-row"><label>Адрес (IP:порт)</label><input id="ak_addr" type="text" placeholder="127.0.0.1:15021"></div>
       <p><button class="btn" onclick="saveAkronAddr()">Сохранить</button></p>
       <div id="akronMsg" class="msg"></div>
     </div>
