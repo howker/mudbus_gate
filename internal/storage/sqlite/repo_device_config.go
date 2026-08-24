@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS es_connection (
     sql_user      TEXT NOT NULL DEFAULT '',
     sql_password  TEXT NOT NULL DEFAULT '',
     sql_port      INTEGER NOT NULL DEFAULT 1433,
+    time_shift_minutes INTEGER NOT NULL DEFAULT 0,  -- сдвиг метки времени при записи в Mains, см. ESConnection.TimeShiftMinutes
     updated_at    DATETIME NOT NULL
 );
 
@@ -114,6 +115,11 @@ CREATE TABLE IF NOT EXISTS es_akron_northbound (
 	// fails here is "duplicate column name" (harmless — means a fresh
 	// install's CREATE TABLE above already included it).
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN retries INTEGER NOT NULL DEFAULT 3`)
+
+	// Та же лёгкая миграция для es_connection, добавленного позже
+	// (сдвиг времени при записи в Mains) — ошибка "duplicate column
+	// name" на уже обновлённой базе безвредна и намеренно игнорируется.
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE es_connection ADD COLUMN time_shift_minutes INTEGER NOT NULL DEFAULT 0`)
 
 	return nil
 }
@@ -402,22 +408,40 @@ type ESConnection struct {
 	SQLUser     string
 	SQLPassword string
 	SQLPort     int
+	// TimeShiftMinutes — сдвиг метки времени (в минутах), который
+	// применяется к MeasureDate ПЕРЕД записью в Mains. Нужен потому, что
+	// Энергосфера раскладывает записи, попавшие в её таблицу напрямую, по
+	// своим строкам со сдвигом относительно того времени, что мы пишем
+	// (наблюдалось живьём, 2026-08-23: наша последняя точка за период
+	// 20:30 оказалась в строке отчёта ЭС за 22:00 — сдвиг в полтора часа).
+	// Точная причина на стороне ЭС не установлена (возможно, она хранит
+	// время в UTC и показывает с поправкой на свой часовой пояс UTC+4 —
+	// он указан в шапке отчётов её родного ПО), поэтому значение сделано
+	// НАСТРАИВАЕМЫМ, а не захардкоженным: оператор подбирает его по
+	// факту и меняет через UI без пересборки.
+	//
+	// ВАЖНО: этот сдвиг относится ТОЛЬКО к прямой записи в Mains (путь
+	// ВКМ). У Akron путь другой — ЭС сама забирает данные через
+	// эмуляцию прибора и раскладывает их по меткам из протокола, там
+	// сдвига не наблюдается и эта настройка не применяется.
+	TimeShiftMinutes int
 }
 
 // SetESConnection upserts the single connection row (id=1 always — see
 // the es_connection table's CHECK constraint).
 func (r *Repo) SetESConnection(ctx context.Context, c ESConnection) error {
 	_, err := r.db.ExecContext(ctx, `
-INSERT INTO es_connection (id, sql_server, sql_database, sql_user, sql_password, sql_port, updated_at)
-VALUES (1, ?, ?, ?, ?, ?, ?)
+INSERT INTO es_connection (id, sql_server, sql_database, sql_user, sql_password, sql_port, time_shift_minutes, updated_at)
+VALUES (1, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     sql_server = excluded.sql_server,
     sql_database = excluded.sql_database,
     sql_user = excluded.sql_user,
     sql_password = excluded.sql_password,
     sql_port = excluded.sql_port,
+    time_shift_minutes = excluded.time_shift_minutes,
     updated_at = excluded.updated_at
-`, c.SQLServer, c.SQLDatabase, c.SQLUser, c.SQLPassword, c.SQLPort, time.Now())
+`, c.SQLServer, c.SQLDatabase, c.SQLUser, c.SQLPassword, c.SQLPort, c.TimeShiftMinutes, time.Now())
 	if err != nil {
 		return fmt.Errorf("set es connection: %w", err)
 	}
@@ -430,9 +454,9 @@ ON CONFLICT(id) DO UPDATE SET
 func (r *Repo) GetESConnection(ctx context.Context) (ESConnection, bool, error) {
 	var c ESConnection
 	err := r.db.QueryRowContext(ctx, `
-SELECT sql_server, sql_database, sql_user, sql_password, sql_port
+SELECT sql_server, sql_database, sql_user, sql_password, sql_port, time_shift_minutes
 FROM es_connection WHERE id = 1
-`).Scan(&c.SQLServer, &c.SQLDatabase, &c.SQLUser, &c.SQLPassword, &c.SQLPort)
+`).Scan(&c.SQLServer, &c.SQLDatabase, &c.SQLUser, &c.SQLPassword, &c.SQLPort, &c.TimeShiftMinutes)
 	if err == sql.ErrNoRows {
 		return ESConnection{}, false, nil
 	}

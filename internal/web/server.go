@@ -82,6 +82,7 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/devices/delete", s.handleDeviceDelete)
 	mux.HandleFunc("/api/devices/probe", s.handleDeviceProbe)
 	mux.HandleFunc("/api/vkm-channels", s.handleVKMChannels)
+	mux.HandleFunc("/api/vkm-channels/check-history", s.handleCheckChannelHistory)
 	mux.HandleFunc("/api/es-connection", s.handleESConnection)
 	mux.HandleFunc("/api/es-connection/test", s.handleESConnectionTest)
 	mux.HandleFunc("/api/akron-northbound", s.handleAkronNorthbound)

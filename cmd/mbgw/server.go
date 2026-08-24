@@ -576,6 +576,10 @@ func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, d
 		SQLPort:     conn.SQLPort,
 		DeviceID:    deviceID,
 		Pipe:        1,
+		// Сдвиг метки времени при записи в Mains — берётся из настроек
+		// подключения к ЭС (вкладка «Подключение к ЭС» в /admin), см.
+		// ESConnection.TimeShiftMinutes.
+		TimeShiftMinutes: conn.TimeShiftMinutes,
 	}
 	for _, ch := range channels {
 		factor := ch.Factor

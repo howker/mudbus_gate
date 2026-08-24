@@ -219,6 +219,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <div class="form-row"><label>Логин</label><input id="es_user" type="text"></div>
       <div class="form-row"><label>Пароль</label><input id="es_password" type="password"></div>
       <div class="form-row"><label>Порт</label><input id="es_port" type="text" value="1433"></div>
+      <div class="form-row"><label>Сдвиг времени (минут)</label><input id="es_time_shift" type="text" value="0"></div>
+      <p class="small-note" style="margin-left:220px;margin-top:-8px;">Сдвигает метку времени при записи в ЭС. Нужен, если ЭС раскладывает наши записи по своим строкам со смещением (наблюдалось смещение на 1,5 часа = -90). 0 — без сдвига. Подбирается опытным путём: сравните час в ЭС с часом в родной программе прибора.</p>
       <p class="small-note" id="es_password_note"></p>
       <p>
         <button class="btn secondary" onclick="testESConnection()">Проверить подключение</button>
@@ -254,6 +256,11 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <div id="panel-current" class="panel">
     <div class="section">
       <h3>Текущие данные</h3>
+      <div class="form-row"><label>Прибор</label>
+        <select id="cur_device" onchange="loadCurrentData()">
+          <option value="">— все приборы —</option>
+        </select>
+      </div>
       <table>
         <thead><tr><th>Прибор</th><th>Параметр</th><th>№</th><th>Значение</th><th>Ед.изм.</th><th>Статус</th><th>Время</th></tr></thead>
         <tbody id="currentData"><tr><td colspan="7">Загрузка...</td></tr></tbody>
@@ -281,6 +288,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <div class="form-row"><label>Группировка</label>
         <select id="ar_granularity">
           <option value="raw">Подробно (как хранится)</option>
+          <option value="hourly">По часам (сумма за час)</option>
           <option value="daily">По суткам (сумма за день)</option>
           <option value="monthly">По месяцам (сумма за месяц)</option>
         </select>
@@ -363,7 +371,7 @@ function showTab(name) {
   for (var j = 0; j < btns.length; j++) { btns[j].className = 'tab-btn'; }
   event.target.className = 'tab-btn active';
 
-  if (name === 'current') { loadCurrentData(); }
+  if (name === 'current') { populateDeviceSelect('cur_device', null); loadCurrentData(); }
   if (name === 'channels') { populateDeviceSelect('ch_device', 'vkm360'); }
   if (name === 'akron') { populateDeviceSelect('ak_device', 'akron'); }
   if (name === 'esconn') { loadESConnection(); }
@@ -806,6 +814,7 @@ function probeDevice() {
 function populateDeviceSelect(selectId, kindFilter) {
   var sel = document.getElementById(selectId);
   var html = '';
+  if (selectId === 'cur_device') { html += '<option value="">— все приборы —</option>'; }
   for (var i = 0; i < allDevices.length; i++) {
     if (kindFilter && allDevices[i].kind !== kindFilter) { continue; }
     html += '<option value="' + allDevices[i].id + '">' + allDevices[i].name + ' (' + allDevices[i].id + ')</option>';
@@ -842,12 +851,67 @@ function saveChannels(force) {
   if (!deviceId) { showMsg('channelsMsg', false, 'Выберите прибор'); return; }
   var tags = ['ST', 'S', 'T', 'Pi'];
   var channels = [];
+  var channelIds = [];
   for (var i = 0; i < tags.length; i++) {
     var t = tags[i];
     var idVal = document.getElementById('ch_' + t + '_id').value;
     if (idVal === '') { continue; }
-    channels.push({ tag: t, es_channel_id: intOrZero(idVal), factor: floatOrOne(document.getElementById('ch_' + t + '_factor').value) });
+    var chId = intOrZero(idVal);
+    channels.push({ tag: t, es_channel_id: chId, factor: floatOrOne(document.getElementById('ch_' + t + '_factor').value) });
+    channelIds.push(chId);
   }
+
+  if (force) {
+    // проверка истории в ЭС уже пройдена (или пропущена оператором) на
+    // предыдущем шаге — идём сразу к сохранению
+    doSaveChannels(deviceId, channels, true);
+    return;
+  }
+
+  // Сначала спрашиваем САМУ ЭС, нет ли в этих каналах уже чужой истории
+  // (см. api_channel_check.go) — это ловит конфликт даже с точками,
+  // которые вообще не настроены у нас самих, в отличие от проверки
+  // внутри doSaveChannels (та знает только про наши собственные приборы).
+  document.getElementById('channelsMsg').className = 'msg';
+  var checkXhr = new XMLHttpRequest();
+  checkXhr.open('POST', '/api/vkm-channels/check-history', true);
+  checkXhr.setRequestHeader('Content-Type', 'application/json');
+  checkXhr.onreadystatechange = function() {
+    if (checkXhr.readyState !== 4) { return; }
+    var data = {};
+    try { data = JSON.parse(checkXhr.responseText); } catch (e) {}
+
+    if (checkXhr.status === 200 && data.checked === false) {
+      // проверка не смогла выполниться (например, подключение к ЭС не
+      // настроено) — не блокируем сохранение, просто предупреждаем
+      if (!confirm('Не удалось проверить каналы напрямую в ЭС (' + (data.reason || 'причина неизвестна') +
+        '). Продолжить сохранение без этой проверки?')) {
+        showMsg('channelsMsg', false, 'Сохранение отменено.');
+        return;
+      }
+      doSaveChannels(deviceId, channels, false);
+      return;
+    }
+
+    if (checkXhr.status === 200 && data.occupied && data.occupied.length > 0) {
+      var msg = 'ВНИМАНИЕ: в ЭС уже есть данные в этих каналах — похоже, они заняты другим прибором:\n';
+      for (var j = 0; j < data.occupied.length; j++) {
+        var o = data.occupied[j];
+        msg += '  канал ' + o.channel_id + ': ' + o.row_count + ' записей, с ' + o.oldest + ' по ' + o.newest + '\n';
+      }
+      msg += '\nСохранить всё равно? Это может испортить данные другого прибора в ЭС!';
+      if (!confirm(msg)) {
+        showMsg('channelsMsg', false, 'Сохранение отменено — номер канала совпадает с уже используемым в ЭС.');
+        return;
+      }
+    }
+
+    doSaveChannels(deviceId, channels, false);
+  };
+  checkXhr.send(JSON.stringify({ channel_ids: channelIds }));
+}
+
+function doSaveChannels(deviceId, channels, force) {
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/vkm-channels', true);
   xhr.setRequestHeader('Content-Type', 'application/json');
@@ -856,13 +920,13 @@ function saveChannels(force) {
     if (xhr.status === 200) {
       showMsg('channelsMsg', true, 'Каналы сохранены.');
     } else if (xhr.status === 409) {
-      // конфликт номеров каналов с другим прибором — показываем
+      // конфликт номеров каналов с ДРУГИМ НАШИМ прибором — показываем
       // предупреждение и даём явно подтвердить сохранение всё равно
       var data = {};
       try { data = JSON.parse(xhr.responseText); } catch (e) {}
       var msg = (data.error || 'Обнаружен конфликт каналов.') + ' Сохранить всё равно?';
       if (confirm(msg)) {
-        saveChannels(true);
+        doSaveChannels(deviceId, channels, true);
       } else {
         showMsg('channelsMsg', false, 'Сохранение отменено — исправьте номер канала.');
       }
@@ -890,6 +954,7 @@ function loadESConnection() {
     document.getElementById('es_database').value = c.sql_database || '';
     document.getElementById('es_user').value = c.sql_user || '';
     document.getElementById('es_port').value = c.sql_port || '1433';
+    document.getElementById('es_time_shift').value = (c.time_shift_minutes === undefined ? 0 : c.time_shift_minutes);
     document.getElementById('es_password_note').innerText = configured ?
       'Пароль уже сохранён (не показывается). Введите новый, только если хотите его изменить.' :
       'Пароль ещё не задан — введите его для сохранения.';
@@ -903,7 +968,8 @@ function esConnectionFormAsJSON() {
     sql_database: document.getElementById('es_database').value,
     sql_user: document.getElementById('es_user').value,
     sql_password: document.getElementById('es_password').value,
-    sql_port: intOrZero(document.getElementById('es_port').value)
+    sql_port: intOrZero(document.getElementById('es_port').value),
+    time_shift_minutes: intOrZero(document.getElementById('es_time_shift').value)
   };
 }
 
@@ -1000,8 +1066,11 @@ var pointLabels = {
 };
 
 function loadCurrentData() {
+  var deviceId = document.getElementById('cur_device').value;
+  var url = '/api/current';
+  if (deviceId) { url += '?device_id=' + encodeURIComponent(deviceId); }
   var xhr = new XMLHttpRequest();
-  xhr.open('GET', '/api/current', true);
+  xhr.open('GET', url, true);
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
     var data = JSON.parse(xhr.responseText) || [];

@@ -321,11 +321,12 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 // (the Web UI's connection form should treat "leave blank to keep
 // existing" as its own concern, not this API's — kept simple here).
 type esConnectionJSON struct {
-	SQLServer   string `json:"sql_server"`
-	SQLDatabase string `json:"sql_database"`
-	SQLUser     string `json:"sql_user"`
-	SQLPort     int    `json:"sql_port"`
-	PasswordSet bool   `json:"password_set"`
+	SQLServer        string `json:"sql_server"`
+	SQLDatabase      string `json:"sql_database"`
+	SQLUser          string `json:"sql_user"`
+	SQLPort          int    `json:"sql_port"`
+	PasswordSet      bool   `json:"password_set"`
+	TimeShiftMinutes int    `json:"time_shift_minutes"`
 }
 
 func (s *Server) handleESConnection(w http.ResponseWriter, r *http.Request) {
@@ -343,16 +344,18 @@ func (s *Server) handleESConnection(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, esConnectionJSON{
 			SQLServer: conn.SQLServer, SQLDatabase: conn.SQLDatabase,
 			SQLUser: conn.SQLUser, SQLPort: conn.SQLPort,
-			PasswordSet: conn.SQLPassword != "",
+			PasswordSet:      conn.SQLPassword != "",
+			TimeShiftMinutes: conn.TimeShiftMinutes,
 		})
 
 	case http.MethodPost:
 		var body struct {
-			SQLServer   string `json:"sql_server"`
-			SQLDatabase string `json:"sql_database"`
-			SQLUser     string `json:"sql_user"`
-			SQLPassword string `json:"sql_password"`
-			SQLPort     int    `json:"sql_port"`
+			SQLServer        string `json:"sql_server"`
+			SQLDatabase      string `json:"sql_database"`
+			SQLUser          string `json:"sql_user"`
+			SQLPassword      string `json:"sql_password"`
+			SQLPort          int    `json:"sql_port"`
+			TimeShiftMinutes int    `json:"time_shift_minutes"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, "некорректный JSON: "+err.Error())
@@ -369,6 +372,7 @@ func (s *Server) handleESConnection(w http.ResponseWriter, r *http.Request) {
 		err := s.repo.SetESConnection(r.Context(), sqliterepo.ESConnection{
 			SQLServer: body.SQLServer, SQLDatabase: body.SQLDatabase,
 			SQLUser: body.SQLUser, SQLPassword: body.SQLPassword, SQLPort: port,
+			TimeShiftMinutes: body.TimeShiftMinutes,
 		})
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "не удалось сохранить настройки подключения: "+err.Error())

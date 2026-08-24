@@ -90,6 +90,38 @@ func (w *MainsWriter) Ping(ctx context.Context) error {
 	return w.db.PingContext(ctx)
 }
 
+// CheckChannelHistory проверяет, есть ли УЖЕ данные в указанном канале
+// Mains — используется как защита от случайного назначения канала,
+// который на самом деле принадлежит СОВСЕМ ДРУГОЙ, посторонней точке ЭС
+// (не одному из наших приборов). В отличие от FindChannelConflicts
+// (repo_device_config.go), которая знает только про каналы, уже
+// настроенные У НАС САМИХ, — это спрашивает напрямую саму ЭС: если в
+// канале уже есть история (особенно давняя, старше того, как мы вообще
+// начали писать в эту базу) — почти наверняка канал занят чем-то чужим,
+// и наша запись туда испортит данные постороннего прибора. found=false
+// означает канал совершенно пустой, безопасен для использования.
+func (w *MainsWriter) CheckChannelHistory(ctx context.Context, channel int) (rowCount int, oldest, newest time.Time, found bool, err error) {
+	var minTS, maxTS sql.NullTime
+	err = w.db.QueryRowContext(ctx, fmt.Sprintf(`
+SELECT COUNT(*), MIN(MeasureDate), MAX(MeasureDate)
+FROM [%s].dbo.Mains WITH (NOLOCK)
+WHERE ID_Channel = @p1
+`, w.database), channel).Scan(&rowCount, &minTS, &maxTS)
+	if err != nil {
+		return 0, time.Time{}, time.Time{}, false, err
+	}
+	if rowCount == 0 {
+		return 0, time.Time{}, time.Time{}, false, nil
+	}
+	if minTS.Valid {
+		oldest = minTS.Time
+	}
+	if maxTS.Valid {
+		newest = maxTS.Time
+	}
+	return rowCount, oldest, newest, true, nil
+}
+
 // ListDatabases returns the non-system database names visible to this
 // connection — used by the Web UI's "Подключение к ЭС" test button to
 // offer a dropdown of real databases instead of the operator typing a

@@ -94,6 +94,14 @@ type Config struct {
 	IntervalSec   int
 	BackfillHours int
 	DryRun        bool
+
+	// TimeShiftMinutes — сдвиг метки времени (в минутах), применяемый к
+	// MeasureDate ПЕРЕД записью в Mains. Подробное объяснение, зачем это
+	// нужно и почему значение настраиваемое, а не захардкоженное — см.
+	// ESConnection.TimeShiftMinutes в internal/storage/sqlite/
+	// repo_device_config.go. 0 = без сдвига (поведение по умолчанию, как
+	// было до появления этой настройки).
+	TimeShiftMinutes int
 }
 
 func defaultConfig() Config {
@@ -182,6 +190,8 @@ func LoadConfig(path string) (Config, error) {
 			cfg.IntervalSec = atoiOr(val, cfg.IntervalSec)
 		case "backfill_hours":
 			cfg.BackfillHours = atoiOr(val, cfg.BackfillHours)
+		case "time_shift_minutes":
+			cfg.TimeShiftMinutes = atoiOr(val, cfg.TimeShiftMinutes)
 		case "dry_run":
 			cfg.DryRun = val == "1" || strings.EqualFold(val, "true") || strings.EqualFold(val, "yes")
 		}
@@ -304,6 +314,14 @@ func runEnergosphereSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer 
 
 	var inserted, skipped, failed int
 	for _, row := range rows {
+		// Сдвиг метки времени применяется ОДИН раз здесь, до всех
+		// дальнейших действий — так он гарантированно одинаков и в
+		// проверке существования точки, и в самой записи, и в строках
+		// лога (иначе легко получить рассинхрон: проверяем одно время,
+		// пишем другое). Зачем этот сдвиг вообще нужен — см.
+		// Config.TimeShiftMinutes.
+		esTime := row.TsHour.Add(time.Duration(cfg.TimeShiftMinutes) * time.Minute)
+
 		for _, t := range targets {
 			rawVal, ok := parseVKMTagFloat(row.RawString, t.tag)
 			if !ok {
@@ -311,10 +329,10 @@ func runEnergosphereSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer 
 			}
 			value := rawVal * t.factor
 
-			present, err := writer.PointExists(ctx, t.channel, row.TsHour)
+			present, err := writer.PointExists(ctx, t.channel, esTime)
 			if err != nil {
 				log.Printf("[es-sync] проверка наличия точки (%s ch=%d %s): %v\n",
-					t.label, t.channel, row.TsHour.Format("02.01 15:04"), err)
+					t.label, t.channel, esTime.Format("02.01 15:04"), err)
 				failed++
 				continue
 			}
@@ -325,19 +343,19 @@ func runEnergosphereSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer 
 
 			if cfg.DryRun {
 				log.Printf("[es-sync] DRY-RUN записал бы: %s ch=%d %s value=%g\n",
-					t.label, t.channel, row.TsHour.Format("02.01.2006 15:04"), value)
+					t.label, t.channel, esTime.Format("02.01.2006 15:04"), value)
 				inserted++
 				continue
 			}
 
 			// state=0 ("достоверно") hardcoded — see package doc's "KNOWN GAP".
-			if err := writer.InsertPoint(ctx, t.channel, row.TsHour, value, 0); err != nil {
+			if err := writer.InsertPoint(ctx, t.channel, esTime, value, 0); err != nil {
 				if IsDuplicateKeyError(err) {
 					skipped++
 					continue
 				}
 				log.Printf("[es-sync] запись (%s ch=%d %s): %v\n",
-					t.label, t.channel, row.TsHour.Format("02.01 15:04"), err)
+					t.label, t.channel, esTime.Format("02.01 15:04"), err)
 				failed++
 				continue
 			}

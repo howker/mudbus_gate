@@ -221,6 +221,13 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 // chronological order (no separate time parsing needed downstream).
 func formatPeriodLabel(t time.Time, granularity string) string {
 	switch granularity {
+	case "hourly":
+		// Округляем ВНИЗ до начала часа — так получасовки 00:00 и 00:30
+		// попадают в одну и ту же корзину "00:00" (для аддитивных
+		// параметров — S/ST у ВКМ — их значения там же ниже просто
+		// складываются, ровно как это делает родная программа учёта,
+		// показывающая по умолчанию часовые, не получасовые, суммы).
+		return t.Truncate(time.Hour).Format("2006-01-02 15:00")
 	case "daily":
 		return t.Format("2006-01-02")
 	case "monthly":
