@@ -166,6 +166,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <p><a href="#" onclick="toggleAdvanced(); return false;" style="color:#0e639c;font-size:13px;" id="advancedToggle">▸ Дополнительные настройки</a></p>
       <div id="advancedFields" style="display:none;">
         <div class="form-row"><label>Опрос текущих (сек)</label><input id="d_current_poll_seconds" type="text" value="3600"></div>
+        <div class="form-row"><label>Глубина дозабора при старте (часов)</label><input id="d_backfill_max_depth_hours" type="text" value="0"></div>
+        <p class="small-note">Сколько часов назад искать и добирать пропуски при каждом запуске сервера. 0 — использовать значение по умолчанию (24ч для ВКМ). Если сервер может простаивать дольше суток (плановое обслуживание и т.п.) — увеличьте, например до 72-96, чтобы пропуски добирались автоматически при следующем старте, без ручного «Принудительного переопроса».</p>
         <p class="small-note">Как часто опрашивать мгновенные показания (не архив). Раз в час обычно достаточно — этот шлюз собирает архив, не ведёт непрерывную телеметрию.</p>
       </div>
 
@@ -307,11 +309,11 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
     <div class="section" id="reloadSection" style="display:none;">
       <h3>Принудительный переопрос</h3>
       <p class="small-note">Заново спрашивает прибор за указанный период и ПЕРЕЗАПИСЫВАЕТ уже сохранённые данные — используйте, если в архиве обнаружено заведомо неверное значение (например, из-за помехи на линии связи). Обычный дозабор такое не исправляет, поскольку строка для этого периода уже существует.</p>
-      <div class="form-row"><label>Переопросить с</label>
-        <input id="rl_from" type="datetime-local">
+      <div class="form-row"><label>Переопросить с (дата)</label>
+        <input id="rl_from" type="date">
       </div>
-      <div class="form-row" id="rl_to_row"><label>По (только для ВКМ)</label>
-        <input id="rl_to" type="datetime-local">
+      <div class="form-row" id="rl_to_row"><label>По какую дату (только для ВКМ)</label>
+        <input id="rl_to" type="date">
       </div>
       <p><button class="btn danger" onclick="forceReload()">Переопросить принудительно</button></p>
       <div id="reloadMsg" class="msg"></div>
@@ -510,11 +512,20 @@ function onArchiveDeviceChange() {
 
 function forceReload() {
   var deviceId = document.getElementById('ar_device').value;
-  var fromVal = document.getElementById('rl_from').value; // формат из <input type=datetime-local>: ГГГГ-ММ-ДДTЧЧ:ММ
-  var toVal = document.getElementById('rl_to').value;
+  var fromDate = document.getElementById('rl_from').value; // ГГГГ-ММ-ДД, из календаря — так же, как поля периода на вкладке "Архив"
+  var toDate = document.getElementById('rl_to').value;
   if (!deviceId) { showMsg('reloadMsg', false, 'Выберите прибор'); return; }
-  if (!fromVal) { showMsg('reloadMsg', false, 'Укажите дату и время начала'); return; }
+  if (!fromDate) { showMsg('reloadMsg', false, 'Выберите дату начала в календаре'); return; }
   if (!confirm('Это ПЕРЕЗАПИШЕТ уже сохранённые данные архива за этот период данными, заново прочитанными с прибора. Продолжить?')) { return; }
+
+  // Время внутри дня выбирать не нужно — "с" всегда означает начало
+  // выбранных суток (00:00), "по" (только ВКМ) — конец выбранных суток
+  // (23:59). Раньше здесь было отдельное поле времени (datetime-local),
+  // но Internet Explorer — единственный браузер на прод-сервере — его
+  // не поддерживает вообще, ломая ввод; календарь без ручного набора
+  // часов/минут работает везде одинаково надёжно.
+  var fromVal = fromDate + 'T00:00';
+  var toVal = toDate ? (toDate + 'T23:59') : '';
 
   document.getElementById('reloadMsg').className = 'msg';
   var xhr = new XMLHttpRequest();
@@ -681,6 +692,7 @@ function editDevice(id) {
   document.getElementById('d_timeout_ms').value = d.timeout_ms || '';
   document.getElementById('d_retries').value = d.retries || '3';
   document.getElementById('d_current_poll_seconds').value = d.current_poll_seconds || '';
+  document.getElementById('d_backfill_max_depth_hours').value = d.backfill_max_depth_hours || '0';
   document.getElementById('d_enabled').checked = !!d.enabled;
   onTransportKindChange();
   showTab('devices');
@@ -708,6 +720,7 @@ function resetDeviceForm() {
   document.getElementById('d_timeout_ms').value = '1000';
   document.getElementById('d_retries').value = '3';
   document.getElementById('d_current_poll_seconds').value = '3600';
+  document.getElementById('d_backfill_max_depth_hours').value = '0';
   document.getElementById('d_enabled').checked = true;
   onTransportKindChange();
   document.getElementById('probeMsg').className = 'msg';
@@ -731,7 +744,7 @@ function currentDeviceFormAsJSON() {
     unit_id: intOrZero(document.getElementById('d_unit_id').value),
     retries: intOrZero(document.getElementById('d_retries').value),
     current_poll_seconds: intOrZero(document.getElementById('d_current_poll_seconds').value),
-    backfill_max_depth_hours: 0,
+    backfill_max_depth_hours: intOrZero(document.getElementById('d_backfill_max_depth_hours').value),
     gap_scan_window_hours: 0,
     archive_at_minute: -1,
     enabled: document.getElementById('d_enabled').checked,
