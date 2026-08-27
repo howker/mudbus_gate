@@ -238,7 +238,16 @@ type tagFactor struct {
 
 // RunEnergosphereSync opens both databases and loops every interval,
 // syncing the backfill window, until ctx is cancelled.
-func RunEnergosphereSync(ctx context.Context, sqlitePath string, cfg Config) error {
+// trigger, если не nil, позволяет вызывающему коду попросить сделать
+// ВНЕПЛАНОВЫЙ проход прямо сейчас, не дожидаясь обычного часового тикера
+// — используется кнопкой «Синхронизировать сейчас» и «Принудительным
+// переопросом» (чтобы данные появлялись в ЭС по ходу сбора, а не только
+// после полного завершения долгой операции — добавлено 2026-08-27).
+// Переиспользует уже открытые repo/writer того же цикла — не открывает
+// новое подключение к БД ЭС на каждый вызов. Буферизованный (размер 1) —
+// несколько быстрых подряд запросов сливаются в один внеплановый проход,
+// не накапливаются в очередь.
+func RunEnergosphereSync(ctx context.Context, sqlitePath string, cfg Config, trigger <-chan struct{}) error {
 	repo, err := sqliterepo.New(sqlitePath)
 	if err != nil {
 		return fmt.Errorf("open mbgw_vkm.db (%s): %w", sqlitePath, err)
@@ -294,6 +303,9 @@ func RunEnergosphereSync(ctx context.Context, sqlitePath string, cfg Config) err
 			log.Println("[es-sync] остановлен")
 			return nil
 		case <-ticker.C:
+			runEnergosphereSyncOnce(ctx, repo, writer, cfg, targets)
+		case <-trigger:
+			log.Println("[es-sync] внеплановая синхронизация по запросу")
 			runEnergosphereSyncOnce(ctx, repo, writer, cfg, targets)
 		}
 	}

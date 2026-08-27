@@ -47,7 +47,23 @@ type Server struct {
 	// длительной операции (добавлено 2026-08-27 — раньше оператор видел
 	// полную тишину на много минут без единого признака, что вообще
 	// происходит).
-	onForceReload func(deviceID string, from, to time.Time, onProgress func(done, total int)) (int, error)
+	onForceReload func(ctx context.Context, deviceID string, from, to time.Time, onProgress func(done, total int)) (int, error)
+
+	// onSyncNow, если задан, просит уже работающий цикл es-sync
+	// конкретного прибора сделать внеплановый проход немедленно — см.
+	// SetSyncNow. nil означает, что режим запуска не поддерживает
+	// (например, старый диагностический дашборд).
+	onSyncNow func(deviceID string) error
+
+	// baseCtx — долгоживущий контекст всего процесса (тот же, что
+	// передан в Start), от которого выводятся ОТМЕНЯЕМЫЕ дочерние
+	// контексты для отдельных фоновых переопросов (см. api_reload.go).
+	// НЕ используем context.Request() HTTP-запроса для этого — он
+	// обрывается сразу же, как только обработчик вернёт управление
+	// (а обработчик переопроса возвращает управление сразу, запустив
+	// работу в фоне), что мгновенно "отменяло" бы переопрос сразу после
+	// его запуска.
+	baseCtx context.Context
 
 	// reloadJobs хранит текущее состояние фоновых переопросов, по одному
 	// на прибор — POST /api/devices/reload-archive запускает переопрос в
@@ -79,6 +95,11 @@ type reloadJob struct {
 	Saved    int    `json:"saved"`
 	Finished bool   `json:"finished"`
 	Error    string `json:"error,omitempty"`
+
+	// cancel останавливает именно ЭТОТ переопрос (см. handleForceReload/
+	// handleReloadCancel в api_reload.go) — не экспортируется в JSON,
+	// нужен только внутри процесса.
+	cancel func()
 }
 
 // SetManualPoll wires the operator "poll now" action. Called by run.go /
@@ -92,12 +113,22 @@ func (s *Server) SetManualPoll(fn func()) {
 // архива — вызывается из cmd/mbgw/server.go после того, как приборы
 // созданы и открыты (см. runServer). Работает для обоих типов приборов
 // (Akron и ВКМ) — какой именно метод вызывать, решает сам callback по
-// типу конкретного прибора.
-func (s *Server) SetForceReload(fn func(deviceID string, from, to time.Time, onProgress func(done, total int)) (int, error)) {
+// типу конкретного прибора. Первый параметр колбэка — jobCtx, который
+// веб-слой создаёт заново на каждый запуск (см. handleForceReload) и
+// может отменить по запросу оператора.
+func (s *Server) SetForceReload(fn func(jobCtx context.Context, deviceID string, from, to time.Time, onProgress func(done, total int)) (int, error)) {
 	s.onForceReload = fn
 }
 
+// SetSyncNow подключает возможность попросить es-sync сделать внеплановый
+// проход прямо сейчас — используется кнопкой «Синхронизировать сейчас»
+// и «Принудительным переопросом» (добавлено 2026-08-27).
+func (s *Server) SetSyncNow(fn func(deviceID string) error) {
+	s.onSyncNow = fn
+}
+
 func (s *Server) Start(ctx context.Context) {
+	s.baseCtx = ctx
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/current", s.handleAPI)
 	mux.HandleFunc("/api/poll", s.handlePoll)
@@ -119,6 +150,8 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/archive/export", s.handleArchiveExport)
 	mux.HandleFunc("/api/devices/reload-archive", s.handleForceReload)
 	mux.HandleFunc("/api/devices/reload-progress", s.handleReloadProgress)
+	mux.HandleFunc("/api/devices/reload-cancel", s.handleReloadCancel)
+	mux.HandleFunc("/api/es-sync/trigger", s.handleSyncNow)
 	mux.HandleFunc("/admin", s.handleAdminUI)
 
 	mux.HandleFunc("/", s.handleDashboard)

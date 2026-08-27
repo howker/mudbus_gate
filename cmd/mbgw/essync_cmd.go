@@ -61,7 +61,13 @@ func runESSync() {
 	waitForShutdownSignal(cancel, "es-sync")
 
 	log.Printf("es-sync: старт, исходная БД %s, конфиг %s\n", dbPath, configPath)
-	if err := integration.RunEnergosphereSync(ctx, dbPath, cfg); err != nil {
+	// nil — в этом отдельном режиме запуска (устаревшая схема "четыре
+	// окна", без единого веб-сервера) нет ни кнопки "Синхронизировать
+	// сейчас", ни принудительного переопроса, которые могли бы попросить
+	// внеплановый проход — канал-триггер просто некому подключать. nil
+	// безопасен: select на nil-канале никогда не срабатывает, обычный
+	// тикер и ctx.Done() продолжают работать как раньше.
+	if err := integration.RunEnergosphereSync(ctx, dbPath, cfg, nil); err != nil {
 		log.Fatalf("[FATAL] es-sync: %v", err)
 	}
 }

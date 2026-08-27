@@ -284,6 +284,12 @@ func runServer() {
 	// решить, какой именно метод вызывать (ForceReloadAkronHourly или
 	// ForceReloadVKMHourly), сам *device.Device своего "типа" не хранит.
 	deviceKinds := make(map[string]string)
+	// esSyncTriggers хранит канал внепланового запуска es-sync для
+	// каждого прибора ВКМ (см. startESyncForDevice) — используется
+	// кнопкой «Синхронизировать сейчас» и «Принудительным переопросом»,
+	// чтобы новые данные появлялись в ЭС по ходу сбора, не дожидаясь
+	// обычного часового цикла (добавлено 2026-08-27).
+	esSyncTriggers := make(map[string]chan struct{})
 
 	// Devices come from the devices table (UpsertDevice/ListDevices,
 	// internal/storage/sqlite/repo_device_config.go) instead of
@@ -429,7 +435,9 @@ func runServer() {
 		case "akron":
 			startAkronNorthboundForDevice(ctx, repo, devRec.ID)
 		case "vkm360":
-			startESyncForDevice(ctx, repo, devRec.ID, dbPath)
+			if trigger := startESyncForDevice(ctx, repo, devRec.ID, dbPath); trigger != nil {
+				esSyncTriggers[devRec.ID] = trigger
+			}
 		}
 	}
 
@@ -450,7 +458,13 @@ func runServer() {
 	// указанным периодом, а не часть обычного расписания опроса. Работает
 	// для обоих типов приборов — какой метод вызвать, решаем по
 	// deviceKinds.
-	webServer.SetForceReload(func(deviceID string, from, to time.Time, onProgress func(done, total int)) (int, error) {
+	//
+	// Первый параметр — jobCtx, а не общий ctx процесса: веб-слой создаёт
+	// СВОЙ, отменяемый контекст на каждый запуск переопроса (см.
+	// api_reload.go), чтобы оператор мог прервать конкретный переопрос
+	// кнопкой «Отменить», не влияя на остальной процесс (добавлено
+	// 2026-08-27 — раньше общий ctx делал это в принципе невозможным).
+	webServer.SetForceReload(func(jobCtx context.Context, deviceID string, from, to time.Time, onProgress func(done, total int)) (int, error) {
 		dev, ok := devices[deviceID]
 		if !ok {
 			return 0, fmt.Errorf("прибор %s не найден среди работающих (сохранён ли он и запущен ли server?)", deviceID)
@@ -460,12 +474,30 @@ func runServer() {
 			deviceID, kind, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
 		switch kind {
 		case "akron":
-			return dev.ForceReloadAkronHourly(ctx, from, onProgress)
+			return dev.ForceReloadAkronHourly(jobCtx, from, onProgress)
 		case "vkm360":
-			return dev.ForceReloadVKMHourly(ctx, from, to, onProgress)
+			return dev.ForceReloadVKMHourly(jobCtx, from, to, onProgress)
 		default:
 			return 0, fmt.Errorf("принудительный переопрос не реализован для типа прибора %q", kind)
 		}
+	})
+
+	// «Синхронизировать сейчас» — просит уже работающий цикл es-sync
+	// конкретного прибора сделать внеплановый проход немедленно, не
+	// дожидаясь часового тикера (добавлено 2026-08-27). Неблокирующая
+	// отправка в буферизованный канал — если проход уже "заказан" и ещё
+	// не обработан, повторный клик просто ничего не делает, не копит
+	// очередь.
+	webServer.SetSyncNow(func(deviceID string) error {
+		trigger, ok := esSyncTriggers[deviceID]
+		if !ok {
+			return fmt.Errorf("для прибора %s es-sync не запущен (проверьте подключение к ЭС и каналы)", deviceID)
+		}
+		select {
+		case trigger <- struct{}{}:
+		default:
+		}
+		return nil
 	})
 
 	go webServer.Start(ctx)
@@ -565,25 +597,46 @@ func startAkronNorthboundForDevice(ctx context.Context, repo *sqliterepo.Repo, d
 // файл, путь к которому передаётся через --db при запуске — es-sync
 // обязан читать оттуда же, иначе получает "no such table: archive_vkm_raw"
 // (подтверждено живьём, 2026-08-23).
-func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, dbPath string) {
+// startESyncForDevice starts the ВКМ→Энергосфера direct-DB sync loop for
+// one device, IF the operator has configured both the SQL Server
+// connection (es_connection) AND at least one channel mapping
+// (es_vkm_channels) for it — same "opt-in, missing config = skip with a
+// log line, not a fatal error" principle as the Akron branch above.
+//
+// dbPath — путь к ЕДИНОЙ базе процесса server (та же, что открыта в
+// runServer как repo), а не отдельный "mbgw_vkm.db". Раньше здесь стоял
+// захардкоженный "mbgw_vkm.db" — рабочий путь в старой схеме "четыре
+// окна", где southbound ВКМ реально писал в отдельный файл с этим именем.
+// В единой базе server всё (включая archive_vkm_raw) пишется в ОДИН
+// файл, путь к которому передаётся через --db при запуске — es-sync
+// обязан читать оттуда же, иначе получает "no such table: archive_vkm_raw"
+// (подтверждено живьём, 2026-08-23).
+//
+// Возвращает канал-триггер внепланового прохода (см. RunEnergosphereSync)
+// — nil, если es-sync для этого прибора не запустился (не настроено
+// подключение/каналы). Вызывающий код регистрирует его в общей карте,
+// чтобы кнопка «Синхронизировать сейчас» и «Принудительный переопрос»
+// могли попросить внеплановый проход, не дожидаясь часового тикера
+// (добавлено 2026-08-27).
+func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, dbPath string) chan struct{} {
 	conn, found, err := repo.GetESConnection(ctx)
 	if err != nil {
 		log.Printf("[ERROR] прибор %s: ошибка чтения параметров подключения к БД ЭС: %v\n", deviceID, err)
-		return
+		return nil
 	}
 	if !found {
 		log.Printf("[INFO] прибор %s: подключение к БД ЭС не настроено — es-sync не запущен\n", deviceID)
-		return
+		return nil
 	}
 
 	channels, err := repo.GetVKMChannels(ctx, deviceID)
 	if err != nil {
 		log.Printf("[ERROR] прибор %s: ошибка чтения каналов ЭС: %v\n", deviceID, err)
-		return
+		return nil
 	}
 	if len(channels) == 0 {
 		log.Printf("[INFO] прибор %s: каналы ЭС не настроены — es-sync не запущен\n", deviceID)
-		return
+		return nil
 	}
 
 	cfg := integration.Config{
@@ -618,10 +671,12 @@ func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, d
 	cfg.IntervalSec = 60
 	cfg.BackfillHours = 168
 
+	trigger := make(chan struct{}, 1)
 	go func() {
 		log.Printf("[OK] es-sync для %s: старт (сервер БД ЭС=%s, база=%s)\n", deviceID, conn.SQLServer, conn.SQLDatabase)
-		if err := integration.RunEnergosphereSync(ctx, dbPath, cfg); err != nil {
+		if err := integration.RunEnergosphereSync(ctx, dbPath, cfg, trigger); err != nil {
 			log.Printf("[ERROR] es-sync %s: %v\n", deviceID, err)
 		}
 	}()
+	return trigger
 }

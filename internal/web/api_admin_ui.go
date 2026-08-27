@@ -205,7 +205,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <!-- ===================== ПОДКЛЮЧЕНИЕ К ЭС ===================== -->
   <div id="panel-esconn" class="panel">
     <div class="section">
-      <h3>Подключение к БД Энергосферы (SQL Server)</h3>
+      <h3>Подключение к БД Энергосферы (SQL Server) — для приборов с прямой записью в базу</h3>
       <div id="es_status_configured" style="display:none;background:#1e3d1e;border:1px solid #2d5a2d;color:#4caf50;padding:10px;border-radius:4px;margin-bottom:15px;">
         Подключение настроено (сервер: <span id="es_status_server"></span>, база: <span id="es_status_db"></span>).
       </div>
@@ -221,8 +221,9 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <div class="form-row"><label>Логин</label><input id="es_user" type="text"></div>
       <div class="form-row"><label>Пароль</label><input id="es_password" type="password"></div>
       <div class="form-row"><label>Порт</label><input id="es_port" type="text" value="1433"></div>
-      <div class="form-row"><label>Сдвиг времени (минут)</label><input id="es_time_shift" type="text" value="0"></div>
-      <p class="small-note" style="margin-left:220px;margin-top:-8px;">Сдвигает метку времени при записи в ЭС. Нужен, если ЭС раскладывает наши записи по своим строкам со смещением (наблюдалось смещение на 1,5 часа = -90). 0 — без сдвига. Подбирается опытным путём: сравните час в ЭС с часом в родной программе прибора.</p>
+      <div class="form-row"><label>Сдвиг времени для ВКМ (минут)</label><input id="es_time_shift" type="text" value="0"></div>
+      <p class="small-note" style="margin-left:220px;margin-top:-8px;color:#ffd479;">⚠ Касается ТОЛЬКО приборов, данные которых мы пишем НАПРЯМУЮ в эту базу (сейчас это ВКМ). Приборов, чьи данные ЭС забирает сама через эмуляцию (сейчас это Akron), это не касается вообще — у них нет нашей прямой записи, значит и сдвигать нечего. Если в будущем появится новый тип прибора — смотрите, каким способом он подключён: прямая запись в базу — сдвиг актуален; эмуляция прибора для ЭС — не актуален.</p>
+      <p class="small-note" style="margin-left:220px;margin-top:4px;">Сдвигает метку времени при записи данных ВКМ в базу ЭС. Нужен, потому что ЭС раскладывает такие прямые записи по своим строкам со смещением (наблюдалось смещение на 1,5 часа = -90). 0 — без сдвига. Подбирается опытным путём: сравните час в ЭС с часом в родной программе прибора.</p>
       <p class="small-note" id="es_password_note"></p>
       <p>
         <button class="btn secondary" onclick="testESConnection()">Проверить подключение</button>
@@ -230,6 +231,14 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       </p>
       <div id="esTestMsg" class="msg"></div>
       <div id="esSaveMsg" class="msg"></div>
+
+      <h3 style="margin-top:30px;">Внеплановая синхронизация</h3>
+      <p class="small-note">Обычно синхронизация с ЭС идёт раз в час сама. Если нужно отправить уже собранные данные немедленно, не дожидаясь этого часа — выберите прибор и нажмите кнопку.</p>
+      <div class="form-row"><label>Прибор</label>
+        <select id="sync_device"></select>
+      </div>
+      <p><button class="btn secondary" onclick="syncNow()">Синхронизировать сейчас</button></p>
+      <div id="syncNowMsg" class="msg"></div>
     </div>
   </div>
 
@@ -317,7 +326,10 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <input id="rl_to" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
         <select id="rl_to_h" style="width:55px;"></select>:<select id="rl_to_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
       </div>
-      <p><button class="btn danger" onclick="forceReload()">Переопросить принудительно</button></p>
+      <p>
+        <button class="btn danger" onclick="forceReload()">Переопросить принудительно</button>
+        <button class="btn secondary" id="reloadCancelBtn" style="display:none;" onclick="cancelReload()">Отменить</button>
+      </p>
       <div id="reloadMsg" class="msg"></div>
     </div>
   </div>
@@ -378,7 +390,7 @@ function showTab(name) {
   if (name === 'current') { populateDeviceSelect('cur_device', null); loadCurrentData(); }
   if (name === 'channels') { populateDeviceSelect('ch_device', 'vkm360'); }
   if (name === 'akron') { populateDeviceSelect('ak_device', 'akron'); }
-  if (name === 'esconn') { loadESConnection(); }
+  if (name === 'esconn') { loadESConnection(); populateDeviceSelect('sync_device', 'vkm360'); }
   if (name === 'settings') { loadSettings(); }
   if (name === 'archive') { populateDeviceSelect('ar_device', null); setArchivePreset('week'); }
 }
@@ -510,7 +522,39 @@ function onArchiveDeviceChange() {
   // верхнюю границу задать нельзя)
   var isVKM = !!(d && d.kind === 'vkm360');
   document.getElementById('rl_to_row').style.display = isVKM ? 'block' : 'none';
+
+  // Проверяем, не идёт ли УЖЕ переопрос для этого прибора — важно после
+  // обновления страницы (F5): сам переопрос на сервере продолжает
+  // работать независимо от браузера, но обычное состояние JS-переменных
+  // (currentReloadDeviceId и т.п.) при перезагрузке страницы стирается,
+  // и без этой проверки оператор увидел бы пустую форму, как будто
+  // ничего не происходит, хотя на сервере переопрос по-прежнему идёт
+  // (добавлено 2026-08-27, прямой вопрос).
+  if (showReload && deviceId) {
+    checkExistingReload(deviceId);
+  }
 }
+
+function checkExistingReload(deviceId) {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/devices/reload-progress?device_id=' + encodeURIComponent(deviceId), true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
+    var data;
+    try { data = JSON.parse(xhr.responseText); } catch (e) { return; }
+    if (data.found && !data.finished) {
+      // переопрос уже идёт (запущен раньше, страница была обновлена или
+      // открыта заново) — сразу возобновляем отображение прогресса,
+      // как будто мы его и запускали
+      currentReloadDeviceId = deviceId;
+      document.getElementById('reloadCancelBtn').style.display = 'inline-block';
+      pollReloadProgress(deviceId);
+    }
+  };
+  xhr.send();
+}
+
+var currentReloadDeviceId = null; // для кнопки «Отменить» — какой прибор сейчас переопрашивается
 
 function forceReload() {
   var deviceId = document.getElementById('ar_device').value;
@@ -545,6 +589,8 @@ function forceReload() {
     try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('reloadMsg', false, 'Ошибка ответа сервера'); return; }
     if (data.started) {
       showMsg('reloadMsg', true, 'Переопрос запущен, идёт сбор данных с прибора...');
+      currentReloadDeviceId = deviceId;
+      document.getElementById('reloadCancelBtn').style.display = 'inline-block';
       pollReloadProgress(deviceId);
     } else {
       showMsg('reloadMsg', false, 'Не удалось запустить переопрос');
@@ -553,11 +599,51 @@ function forceReload() {
   xhr.send(JSON.stringify({ device_id: deviceId, from: fromVal, to: toVal }));
 }
 
+// cancelReload прерывает уже запущенный переопрос — по прямому запросу
+// оператора должна быть возможность остановить долгую операцию (тысяча с
+// лишним периодов может идти больше часа), не дожидаясь конца, если что-то
+// выглядит не так (добавлено 2026-08-27).
+function cancelReload() {
+  if (!currentReloadDeviceId) { return; }
+  if (!confirm('Прервать переопрос? Уже собранные данные останутся, недостающие периоды нужно будет переопросить отдельно.')) { return; }
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/devices/reload-cancel', true);
+  xhr.setRequestHeader('Content-Type', 'application/json');
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    showMsg('reloadMsg', true, 'Отмена запрошена, завершение текущего периода...');
+  };
+  xhr.send(JSON.stringify({ device_id: currentReloadDeviceId }));
+}
+
 // pollReloadProgress опрашивает состояние фонового переопроса каждые 1.5
 // секунды и обновляет текст под кнопкой — оператор видит реальный прогресс
 // (обработано X из Y периодов) вместо полной тишины на много минут
 // (добавлено 2026-08-27 по прямому запросу — раньше было непонятно,
 // работает ли вообще что-то, или процесс завис).
+// syncNow — кнопка «Синхронизировать сейчас» на вкладке «Подключение к
+// ЭС» — просит уже работающий цикл es-sync конкретного прибора сделать
+// внеплановый проход немедленно (добавлено 2026-08-27).
+function syncNow() {
+  var deviceId = document.getElementById('sync_device').value;
+  if (!deviceId) { showMsg('syncNowMsg', false, 'Выберите прибор'); return; }
+  document.getElementById('syncNowMsg').className = 'msg';
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/es-sync/trigger', true);
+  xhr.setRequestHeader('Content-Type', 'application/json');
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    var data;
+    try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('syncNowMsg', false, 'Ошибка ответа сервера'); return; }
+    if (data.ok) {
+      showMsg('syncNowMsg', true, 'Синхронизация запрошена — проверьте ЭС через несколько секунд.');
+    } else {
+      showMsg('syncNowMsg', false, 'Ошибка: ' + (data.error || 'неизвестная'));
+    }
+  };
+  xhr.send(JSON.stringify({ device_id: deviceId }));
+}
+
 function pollReloadProgress(deviceId) {
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/api/devices/reload-progress?device_id=' + encodeURIComponent(deviceId), true);
@@ -569,10 +655,13 @@ function pollReloadProgress(deviceId) {
 
     if (!data.finished) {
       var pct = data.total > 0 ? Math.round(100 * data.done / data.total) : 0;
-      showMsg('reloadMsg', true, 'Идёт переопрос: обработано ' + data.done + ' из ' + data.total + ' периодов (' + pct + '%)...');
+      showMsg('reloadMsg', true, 'Идёт переопрос: обработано ' + data.done + ' из ' + data.total + ' периодов (' + pct + '%). Данные постепенно появляются в ЭС по ходу сбора...');
       setTimeout(function() { pollReloadProgress(deviceId); }, 1500);
       return;
     }
+
+    document.getElementById('reloadCancelBtn').style.display = 'none';
+    currentReloadDeviceId = null;
 
     if (data.error) {
       showMsg('reloadMsg', false, 'Завершено с ошибкой: ' + data.error + ' (успело перезаписать записей: ' + data.saved + ')');
