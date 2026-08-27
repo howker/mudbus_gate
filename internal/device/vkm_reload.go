@@ -22,6 +22,15 @@ import (
 // существующую строку) — обычный дозабор (backfillVKMHourly) просто
 // заранее ОТФИЛЬТРОВЫВАЕТ периоды, для которых строка уже есть, эта же
 // функция намеренно идёт по ВСЕМ периодам диапазона без такого фильтра.
+// hourlyArchiveDeleter — узкий локальный интерфейс с одним методом,
+// который умеет только *sqliterepo.Repo (см. internal/storage/sqlite/
+// repo_archive_range.go, DeleteHourlyArchiveRange). Тот же приём, что
+// prevValueChecker в akron_hourly.go — не расширяем общий storage.Repo
+// ради одного метода, полагаемся на приведение типа во время выполнения.
+type hourlyArchiveDeleter interface {
+	DeleteHourlyArchiveRange(ctx context.Context, deviceID, channel, param string, from, to time.Time) (int64, error)
+}
+
 func (d *Device) ForceReloadVKMHourly(ctx context.Context, from, to time.Time) (int, error) {
 	var a profile.Archive
 	found := false
@@ -35,6 +44,29 @@ func (d *Device) ForceReloadVKMHourly(ctx context.Context, from, to time.Time) (
 	}
 	if !found {
 		return 0, fmt.Errorf("у прибора %s нет архива ВКМ в профиле", d.ID)
+	}
+
+	// Удаляем всё, что уже есть в базе за диапазон, ПЕРЕД повторным
+	// сбором — иначе, если старые строки размечены другим соглашением
+	// (например, старым "начало периода" вместо нынешнего "конец
+	// периода" — см. подробности в vkm_hourly.go, фикс 2026-08-27), их
+	// метки не совпадут с новыми, и они останутся висеть в базе рядом со
+	// свежими, никем не замеченные. Берём диапазон с запасом в один
+	// период в обе стороны — гарантированно захватывает и старую, и
+	// новую разметку границ. Если repo не поддерживает удаление (узкая
+	// заглушка в тестах) — переопрос честно завершается ошибкой, а не
+	// тихо продолжает без очистки: молчаливо оставить дубликаты хуже,
+	// чем явно сообщить, что не смогли почистить.
+	if deleter, ok := d.Repo.(hourlyArchiveDeleter); ok {
+		deleteFrom := from.Add(-vkmArchivePeriod)
+		deleteTo := to.Add(vkmArchivePeriod)
+		for _, param := range vkmHourlyParams {
+			if _, err := deleter.DeleteHourlyArchiveRange(ctx, d.ID, "", param, deleteFrom, deleteTo); err != nil {
+				return 0, fmt.Errorf("очистка старых записей (%s) перед переопросом: %w", param, err)
+			}
+		}
+	} else {
+		return 0, fmt.Errorf("хранилище не поддерживает очистку перед переопросом (внутренняя ошибка)")
 	}
 
 	periodStart := from.Truncate(vkmArchivePeriod)

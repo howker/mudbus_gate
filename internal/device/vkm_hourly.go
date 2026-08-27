@@ -15,7 +15,7 @@ import (
 
 // vkmArchivePeriod — длина одного периода сбора архива ВКМ. Подтверждено
 // живым захватом (2026-08-02, vkm_live.jsonl): реальный драйвер ЭС (УВП-280)
-// запрашивает архив ИМЕННО получасовыми окнами (например 19:00:00-19:30:00),
+// Р·Р°РїСЂР°С€РёРІР°РµС‚ Р°СЂС…РёРІ РРњР•РќРќРћ РїРѕР»СѓС‡Р°СЃРѕРІС‹РјРё РѕРєРЅР°РјРё (РЅР°РїСЂРёРјРµСЂ 19:00:00-19:30:00),
 // а не часовыми — этот параметр в самой ЭС не настраивается, так жёстко
 // сделан драйвер. Раньше здесь был час (по аналогии с Акроном) — из-за
 // этого ЭС получала строку с Time=...19:00-20:00, не совпадающую с тем,
@@ -42,16 +42,28 @@ const vkmDefaultBackfillDepthHours = 24
 var vkmHourlyParams = []string{"S", "ST"}
 
 // persistVKMHourly сохраняет vkmHourlyParams из одного результата архива
-// ВКМ как строки archive_hourly, привязанные к periodStart (начало периода,
-// который реально покрывало окно From/To запроса — не time.Now(), так как
-// дозабираемый период всегда в прошлом).
-func persistVKMHourly(ctx context.Context, d *Device, periodStart time.Time, rec archive.ArchiveRecord) int {
+// ВКМ как строки archive_hourly, привязанные к periodLabel — МЕТКЕ
+// КОНЦА периода (например, для окна [09:30, 10:00) метка — 10:00), а не
+// его началу.
+//
+// ВАЖНО (исправлено 2026-08-27): раньше здесь передавалось начало
+// периода (periodStart) — то есть то же самое окно, что у Akron
+// подписывается концом (10:00), у ВКМ подписывалось началом (9:30).
+// Внешне это выглядело как "данные опаздывают на полчаса-час": оператор,
+// сверяя с родным ПО прибора (там строки подписаны концом интервала —
+// "09:00-10:00"), видел в нашей системе/в ЭС последнюю точку под меткой
+// "9:30" вместо ожидаемой "10:00", хотя данные уже были полностью
+// собраны и сохранены — просто НАЗВАНЫ иначе. Реальной задержки не было
+// никогда, только несовпадение соглашения о подписи между Akron и ВКМ
+// внутри нашей же системы. Теперь оба типа приборов подписывают архив
+// одинаково — концом периода.
+func persistVKMHourly(ctx context.Context, d *Device, periodLabel time.Time, rec archive.ArchiveRecord) int {
 	saved := 0
 	for _, param := range vkmHourlyParams {
 		v, ok := fieldFloat(rec.Fields, param)
 		if !ok {
 			log.Printf("[%s] VKM период %s: поле %s отсутствует в ответе прибора (поля=%v)\n",
-				d.ID, periodStart.Format("02.01.2006 15:04"), param, rec.Fields)
+				d.ID, periodLabel.Format("02.01.2006 15:04"), param, rec.Fields)
 			continue
 		}
 		unit, _ := rec.Fields[param+"_unit"].(string)
@@ -60,13 +72,13 @@ func persistVKMHourly(ctx context.Context, d *Device, periodStart time.Time, rec
 			DeviceID: d.ID,
 			Channel:  "",
 			Param:    param,
-			TsHour:   periodStart,
+			TsHour:   periodLabel,
 			Value:    v,
 			Unit:     unit,
 		}
 		if err := d.Repo.SaveHourlyArchive(ctx, r); err != nil {
 			log.Printf("[%s] VKM период %s: ошибка сохранения %s: %v\n",
-				d.ID, periodStart.Format("02.01.2006 15:04"), param, err)
+				d.ID, periodLabel.Format("02.01.2006 15:04"), param, err)
 			continue
 		}
 		saved++
@@ -74,7 +86,7 @@ func persistVKMHourly(ctx context.Context, d *Device, periodStart time.Time, rec
 	return saved
 }
 
-// isVKMTimeAnomalous — ИСТОРИЧЕСКАЯ функция, была источником главной
+// isVKMTimeAnomalous вЂ” РРЎРўРћР РР§Р•РЎРљРђРЇ С„СѓРЅРєС†РёСЏ, Р±С‹Р»Р° РёСЃС‚РѕС‡РЅРёРєРѕРј РіР»Р°РІРЅРѕР№
 // ошибки дня (2026-08-10): считала "секундный" формат Time
 // ("839089620-839089800сек") браком и заставляла collectVKMPeriod
 // переспрашивать период, пока прибор не даст "датный" формат
@@ -100,7 +112,7 @@ func isVKMTimeAnomalous(raw string) bool {
 	return !strings.Contains(value, "/")
 }
 
-// collectVKMPeriod делает ОДИН полный танец запись/ожидание/чтение архива
+// collectVKMPeriod РґРµР»Р°РµС‚ РћР”РРќ РїРѕР»РЅС‹Р№ С‚Р°РЅРµС† Р·Р°РїРёСЃСЊ/РѕР¶РёРґР°РЅРёРµ/С‡С‚РµРЅРёРµ Р°СЂС…РёРІР°
 // для окна [periodStart, periodStart+vkmArchivePeriod) и сохраняет то, что
 // пришло. Возвращает, сколько из vkmHourlyParams реально сохранено (0 без
 // ошибки — законный исход: у прибора не было данных за этот период).
@@ -145,17 +157,26 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, period
 	// найдено живьём 2026-08-02). Ошибка сохранения сырой строки не должна
 	// ронять сохранение S/ST — это две независимые вещи.
 	//
+	// Метка при сохранении (и сырой строки, и разобранных полей) —
+	// КОНЕЦ периода (periodStart+vkmArchivePeriod), не его начало — см.
+	// подробное объяснение в doc-комментарии persistVKMHourly. Сам
+	// запрос к прибору (q.From/q.To выше) по-прежнему построен от
+	// НАЧАЛА periodStart — это два разных, не связанных использования
+	// одной переменной: одно для окна запроса, другое для подписи
+	// результата.
+	//
 	// records[0].Raw сохраняется здесь БУКВАЛЬНО как пришло от прибора
 	// (parseTaggedString ничего в нём не меняет, кроме обрезки нулевых
 	// байт) — northbound должен отдавать его в ЭС так же нетронуто, без
 	// собственных текстовых преобразований (strip_headers/expand_exponent/
 	// field_scale и т.п. — см. историю в vkm_config.go).
-	if err := d.Repo.SaveVKMRawString(ctx, d.ID, q.Instance, periodStart, string(records[0].Raw)); err != nil {
+	periodLabel := periodStart.Add(vkmArchivePeriod)
+	if err := d.Repo.SaveVKMRawString(ctx, d.ID, q.Instance, periodLabel, string(records[0].Raw)); err != nil {
 		log.Printf("[%s] VKM период %s: ошибка сохранения сырой строки: %v\n",
-			d.ID, periodStart.Format("02.01.2006 15:04"), err)
+			d.ID, periodLabel.Format("02.01.2006 15:04"), err)
 	}
 
-	return persistVKMHourly(ctx, d, periodStart, records[0]), nil
+	return persistVKMHourly(ctx, d, periodLabel, records[0]), nil
 }
 
 // pollVKMHourlyLatest — обычный плановый опрос архива ВКМ (аналог часового
@@ -167,17 +188,26 @@ func (d *Device) pollVKMHourlyLatest(ctx context.Context, a profile.Archive) {
 	saved, err := d.collectVKMPeriod(ctx, a, periodStart)
 	if err != nil {
 		log.Printf("[%s] VKM архив %s: период %s: ошибка: %v\n",
-			d.ID, a.ID, periodStart.Format("02.01.2006 15:04"), err)
+			d.ID, a.ID, periodStart.Add(vkmArchivePeriod).Format("02.01.2006 15:04"), err)
 		return
 	}
 	log.Printf("[%s] VKM архив %s: период %s: сохранено полей: %d/%d\n",
-		d.ID, a.ID, periodStart.Format("02.01.2006 15:04"), saved, len(vkmHourlyParams))
+		d.ID, a.ID, periodStart.Add(vkmArchivePeriod).Format("02.01.2006 15:04"), saved, len(vkmHourlyParams))
 }
 
-// missingVKMPeriods находит получасовые периоды в [from, to], для которых
-// ещё нет строки archive_hourly с param="S" — собственный расчёт (не через
-// storage.Repo.MissingHours, который жёстко считает по часу) специально
-// под получасовой шаг ВКМ.
+// missingVKMPeriods находит получасовые периоды в [from, to] (from/to —
+// НАЧАЛА периодов, тот же смысл, что и periodStart в остальном файле),
+// для которых ещё нет строки archive_hourly с param="S" — собственный
+// расчёт (не через storage.Repo.MissingHours, который жёстко считает по
+// часу) специально под получасовой шаг ВКМ.
+//
+// ВАЖНО (2026-08-27): раз сохраняем теперь по МЕТКЕ КОНЦА периода (см.
+// persistVKMHourly), а перебираем здесь диапазон НАЧАЛАМИ периодов
+// (так исторически сложилось в backfillVKMHourly, менять не стал, чтобы
+// не трогать лишнего) — проверка присутствия обязана сдвигать каждую
+// проверяемую точку на +vkmArchivePeriod при сверке с уже сохранёнными
+// метками, иначе решит, что ничего не сохранено, хотя на самом деле всё
+// уже есть, просто под другой меткой.
 func missingVKMPeriods(ctx context.Context, repo storage.Repo, deviceID string, from, to time.Time) ([]time.Time, error) {
 	// Разумный запас по лимиту — покрывает несколько лет получасовых
 	// записей; для наших объёмов (месяцы работы одного прибора) с большим
@@ -188,13 +218,14 @@ func missingVKMPeriods(ctx context.Context, repo storage.Repo, deviceID string, 
 	}
 	present := make(map[int64]bool, len(existing))
 	for _, r := range existing {
-		present[r.TsHour.Unix()] = true
+		present[r.TsHour.Unix()] = true // r.TsHour — уже метка КОНЦА периода
 	}
 
 	var missing []time.Time
 	for t := from; !t.After(to); t = t.Add(vkmArchivePeriod) {
-		if !present[t.Unix()] {
-			missing = append(missing, t)
+		label := t.Add(vkmArchivePeriod) // t — начало периода, label — соответствующий ему конец
+		if !present[label.Unix()] {
+			missing = append(missing, t) // в missing по-прежнему кладём НАЧАЛО — collectVKMPeriod ждёт именно его
 		}
 	}
 	return missing, nil
@@ -246,7 +277,7 @@ func (d *Device) backfillVKMHourly(ctx context.Context, a profile.Archive, opts 
 		saved, err := d.collectVKMPeriod(ctx, a, period)
 		if err != nil {
 			log.Printf("[%s] VKM дозабор %s: период %s: ошибка: %v\n",
-				d.ID, a.ID, period.Format("02.01.2006 15:04"), err)
+				d.ID, a.ID, period.Add(vkmArchivePeriod).Format("02.01.2006 15:04"), err)
 			continue
 		}
 		if saved > 0 {
@@ -257,7 +288,7 @@ func (d *Device) backfillVKMHourly(ctx context.Context, a profile.Archive, opts 
 		// только итоговая сводка ниже. Полный построчный вывод доступен
 		// через отладочный лог (вкладка «Настройки» в /admin).
 		dbg.Printf("[%s] VKM дозабор %s: период %s: сохранено полей: %d/%d\n",
-			d.ID, a.ID, period.Format("02.01.2006 15:04"), saved, len(vkmHourlyParams))
+			d.ID, a.ID, period.Add(vkmArchivePeriod).Format("02.01.2006 15:04"), saved, len(vkmHourlyParams))
 	}
 	log.Printf("[%s] VKM дозабор %s: готово, заполнено периодов: %d/%d\n", d.ID, a.ID, periodsFilled, len(missing))
 }

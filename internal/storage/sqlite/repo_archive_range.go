@@ -49,6 +49,34 @@ ORDER BY ts_hour ASC
 	return out, rows.Err()
 }
 
+// DeleteHourlyArchiveRange удаляет все строки archive_hourly для
+// (deviceID, channel, param), чья метка попадает в [from, to] —
+// используется «Принудительным переопросом» ПЕРЕД повторным сбором с
+// прибора (см. akron_reload.go/vkm_reload.go): без предварительного
+// удаления повторный сбор просто ДОБАВИЛ бы новые строки поверх старых
+// через upsert по точному совпадению метки времени, а если старые
+// строки размечены НЕ ТЕМ соглашением (например, после фикса 2026-08-27,
+// когда подпись получасовок ВКМ поменялась с начала периода на конец) —
+// их метки просто не совпадут с новыми, и старые ошибочные строки
+// останутся висеть в базе нетронутыми рядом с новыми верными. Удаление
+// диапазона целиком перед сбором устраняет это — какой бы ни была старая
+// разметка, после переопроса в диапазоне останутся только свежие,
+// правильно размеченные записи.
+func (r *Repo) DeleteHourlyArchiveRange(ctx context.Context, deviceID, channel, param string, from, to time.Time) (int64, error) {
+	res, err := r.db.ExecContext(ctx, `
+DELETE FROM archive_hourly
+WHERE device_id = ? AND channel = ? AND param = ? AND ts_hour >= ? AND ts_hour <= ?
+`, deviceID, channel, param, from, to)
+	if err != nil {
+		return 0, fmt.Errorf("delete hourly archive range: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("delete hourly archive range: rows affected: %w", err)
+	}
+	return n, nil
+}
+
 // GetPreviousHourlyValue возвращает значение последней (по времени)
 // записи СТРОГО ДО указанного момента — используется для проверки
 // правдоподобия нового показания накопительного счётчика Akron (V):
