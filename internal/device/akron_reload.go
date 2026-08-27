@@ -30,7 +30,11 @@ import (
 // считает, на сколько часов назад это от текущего момента, и переводит
 // в индексы, которые понимает протокол Akron (i=1 — самая свежая
 // запись, дальше вглубь).
-func (d *Device) ForceReloadAkronHourly(ctx context.Context, fromTime time.Time) (int, error) {
+//
+// onProgress, если не nil, вызывается после каждой обработанной страницы
+// (done — сколько часов уже обработано, total — сколько всего) — см.
+// тот же параметр в ForceReloadVKMHourly, добавлено 2026-08-27.
+func (d *Device) ForceReloadAkronHourly(ctx context.Context, fromTime time.Time, onProgress func(done, total int)) (int, error) {
 	var a profile.Archive
 	found := false
 	for _, cand := range d.Profile.Archives {
@@ -68,6 +72,8 @@ func (d *Device) ForceReloadAkronHourly(ctx context.Context, fromTime time.Time)
 	}
 
 	totalSaved := 0
+	pagesDone := 0
+	totalPages := (depthHours + pageSize - 1) / pageSize
 	for from := 0; from < depthHours; from += pageSize {
 		to := from + pageSize - 1
 		if to >= depthHours {
@@ -104,6 +110,10 @@ func (d *Device) ForceReloadAkronHourly(ctx context.Context, fromTime time.Time)
 		// правдоподобия значения — если на линии СЕЙЧАС тоже помеха,
 		// заведомо плохое новое чтение не заменит собой хорошее старое.
 		totalSaved += persistAkronHourly(ctx, d.Repo, d.ID, a, records)
+		pagesDone++
+		if onProgress != nil {
+			onProgress(pagesDone, totalPages)
+		}
 	}
 
 	return totalSaved, nil

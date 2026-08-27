@@ -22,6 +22,11 @@ import (
 // существующую строку) — обычный дозабор (backfillVKMHourly) просто
 // заранее ОТФИЛЬТРОВЫВАЕТ периоды, для которых строка уже есть, эта же
 // функция намеренно идёт по ВСЕМ периодам диапазона без такого фильтра.
+//
+// onProgress, если не nil, вызывается после каждого обработанного периода
+// (done — сколько уже сделано, total — сколько всего) — используется
+// веб-интерфейсом, чтобы показывать реальный прогресс длительного
+// переопроса вместо "тишины" на много минут (добавлено 2026-08-27).
 // hourlyArchiveDeleter — узкий локальный интерфейс с одним методом,
 // который умеет только *sqliterepo.Repo (см. internal/storage/sqlite/
 // repo_archive_range.go, DeleteHourlyArchiveRange). Тот же приём, что
@@ -31,7 +36,7 @@ type hourlyArchiveDeleter interface {
 	DeleteHourlyArchiveRange(ctx context.Context, deviceID, channel, param string, from, to time.Time) (int64, error)
 }
 
-func (d *Device) ForceReloadVKMHourly(ctx context.Context, from, to time.Time) (int, error) {
+func (d *Device) ForceReloadVKMHourly(ctx context.Context, from, to time.Time, onProgress func(done, total int)) (int, error) {
 	var a profile.Archive
 	found := false
 	for _, cand := range d.Profile.Archives {
@@ -69,8 +74,26 @@ func (d *Device) ForceReloadVKMHourly(ctx context.Context, from, to time.Time) (
 		return 0, fmt.Errorf("хранилище не поддерживает очистку перед переопросом (внутренняя ошибка)")
 	}
 
+	// Верхняя граница переопроса НИКОГДА не может заходить в ещё не
+	// завершённый период — иначе запрашиваем и сохраняем "недособранное"
+	// значение (застали прибор посреди периода), и оно ляжет в базу и
+	// уйдёт в ЭС как будто период уже закрыт. Подтверждено живьём
+	// (2026-08-27): выбор "по" = сегодняшняя дата без ограничения дал
+	// строку архива с меткой на 15 минут ВПЕРЕДИ реального времени
+	// сервера. Обрезаем "to" до последнего периода, который уже
+	// гарантированно закрылся к текущему моменту.
+	lastCompletedPeriodStart := time.Now().Truncate(vkmArchivePeriod).Add(-vkmArchivePeriod)
+	if to.After(lastCompletedPeriodStart) {
+		to = lastCompletedPeriodStart
+	}
+
 	periodStart := from.Truncate(vkmArchivePeriod)
+	totalPeriods := int(to.Sub(periodStart)/vkmArchivePeriod) + 1
+	if totalPeriods < 0 {
+		totalPeriods = 0
+	}
 	totalSaved := 0
+	doneCount := 0
 	for !periodStart.After(to) {
 		select {
 		case <-ctx.Done():
@@ -83,6 +106,10 @@ func (d *Device) ForceReloadVKMHourly(ctx context.Context, from, to time.Time) (
 			return totalSaved, fmt.Errorf("период %s: ошибка чтения у прибора: %w", periodStart.Format("02.01.2006 15:04"), err)
 		}
 		totalSaved += saved
+		doneCount++
+		if onProgress != nil {
+			onProgress(doneCount, totalPeriods)
+		}
 		periodStart = periodStart.Add(vkmArchivePeriod)
 	}
 

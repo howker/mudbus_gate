@@ -40,7 +40,22 @@ type Server struct {
 	// SetForceReload. nil означает, что этот режим запуска не умеет
 	// принудительно переопрашивать (например, старый диагностический
 	// дашборд без полного набора приборов).
-	onForceReload func(deviceID string, from, to time.Time) (int, error)
+	//
+	// onProgress (последний параметр) вызывается изнутри переопроса по
+	// мере обработки — используется для заполнения reloadJobs (ниже),
+	// который опрашивает браузер, чтобы показывать реальный прогресс
+	// длительной операции (добавлено 2026-08-27 — раньше оператор видел
+	// полную тишину на много минут без единого признака, что вообще
+	// происходит).
+	onForceReload func(deviceID string, from, to time.Time, onProgress func(done, total int)) (int, error)
+
+	// reloadJobs хранит текущее состояние фоновых переопросов, по одному
+	// на прибор — POST /api/devices/reload-archive запускает переопрос в
+	// фоновой горутине и сразу возвращает управление, а браузер опрашивает
+	// GET /api/devices/reload-progress каждые полторы секунды, пока не
+	// увидит finished=true.
+	reloadJobsMu sync.Mutex
+	reloadJobs   map[string]*reloadJob
 
 	// mu protects httpSrv/mux/port for Rebind — called from an HTTP
 	// handler goroutine (settings save), while Start's own goroutine also
@@ -51,7 +66,19 @@ type Server struct {
 }
 
 func NewServer(repo *sqliterepo.Repo, port int) *Server {
-	return &Server{repo: repo, port: port}
+	return &Server{repo: repo, port: port, reloadJobs: make(map[string]*reloadJob)}
+}
+
+// reloadJob — состояние одного фонового переопроса, по одному на прибор
+// (новый запуск переопроса для того же прибора просто заменяет старую
+// запись — параллельных переопросов одного прибора всё равно быть не
+// должно, у него один физический канал связи).
+type reloadJob struct {
+	Done     int    `json:"done"`
+	Total    int    `json:"total"`
+	Saved    int    `json:"saved"`
+	Finished bool   `json:"finished"`
+	Error    string `json:"error,omitempty"`
 }
 
 // SetManualPoll wires the operator "poll now" action. Called by run.go /
@@ -66,7 +93,7 @@ func (s *Server) SetManualPoll(fn func()) {
 // созданы и открыты (см. runServer). Работает для обоих типов приборов
 // (Akron и ВКМ) — какой именно метод вызывать, решает сам callback по
 // типу конкретного прибора.
-func (s *Server) SetForceReload(fn func(deviceID string, from, to time.Time) (int, error)) {
+func (s *Server) SetForceReload(fn func(deviceID string, from, to time.Time, onProgress func(done, total int)) (int, error)) {
 	s.onForceReload = fn
 }
 
@@ -91,6 +118,7 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/archive", s.handleArchive)
 	mux.HandleFunc("/api/archive/export", s.handleArchiveExport)
 	mux.HandleFunc("/api/devices/reload-archive", s.handleForceReload)
+	mux.HandleFunc("/api/devices/reload-progress", s.handleReloadProgress)
 	mux.HandleFunc("/admin", s.handleAdminUI)
 
 	mux.HandleFunc("/", s.handleDashboard)
@@ -118,7 +146,7 @@ func (s *Server) Start(ctx context.Context) {
 	_ = current.Shutdown(shutdownCtx)
 }
 
-// Rebind переключает веб-сервер на новый порт ВНУТРИ работающего
+// Rebind РїРµСЂРµРєР»СЋС‡Р°РµС‚ РІРµР±-СЃРµСЂРІРµСЂ РЅР° РЅРѕРІС‹Р№ РїРѕСЂС‚ Р’РќРЈРўР Р СЂР°Р±РѕС‚Р°СЋС‰РµРіРѕ
 // процесса, без перезапуска всего mbgw.exe — вызывается из обработчика
 // сохранения настроек (POST /api/settings), когда оператор меняет порт
 // через UI. Сначала открывает слушатель на НОВОМ порту (если порт занят

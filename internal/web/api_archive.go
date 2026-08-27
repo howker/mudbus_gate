@@ -346,7 +346,7 @@ func (s *Server) handleArchiveExport(w http.ResponseWriter, r *http.Request) {
 				record = append(record, "")
 				continue
 			}
-			record = append(record, fmt.Sprintf("%.3f", v)) // фиксированный формат, не научная нотация — важно для Excel и для читаемости
+			record = append(record, fmt.Sprintf("%.5f", v)) // 5 знаков — соответствует точности родного ПО прибора, нужно для точной сверки, не 3 (было мало для диагностики расхождений, 2026-08-27)
 		}
 		_ = cw.Write(record)
 	}

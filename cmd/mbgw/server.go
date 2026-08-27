@@ -450,7 +450,7 @@ func runServer() {
 	// указанным периодом, а не часть обычного расписания опроса. Работает
 	// для обоих типов приборов — какой метод вызвать, решаем по
 	// deviceKinds.
-	webServer.SetForceReload(func(deviceID string, from, to time.Time) (int, error) {
+	webServer.SetForceReload(func(deviceID string, from, to time.Time, onProgress func(done, total int)) (int, error) {
 		dev, ok := devices[deviceID]
 		if !ok {
 			return 0, fmt.Errorf("прибор %s не найден среди работающих (сохранён ли он и запущен ли server?)", deviceID)
@@ -460,9 +460,9 @@ func runServer() {
 			deviceID, kind, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
 		switch kind {
 		case "akron":
-			return dev.ForceReloadAkronHourly(ctx, from)
+			return dev.ForceReloadAkronHourly(ctx, from, onProgress)
 		case "vkm360":
-			return dev.ForceReloadVKMHourly(ctx, from, to)
+			return dev.ForceReloadVKMHourly(ctx, from, to, onProgress)
 		default:
 			return 0, fmt.Errorf("принудительный переопрос не реализован для типа прибора %q", kind)
 		}

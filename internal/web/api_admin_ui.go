@@ -543,13 +543,44 @@ function forceReload() {
     if (xhr.readyState !== 4) { return; }
     var data;
     try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('reloadMsg', false, 'Ошибка ответа сервера'); return; }
-    if (data.ok) {
-      showMsg('reloadMsg', true, 'Готово, перезаписано записей: ' + data.saved + '. Нажмите «Показать», чтобы увидеть обновлённые данные.');
+    if (data.started) {
+      showMsg('reloadMsg', true, 'Переопрос запущен, идёт сбор данных с прибора...');
+      pollReloadProgress(deviceId);
     } else {
-      showMsg('reloadMsg', false, 'Ошибка: ' + (data.error || 'неизвестная') + ' (перезаписано до сбоя: ' + data.saved + ')');
+      showMsg('reloadMsg', false, 'Не удалось запустить переопрос');
     }
   };
   xhr.send(JSON.stringify({ device_id: deviceId, from: fromVal, to: toVal }));
+}
+
+// pollReloadProgress опрашивает состояние фонового переопроса каждые 1.5
+// секунды и обновляет текст под кнопкой — оператор видит реальный прогресс
+// (обработано X из Y периодов) вместо полной тишины на много минут
+// (добавлено 2026-08-27 по прямому запросу — раньше было непонятно,
+// работает ли вообще что-то, или процесс завис).
+function pollReloadProgress(deviceId) {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/devices/reload-progress?device_id=' + encodeURIComponent(deviceId), true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
+    var data;
+    try { data = JSON.parse(xhr.responseText); } catch (e) { return; }
+    if (!data.found) { return; }
+
+    if (!data.finished) {
+      var pct = data.total > 0 ? Math.round(100 * data.done / data.total) : 0;
+      showMsg('reloadMsg', true, 'Идёт переопрос: обработано ' + data.done + ' из ' + data.total + ' периодов (' + pct + '%)...');
+      setTimeout(function() { pollReloadProgress(deviceId); }, 1500);
+      return;
+    }
+
+    if (data.error) {
+      showMsg('reloadMsg', false, 'Завершено с ошибкой: ' + data.error + ' (успело перезаписать записей: ' + data.saved + ')');
+    } else {
+      showMsg('reloadMsg', true, 'Готово, перезаписано записей: ' + data.saved + '. Нажмите «Показать», чтобы увидеть обновлённые данные.');
+    }
+  };
+  xhr.send();
 }
 
 function pad2(n) { return (n < 10 ? '0' : '') + n; }
@@ -624,7 +655,7 @@ function renderArchiveTable(data) {
       bodyHtml += '<tr><td>' + row.period + '</td>';
       for (var c = 0; c < data.params.length; c++) {
         var v = row.values[data.params[c]];
-        bodyHtml += '<td>' + (v === undefined ? '' : v.toFixed(3)) + '</td>';
+        bodyHtml += '<td>' + (v === undefined ? '' : v.toFixed(5)) + '</td>';
       }
       bodyHtml += '</tr>';
     }
