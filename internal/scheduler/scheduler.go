@@ -150,12 +150,34 @@ type deviceSchedule struct {
 }
 
 // nextArchiveAnchored returns the next wall-clock time strictly after
-// `now` that falls on archiveAtMinute past some hour. E.g. atMinute=5 and
-// now=13:07 → 14:05; now=13:02 → 13:05.
-func nextArchiveAnchored(now time.Time, atMinute int) time.Time {
+// `now` that falls on archiveAtMinute past some hour-boundary-aligned
+// step of size `interval`. E.g. atMinute=5, interval=1h, now=13:07 →
+// 14:05; now=13:02 → 13:05.
+//
+// ВАЖНО (исправлено 2026-08-26): раньше здесь был жёстко зашит шаг РОВНО
+// В ЧАС (candidate.Add(time.Hour)), независимо от того, что реально
+// передано в interval — эта функция изначально писалась только под
+// Akron (часовой архив), и при добавлении получасового опроса для ВКМ
+// (archiveInterval=30 мин) полностью игнорировала эту настройку: любой
+// прибор с archiveAtMinute>=0 (а это включено по умолчанию, =5) всё
+// равно опрашивался РОВНО раз в час, что бы ни стояло в archiveInterval.
+// Это и было настоящей причиной того, что ВКМ систематически терял
+// получасовку ":00" даже ПОСЛЕ смены archiveInterval на 30 минут —
+// прошлый фикс менял значение, которое этот планировщик в заякоренном
+// режиме просто не читал (подтверждено живьём, 2026-08-26).
+//
+// Теперь шаг — сам interval (через цикл, чтобы корректно "перепрыгнуть"
+// несколько пропущенных интервалов разом, если процесс был неактивен
+// дольше одного шага) — при interval=1h ведёт себя ТОЧНО как раньше
+// (один проход цикла эквивалентен старому одиночному +Add(time.Hour)),
+// так что для Akron поведение не меняется.
+func nextArchiveAnchored(now time.Time, atMinute int, interval time.Duration) time.Time {
+	if interval <= 0 {
+		interval = time.Hour
+	}
 	candidate := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), atMinute, 0, 0, now.Location())
-	if !candidate.After(now) {
-		candidate = candidate.Add(time.Hour)
+	for !candidate.After(now) {
+		candidate = candidate.Add(interval)
 	}
 	return candidate
 }
@@ -237,7 +259,7 @@ func (s *Scheduler) Tick(now time.Time) {
 				// start time. Interval mode (archiveAtMinute < 0): legacy
 				// now+interval.
 				if ds.archiveAtMinute >= 0 {
-					ds.nextArchiveDue = nextArchiveAnchored(now, ds.archiveAtMinute)
+					ds.nextArchiveDue = nextArchiveAnchored(now, ds.archiveAtMinute, ds.archiveInterval)
 				} else {
 					ds.nextArchiveDue = now.Add(ds.archiveInterval)
 				}

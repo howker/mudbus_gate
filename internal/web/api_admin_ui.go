@@ -110,7 +110,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 
 <div class="content">
 
-  <!-- ===================== ПРИБОРЫ ===================== -->
+  <!-- ===================== РџР РР‘РћР Р« ===================== -->
   <div id="panel-devices" class="panel active">
     <div class="section">
       <h3>Список приборов</h3>
@@ -254,7 +254,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
     </div>
   </div>
 
-  <!-- ===================== ТЕКУЩИЕ ДАННЫЕ ===================== -->
+  <!-- ===================== РўР•РљРЈР©РР• Р”РђРќРќР«Р• ===================== -->
   <div id="panel-current" class="panel">
     <div class="section">
       <h3>Текущие данные</h3>
@@ -270,7 +270,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
     </div>
   </div>
 
-  <!-- ===================== АРХИВ ===================== -->
+  <!-- ===================== РђР РҐРР’ ===================== -->
   <div id="panel-archive" class="panel">
     <div class="section">
       <h3>Архив по прибору</h3>
@@ -278,9 +278,9 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <select id="ar_device" onchange="onArchiveDeviceChange()"></select>
       </div>
       <div class="form-row"><label>Период</label>
-        <input id="ar_from" type="date" style="width:150px;">
+        <input id="ar_from" type="text" readonly="readonly" style="width:150px;" placeholder="ГГГГ-ММ-ДД">
         &nbsp;—&nbsp;
-        <input id="ar_to" type="date" style="width:150px;">
+        <input id="ar_to" type="text" readonly="readonly" style="width:150px;" placeholder="ГГГГ-ММ-ДД">
       </div>
       <div class="form-row"><label></label>
         <button class="btn secondary" onclick="setArchivePreset('today')">Сегодня</button>
@@ -309,11 +309,13 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
     <div class="section" id="reloadSection" style="display:none;">
       <h3>Принудительный переопрос</h3>
       <p class="small-note">Заново спрашивает прибор за указанный период и ПЕРЕЗАПИСЫВАЕТ уже сохранённые данные — используйте, если в архиве обнаружено заведомо неверное значение (например, из-за помехи на линии связи). Обычный дозабор такое не исправляет, поскольку строка для этого периода уже существует.</p>
-      <div class="form-row"><label>Переопросить с (дата)</label>
-        <input id="rl_from" type="date">
+      <div class="form-row"><label>Переопросить с</label>
+        <input id="rl_from" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
+        <select id="rl_from_h" style="width:55px;"></select>:<select id="rl_from_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
       </div>
-      <div class="form-row" id="rl_to_row"><label>По какую дату (только для ВКМ)</label>
-        <input id="rl_to" type="date">
+      <div class="form-row" id="rl_to_row"><label>По какую дату (только ВКМ)</label>
+        <input id="rl_to" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
+        <select id="rl_to_h" style="width:55px;"></select>:<select id="rl_to_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
       </div>
       <p><button class="btn danger" onclick="forceReload()">Переопросить принудительно</button></p>
       <div id="reloadMsg" class="msg"></div>
@@ -512,20 +514,26 @@ function onArchiveDeviceChange() {
 
 function forceReload() {
   var deviceId = document.getElementById('ar_device').value;
-  var fromDate = document.getElementById('rl_from').value; // ГГГГ-ММ-ДД, из календаря — так же, как поля периода на вкладке "Архив"
+  var fromDate = document.getElementById('rl_from').value; // ГГГГ-ММ-ДД, из календаря
   var toDate = document.getElementById('rl_to').value;
   if (!deviceId) { showMsg('reloadMsg', false, 'Выберите прибор'); return; }
   if (!fromDate) { showMsg('reloadMsg', false, 'Выберите дату начала в календаре'); return; }
   if (!confirm('Это ПЕРЕЗАПИШЕТ уже сохранённые данные архива за этот период данными, заново прочитанными с прибора. Продолжить?')) { return; }
 
-  // Время внутри дня выбирать не нужно — "с" всегда означает начало
-  // выбранных суток (00:00), "по" (только ВКМ) — конец выбранных суток
-  // (23:59). Раньше здесь было отдельное поле времени (datetime-local),
-  // но Internet Explorer — единственный браузер на прод-сервере — его
-  // не поддерживает вообще, ломая ввод; календарь без ручного набора
-  // часов/минут работает везде одинаково надёжно.
-  var fromVal = fromDate + 'T00:00';
-  var toVal = toDate ? (toDate + 'T23:59') : '';
+  // Время внутри суток — отдельные выпадающие списки часа и получаса
+  // (не текстовый ввод — оператору не нужно гадать формат; не HTML5
+  // "time", потому что Internet Explorer его не поддерживает вообще).
+  // По умолчанию оба поля 00:00 (первый вариант в списке часов).
+  var fromH = document.getElementById('rl_from_h').value;
+  var fromM = document.getElementById('rl_from_m').value;
+  var fromVal = fromDate + 'T' + fromH + ':' + fromM;
+
+  var toVal = '';
+  if (toDate) {
+    var toH = document.getElementById('rl_to_h').value;
+    var toM = document.getElementById('rl_to_m').value;
+    toVal = toDate + 'T' + toH + ':' + toM;
+  }
 
   document.getElementById('reloadMsg').className = 'msg';
   var xhr = new XMLHttpRequest();
@@ -1164,6 +1172,183 @@ function saveSettings() {
   };
   xhr.send(JSON.stringify(body));
 }
+
+// ===================== ПРОСТОЙ ВСПЛЫВАЮЩИЙ КАЛЕНДАРЬ =====================
+// Internet Explorer (единственный браузер на прод-сервере) НЕ реализовал
+// ни один из HTML5-типов полей даты/времени (<input type="date">,
+// "datetime-local", "time") ни в одной своей версии — они просто
+// становятся обычными текстовыми полями без всякого календаря и без
+// проверки формата. Раньше здесь предполагалось, что "date" хотя бы
+// откатится на что-то безопасное — не откатывается, календаря нет вообще
+// (подтверждено живьём, 2026-08-26). Поэтому здесь свой собственный,
+// маленький календарь на чистом ES5 — работает одинаково в любом браузере,
+// включая IE, и не требует от оператора вводить дату руками вообще: поля
+// теперь readonly, выбор — только кликом по дню в календаре.
+
+var calendarPopupEl = null;
+var calendarActiveInputId = null;
+
+var monthNamesRu = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+var weekDaysRu = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+
+function parseISODate(s) {
+  var parts = s.split('-');
+  return new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
+}
+
+// attachCalendar делает поле нажимаемым — клик открывает всплывающий
+// календарь под этим полем. Вызывается один раз при загрузке страницы
+// для каждого из полей дат.
+function attachCalendar(inputId) {
+  var input = document.getElementById(inputId);
+  if (!input) { return; }
+  input.style.cursor = 'pointer';
+  input.style.background = '#3c3c3c';
+  input.onclick = function() { toggleCalendarPopup(inputId); };
+}
+
+function toggleCalendarPopup(inputId) {
+  if (calendarPopupEl && calendarActiveInputId === inputId) {
+    closeCalendarPopup();
+    return;
+  }
+  closeCalendarPopup();
+
+  var input = document.getElementById(inputId);
+  var rect = input.getBoundingClientRect();
+  var scrollTop = document.body.scrollTop || document.documentElement.scrollTop;
+  var scrollLeft = document.body.scrollLeft || document.documentElement.scrollLeft;
+
+  var popup = document.createElement('div');
+  popup.style.position = 'absolute';
+  popup.style.left = (rect.left + scrollLeft) + 'px';
+  popup.style.top = (rect.bottom + scrollTop + 4) + 'px';
+  popup.style.background = '#2d2d30';
+  popup.style.border = '1px solid #3e3e42';
+  popup.style.borderRadius = '4px';
+  popup.style.padding = '10px';
+  popup.style.zIndex = '9999';
+  popup.style.width = '230px';
+  popup.style.boxShadow = '0 4px 12px rgba(0,0,0,0.5)';
+
+  var current = input.value ? parseISODate(input.value) : new Date();
+
+  document.body.appendChild(popup);
+  calendarPopupEl = popup;
+  calendarActiveInputId = inputId;
+  renderCalendarMonth(current.getFullYear(), current.getMonth());
+
+  setTimeout(function() {
+    if (document.addEventListener) {
+      document.addEventListener('click', outsideCalendarClick, false);
+    } else if (document.attachEvent) {
+      document.attachEvent('onclick', outsideCalendarClick);
+    }
+  }, 0);
+}
+
+function outsideCalendarClick(e) {
+  var evt = e || window.event;
+  var target = evt.target || evt.srcElement;
+  if (!calendarPopupEl) { return; }
+  var node = target;
+  while (node) {
+    if (node === calendarPopupEl) { return; } // клик внутри календаря — не закрываем
+    node = node.parentNode;
+  }
+  if (target.id === calendarActiveInputId) { return; } // клик по самому полю — им управляет toggle
+  closeCalendarPopup();
+}
+
+function closeCalendarPopup() {
+  if (calendarPopupEl && calendarPopupEl.parentNode) {
+    calendarPopupEl.parentNode.removeChild(calendarPopupEl);
+  }
+  calendarPopupEl = null;
+  calendarActiveInputId = null;
+  if (document.removeEventListener) {
+    document.removeEventListener('click', outsideCalendarClick, false);
+  } else if (document.detachEvent) {
+    document.detachEvent('onclick', outsideCalendarClick);
+  }
+}
+
+function renderCalendarMonth(year, month) {
+  if (!calendarPopupEl) { return; }
+  var html = '';
+  html += '<div style="display:table;width:100%;margin-bottom:8px;">';
+  html += '<div style="display:table-cell;text-align:left;"><button type="button" style="background:#3c3c3c;color:#fff;border:none;padding:4px 10px;cursor:pointer;" onclick="calendarChangeMonth(' + year + ',' + month + ',-1)">&lt;</button></div>';
+  html += '<div style="display:table-cell;text-align:center;color:#fff;font-size:13px;">' + monthNamesRu[month] + ' ' + year + '</div>';
+  html += '<div style="display:table-cell;text-align:right;"><button type="button" style="background:#3c3c3c;color:#fff;border:none;padding:4px 10px;cursor:pointer;" onclick="calendarChangeMonth(' + year + ',' + month + ',1)">&gt;</button></div>';
+  html += '</div>';
+  html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
+  html += '<tr>';
+  for (var d = 0; d < 7; d++) { html += '<th style="color:#969696;padding:4px;font-weight:normal;">' + weekDaysRu[d] + '</th>'; }
+  html += '</tr>';
+
+  var firstDay = new Date(year, month, 1);
+  var startOffset = (firstDay.getDay() + 6) % 7; // понедельник = первый столбец
+  var daysInMonth = new Date(year, month + 1, 0).getDate();
+  var todayStr = dateToInputValue(new Date());
+
+  var day = 1;
+  var rows = Math.ceil((startOffset + daysInMonth) / 7);
+  for (var row = 0; row < rows; row++) {
+    html += '<tr>';
+    for (var col = 0; col < 7; col++) {
+      if (row === 0 && col < startOffset) {
+        html += '<td></td>';
+      } else if (day > daysInMonth) {
+        html += '<td></td>';
+      } else {
+        var dStr = year + '-' + pad2(month + 1) + '-' + pad2(day);
+        var bg = (dStr === todayStr) ? '#0e639c' : 'transparent';
+        html += '<td style="text-align:center;padding:6px 0;cursor:pointer;color:#ccc;background:' + bg + ';" ' +
+          'onmouseover="this.style.background=\'#3c3c3c\'" ' +
+          'onmouseout="this.style.background=\'' + bg + '\'" ' +
+          'onclick="calendarPickDate(\'' + dStr + '\')">' + day + '</td>';
+        day++;
+      }
+    }
+    html += '</tr>';
+  }
+  html += '</table>';
+  calendarPopupEl.innerHTML = html;
+}
+
+function calendarChangeMonth(year, month, delta) {
+  month += delta;
+  if (month < 0) { month = 11; year -= 1; }
+  if (month > 11) { month = 0; year += 1; }
+  renderCalendarMonth(year, month);
+}
+
+function calendarPickDate(dateStr) {
+  var inputId = calendarActiveInputId;
+  document.getElementById(inputId).value = dateStr;
+  closeCalendarPopup();
+}
+
+attachCalendar('ar_from');
+attachCalendar('ar_to');
+// populateHourSelect заполняет выпадающий список часов 00-23 — по умолчанию
+// выбран первый вариант (00), что и даёт "по умолчанию 00:00" без
+// дополнительного кода. Отдельная функция, а не разметка вручную на 24
+// строки — компактнее и меньше шансов ошибиться при правке.
+function populateHourSelect(selectId) {
+  var sel = document.getElementById(selectId);
+  var html = '';
+  for (var h = 0; h < 24; h++) {
+    var hh = pad2(h);
+    html += '<option value="' + hh + '">' + hh + '</option>';
+  }
+  sel.innerHTML = html;
+}
+populateHourSelect('rl_from_h');
+populateHourSelect('rl_to_h');
+
+attachCalendar('rl_from');
+attachCalendar('rl_to');
 
 loadDevices();
 loadProfiles();

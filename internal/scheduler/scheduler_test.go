@@ -240,7 +240,11 @@ func TestScheduler_Next_EmptyQueue(t *testing.T) {
 
 // TestNextArchiveAnchored verifies the hour-anchored next-due calculation
 // used to stop the archive poll from drifting with process start time
-// (the 2026-07-30 zero-delta-hour bug).
+// (the 2026-07-30 zero-delta-hour bug). All cases here use interval=1h
+// (Akron's real interval) — see TestNextArchiveAnchored_HalfHourInterval
+// below for the ВКМ 30-минутный случай, добавленный после того, как
+// выяснилось, что старая версия функции игнорировала interval и всегда
+// прибавляла ровно час (2026-08-26).
 func TestNextArchiveAnchored(t *testing.T) {
 	loc := time.UTC
 	cases := []struct {
@@ -260,9 +264,41 @@ func TestNextArchiveAnchored(t *testing.T) {
 		{time.Date(2026, 7, 30, 23, 50, 0, 0, loc), 5, time.Date(2026, 7, 31, 0, 5, 0, 0, loc)},
 	}
 	for i, c := range cases {
-		got := nextArchiveAnchored(c.now, c.atMinute)
+		got := nextArchiveAnchored(c.now, c.atMinute, time.Hour)
 		if !got.Equal(c.want) {
-			t.Errorf("case %d: nextArchiveAnchored(%v, %d) = %v, want %v", i, c.now, c.atMinute, got, c.want)
+			t.Errorf("case %d: nextArchiveAnchored(%v, %d, 1h) = %v, want %v", i, c.now, c.atMinute, got, c.want)
+		}
+	}
+}
+
+// TestNextArchiveAnchored_HalfHourInterval — прямая проверка фикса от
+// 2026-08-26: с interval=30 минут якорь должен продвигаться каждые 30
+// минут (HH:05, HH:35, (HH+1):05, ...), а не перепрыгивать сразу на час,
+// как это было в старой реализации (жёстко зашитый Add(time.Hour) вместо
+// Add(interval)) — именно это и было настоящей причиной систематической
+// потери получасовки ":00" у ВКМ даже после того, как device-уровневый
+// archiveInterval был изменён на 30 минут.
+func TestNextArchiveAnchored_HalfHourInterval(t *testing.T) {
+	loc := time.UTC
+	cases := []struct {
+		now      time.Time
+		atMinute int
+		want     time.Time
+	}{
+		// До якоря :05 в текущем получасе → якорь в этом же получасе.
+		{time.Date(2026, 8, 26, 13, 2, 0, 0, loc), 5, time.Date(2026, 8, 26, 13, 5, 0, 0, loc)},
+		// Сразу после :05 → следующий якорь через 30 минут, :35, НЕ через
+		// час (:14:05) — именно это раньше ломалось.
+		{time.Date(2026, 8, 26, 13, 10, 0, 0, loc), 5, time.Date(2026, 8, 26, 13, 35, 0, 0, loc)},
+		// После :35 → следующий якорь в следующем часе, :05.
+		{time.Date(2026, 8, 26, 13, 40, 0, 0, loc), 5, time.Date(2026, 8, 26, 14, 5, 0, 0, loc)},
+		// Ровно на якоре :35 → следующий (строго после now) через 30 мин.
+		{time.Date(2026, 8, 26, 13, 35, 0, 0, loc), 5, time.Date(2026, 8, 26, 14, 5, 0, 0, loc)},
+	}
+	for i, c := range cases {
+		got := nextArchiveAnchored(c.now, c.atMinute, 30*time.Minute)
+		if !got.Equal(c.want) {
+			t.Errorf("case %d: nextArchiveAnchored(%v, %d, 30m) = %v, want %v", i, c.now, c.atMinute, got, c.want)
 		}
 	}
 }
@@ -288,5 +324,37 @@ func TestScheduler_ArchiveAnchor_DoesNotDrift(t *testing.T) {
 	want := time.Date(2026, 7, 30, 14, 5, 0, 0, time.UTC)
 	if !ds.nextArchiveDue.Equal(want) {
 		t.Fatalf("nextArchiveDue = %v, want %v (anchored, not drifted to :47)", ds.nextArchiveDue, want)
+	}
+}
+
+// TestScheduler_ArchiveAnchor_HalfHourInterval_DoesNotSkipPeriods —
+// регрессионный тест на реальный производственный баг (2026-08-25/26):
+// прибор ВКМ360 с archiveInterval=30 минут и включённым якорем терял
+// каждую вторую получасовку, потому что заякоренный режим планировщика
+// жёстко использовал шаг в час независимо от archiveInterval. Проверяет,
+// что ПОСЛЕДОВАТЕЛЬНЫЕ срабатывания идут каждые 30 минут, а не раз в час.
+func TestScheduler_ArchiveAnchor_HalfHourInterval_DoesNotSkipPeriods(t *testing.T) {
+	s := New(nil)
+	s.RegisterWithArchiveAnchor("dev1", 0, 30*time.Minute, nil, 5)
+
+	start := time.Date(2026, 8, 26, 13, 0, 0, 0, time.UTC)
+	s.Tick(start)
+	if _, ok := s.Next(); !ok {
+		t.Fatal("expected an archive task on first tick")
+	}
+
+	ds := s.devices["dev1"]
+	firstDue := ds.nextArchiveDue
+
+	// Продвигаемся до firstDue и чуть дальше — должно сработать.
+	s.Tick(firstDue.Add(time.Second))
+	if _, ok := s.Next(); !ok {
+		t.Fatal("expected an archive task at the first anchored due time")
+	}
+	secondDue := ds.nextArchiveDue
+
+	gap := secondDue.Sub(firstDue)
+	if gap != 30*time.Minute {
+		t.Fatalf("expected consecutive archive due-times 30 minutes apart, got %v apart (firstDue=%v, secondDue=%v) — half-hour periods are being skipped again", gap, firstDue, secondDue)
 	}
 }
