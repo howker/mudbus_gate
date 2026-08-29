@@ -1025,6 +1025,13 @@ function probeDevice() {
       if (data.serial_number) { text += ' Заводской №: ' + data.serial_number + '.'; }
       if (data.firmware_info) { text += ' ' + data.firmware_info + '.'; }
       if (data.device_time) { text += ' Время прибора: ' + data.device_time + '.'; }
+      // Поля ниже заполняет только probeVKM (internal/web/api_probe.go) —
+      // мгновенные показания трубопровода №1, добавлено 2026-08-29 по
+      // прямому запросу оператора вместе с самой реализацией проверки
+      // ВКМ (раньше кнопка «Проверить прибор» для ВКМ ничего не делала).
+      if (data.pressure) { text += ' Давление: ' + data.pressure + '.'; }
+      if (data.temperature) { text += ' Температура: ' + data.temperature + '.'; }
+      if (data.mass_flow) { text += ' Массовый расход: ' + data.mass_flow + '.'; }
       showMsg('probeMsg', true, text);
     } else {
       showMsg('probeMsg', false, data.error || 'Не удалось опросить прибор');

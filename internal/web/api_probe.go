@@ -10,6 +10,7 @@ import (
 	"mbgw/internal/codec"
 	"mbgw/internal/pollcore"
 	"mbgw/internal/protocol/akron"
+	"mbgw/internal/session"
 	"mbgw/internal/transport"
 )
 
@@ -31,19 +32,17 @@ import (
 // both the real device and Энергосфера's own driver (see
 // docs/M3_DISCOVERY_FINDINGS_akron.md, internal/protocol/akron/akron.go).
 //
-// VKM360: NOT implemented here. There is no existing, tested code path in
-// this project that reads a ВКМ-360 identification/serial number in
-// isolation — SaveDevicePassport/GetDevicePassport exist on the Repo
-// interface but are never actually called anywhere in the codebase today
-// (confirmed by a project-wide search, 2026-08-22), and the ВКМ archive-
-// string protocol itself still has an open, undocumented detail per
-// docs/SESSION_STATUS_northbound.md ("единственная оставшаяся
-// неизвестность: точный словарь тэгов и формат значения"). Writing a
-// probe implementation now would mean guessing at a protocol detail this
-// project has explicitly flagged as unresolved — exactly the kind of
-// guess that cost a full day on a different device earlier in this same
-// project. handleDeviceProbe returns a clear "not supported" response for
-// kind=vkm360 instead.
+// VKM360: ДОБАВЛЕНО (2026-08-29, прямой запрос оператора). Раньше здесь
+// был отказ "не реализовано" — единственная причина была в том, что
+// точный словарь тэгов АРХИВНОЙ строки (mb_request_poll_string) на тот
+// момент был не подтверждён (см. историю в docs/SESSION_STATUS_
+// northbound.md). Но пробник не обязан читать архив вообще — он читает
+// ПРОСТЫЕ регистры (серийник, версия ПО, часы, мгновенные показания),
+// формат которых давно подтверждён живьём (см. tools/vkmprobe и
+// registri_mbrrtu_vkm.pdf) и никак не завязан на тот самый неразрешённый
+// вопрос про архивную строку. probeVKM ниже — по сути урезанная копия
+// tools/vkmprobe's readCurrentValues + прямые чтения 1800-1810HR, без
+// самого архива.
 
 type probeRequest struct {
 	Kind          string `json:"kind"` // "vkm360" | "akron"
@@ -64,6 +63,16 @@ type probeResponse struct {
 	SerialNumber string `json:"serial_number,omitempty"`
 	FirmwareInfo string `json:"firmware_info,omitempty"`
 	DeviceTime   string `json:"device_time,omitempty"`
+
+	// Поля ниже заполняются ТОЛЬКО probeVKM (у Akron нет прямого
+	// Modbus-аналога этих мгновенных показаний в самом пробнике —
+	// он читает их из архивной команды 102, не отдельными регистрами).
+	// Не обязательные (omitempty) — пустая строка означает "этот
+	// конкретный регистр не прочитался", а не ошибку всего пробника
+	// целиком (частичный успех допустим и полезен оператору).
+	Pressure    string `json:"pressure,omitempty"`
+	Temperature string `json:"temperature,omitempty"`
+	MassFlow    string `json:"mass_flow,omitempty"`
 }
 
 func (s *Server) handleDeviceProbe(w http.ResponseWriter, r *http.Request) {
@@ -81,10 +90,7 @@ func (s *Server) handleDeviceProbe(w http.ResponseWriter, r *http.Request) {
 	case "akron":
 		writeJSON(w, http.StatusOK, probeAkron(r.Context(), req))
 	case "vkm360":
-		writeJSON(w, http.StatusOK, probeResponse{
-			OK:    false,
-			Error: "Проверка ВКМ-360 пока не реализована — используйте пробный опрос через обычный цикл сбора после сохранения прибора.",
-		})
+		writeJSON(w, http.StatusOK, probeVKM(r.Context(), req))
 	default:
 		writeError(w, http.StatusBadRequest, `поле kind должно быть "vkm360" или "akron"`)
 	}
@@ -196,4 +202,152 @@ func probeAkron(ctx context.Context, req probeRequest) probeResponse {
 	}
 
 	return resp
+}
+
+// probeVKM opens a transport, performs the ВКМ session handshake
+// (byte-order detection + authorization — required for this device,
+// unlike Akron's session "none", see profiles/vkm360.yaml's session
+// type "modbus_byteorder_auth"), then reads a handful of plain
+// registers: serial number + firmware version (identification-
+// equivalent), the device's own clock (1800-1805HR, read-only per
+// registri_mbrrtu_vkm.pdf), and three instantaneous readings on pipe 1
+// (pressure/temperature/mass flow) as a live proof-of-life beyond just
+// the clock. Deliberately does NOT touch the archive-string dance
+// (registers 7900-9999) — that's tools/vkmprobe's job for deep protocol
+// diagnostics, not a quick "is this really a ВКМ-360 and is it alive"
+// check from the add-device form.
+//
+// Partial success is reported as-is (OK:true with only some fields
+// filled) rather than an all-or-nothing failure — a device that answers
+// the clock but not, say, the mass-flow register on an unconfigured
+// pipe is still clearly "a real, reachable ВКМ-360", which is the
+// question this probe answers for the operator.
+func probeVKM(ctx context.Context, req probeRequest) probeResponse {
+	timeoutMs := req.TimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = 1000
+	}
+
+	tr, err := transport.New(transport.Params{
+		Kind:            transport.Kind(req.TransportKind),
+		Host:            req.Host,
+		Port:            req.Port,
+		COM:             req.COM,
+		Baudrate:        req.Baudrate,
+		Parity:          req.Parity,
+		StopBits:        req.StopBits,
+		ResponseTimeout: time.Duration(timeoutMs) * time.Millisecond,
+		Retries:         3, // см. комментарий у Retries в probeAkron выше — тот же расчёт
+	})
+	if err != nil {
+		return probeResponse{OK: false, Error: "не удалось создать транспорт: " + err.Error()}
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	if err := tr.Open(probeCtx); err != nil {
+		return probeResponse{OK: false, Error: "не удалось открыть соединение: " + err.Error()}
+	}
+	defer tr.Close()
+
+	sess, err := session.New("modbus_byteorder_auth")
+	if err != nil {
+		return probeResponse{OK: false, Error: "создание сессии: " + err.Error()}
+	}
+	if err := sess.Open(probeCtx, tr); err != nil {
+		return probeResponse{OK: false, Error: "открытие сессии (byte-order/авторизация): " + err.Error()}
+	}
+
+	isTCP := req.TransportKind == "modbus_tcp"
+	unitID := req.UnitID
+	if unitID == 0 {
+		unitID = 1
+	}
+	reader := pollcore.New(tr, isTCP, uint8(unitID))
+
+	resp := probeResponse{OK: true}
+
+	// Серийный номер (1810HR, int32) и версия встроенного ПО (1807HR,
+	// int16) — регистры "Идентификаторы и флаги" из карты регистров
+	// ЭЛЕМЕР-ВКМ-360 (registri_mbrrtu_vkm.pdf). Порядок байт "0123" —
+	// после успешного sess.Open() устройство уже подтверждено работающим
+	// в стандартном порядке (тот же приём, что в tools/vkmprobe).
+	if data, err := reader.ReadRaw(probeCtx, "HR", 1810, "int32"); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "серийный номер (HR 1810): "+err.Error())
+	} else if v, err := codec.DecodeInt32(data, "0123"); err == nil {
+		resp.SerialNumber = fmt.Sprintf("%d", v)
+	}
+	if data, err := reader.ReadRaw(probeCtx, "HR", 1807, "int16"); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "версия ПО (HR 1807): "+err.Error())
+	} else if v, err := codec.DecodeInt16(data); err == nil {
+		resp.FirmwareInfo = fmt.Sprintf("версия встроенного ПО = %d", v)
+	}
+
+	// Часы прибора — 1800-1805HR, только чтение (день/месяц/год/часы/
+	// минуты/секунды, каждый отдельным int16-регистром).
+	clock := make([]int16, 6)
+	clockOK := true
+	for i := range clock {
+		data, err := reader.ReadRaw(probeCtx, "HR", 1800+i, "int16")
+		if err != nil {
+			clockOK = false
+			resp.Error = firstNonEmpty(resp.Error, fmt.Sprintf("часы прибора (HR %d): %v", 1800+i, err))
+			break
+		}
+		v, err := codec.DecodeInt16(data)
+		if err != nil {
+			clockOK = false
+			break
+		}
+		clock[i] = v
+	}
+	if clockOK {
+		resp.DeviceTime = fmt.Sprintf("%02d.%02d.%04d %02d:%02d:%02d",
+			clock[0], clock[1], clock[2], clock[3], clock[4], clock[5])
+	}
+
+	// Мгновенные показания на трубопроводе №1 (addr_formula
+	// "2000+(pipe-1)*100+N" из profiles/vkm360.yaml при pipe=1 даёт
+	// смещение 0) — форма добавления прибора пока не собирает номер
+	// трубы отдельно (это делается позже, на вкладке каналов ЭС), так
+	// что пробник намеренно всегда проверяет трубу №1, просто как живой
+	// признак того, что прибор действительно отдаёт измерения, а не
+	// только отвечает на служебные регистры.
+	if data, err := reader.ReadRaw(probeCtx, "IR", 2000, "float"); err == nil {
+		if v, err := codec.DecodeFloat32(data, "0123"); err == nil {
+			resp.Pressure = fmt.Sprintf("%.0f Па", v)
+		}
+	}
+	if data, err := reader.ReadRaw(probeCtx, "IR", 2004, "float"); err == nil {
+		if v, err := codec.DecodeFloat32(data, "0123"); err == nil {
+			resp.Temperature = fmt.Sprintf("%.2f °C", v)
+		}
+	}
+	if data, err := reader.ReadRaw(probeCtx, "IR", 2008, "float"); err == nil {
+		if v, err := codec.DecodeFloat32(data, "0123"); err == nil {
+			resp.MassFlow = fmt.Sprintf("%.4f кг/с", v)
+		}
+	}
+
+	// Если не прочиталось ВООБЩЕ ничего (ни серийника, ни часов) —
+	// сессия открылась, но за этим явно стоит неверный unit id или
+	// нестандартная прошивка, а не частичный успех. Сообщаем как отказ,
+	// а не как "успех" с полностью пустым ответом.
+	if resp.SerialNumber == "" && resp.DeviceTime == "" {
+		resp.OK = false
+		resp.Error = firstNonEmpty(resp.Error, "сессия открыта, но ни один регистр не прочитался — проверьте unit id")
+	}
+
+	return resp
+}
+
+// firstNonEmpty returns a if it's non-empty, otherwise b — used above to
+// keep the FIRST error encountered while probing several independent
+// registers, instead of the LAST one silently overwriting it.
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
