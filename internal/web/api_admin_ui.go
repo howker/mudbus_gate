@@ -857,6 +857,14 @@ function findDevice(id) {
 function editDevice(id) {
   var d = findDevice(id);
   if (!d) { return; }
+  // Сброс сообщений от ПРЕЖНЕГО прибора — без этого «Сохранено. Для
+  // применения запустите/перезапустите mbgw server.» (или результат
+  // «Проверить прибор») продолжало висеть на экране после переключения
+  // на другой прибор, как будто относится к нему (тот же класс бага,
+  // что уже чинили для статуса переопроса — найдено оператором живьём,
+  // 2026-08-29). Тот же приём, что уже применён в resetDeviceForm ниже.
+  document.getElementById('deviceMsg').className = 'msg';
+  document.getElementById('probeMsg').className = 'msg';
   editingOriginalKind = d.kind;
   document.getElementById('editWarning').style.display = 'block';
   document.getElementById('editWarningName').innerText = d.name;
