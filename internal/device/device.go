@@ -2,12 +2,14 @@ package device
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
 	"mbgw/internal/archive"
 	"mbgw/internal/codec"
+	"mbgw/internal/errs"
 	"mbgw/internal/lease"
 	"mbgw/internal/pointresolver"
 	"mbgw/internal/profile"
@@ -72,6 +74,63 @@ func New(id string, p *profile.Profile, cli PointClient, sess session.Session, r
 		Repo:    repo,
 		Lease:   l,
 	}
+}
+
+// leaseAcquireRetries / leaseAcquireRetryDelay управляют повторными
+// попытками занять lease конкретного прибора+архива, когда она временно
+// занята чем-то ещё — прежде всего принудительным переопросом (см.
+// vkm_reload.go/ForceReloadVKMHourly, akron_reload.go/
+// ForceReloadAkronHourly — оба держат lease только на время ОДНОГО
+// запрошенного периода, отпуская её между периодами через
+// collectVKMPeriod/аналогичную функцию Akron). Без повтора обычный
+// плановый такт (pollVKMHourlyLatest / generic-ветка PollArchives ниже),
+// попавший ровно в момент, когда переопрос удерживает линию, молча
+// пропускал бы весь такт — до часа простоя получасовки, пока не
+// сработает следующий тик планировщика.
+//
+// ПОДТВЕРЖДЕНО ЖИВЬЁМ (найдено оператором 2026-08-27/29, mbgw_server.log):
+//
+//	VKM архив main: период 27.08.2026 13:30: ошибка:
+//	lease: lease held for device "boylernaya_par"... device lease held by another owner
+//
+// 8 попыток по 4с = до 32с ожидания — с запасом перекрывает типичное
+// время одного периода переопроса (в переписке с оператором: 60
+// периодов ≈ 3 минуты, то есть около 3с на период).
+const (
+	leaseAcquireRetries    = 8
+	leaseAcquireRetryDelay = 4 * time.Second
+)
+
+// acquireLeaseWithRetry — обёртка над d.Lease.Acquire с повтором ИМЕННО
+// при конфликте занятости (errs.ErrLease, см. internal/lease/lease.go).
+// Прочие ошибки (например, пустой deviceID) возвращаются немедленно, без
+// бессмысленного ожидания — они сами по себе не "рассосутся" со
+// временем, в отличие от занятой линии связи.
+func (d *Device) acquireLeaseWithRetry(ctx context.Context, leaseContext string, ttl time.Duration) (func(), error) {
+	var lastErr error
+	for attempt := 1; attempt <= leaseAcquireRetries; attempt++ {
+		release, err := d.Lease.Acquire(ctx, d.ID, leaseContext, ttl)
+		if err == nil {
+			if attempt > 1 {
+				log.Printf("[%s] lease %q занята с %d-й попытки (ждали конфликт с другой операцией на этой же линии)\n", d.ID, leaseContext, attempt)
+			}
+			return release, nil
+		}
+		lastErr = err
+		if !errors.Is(err, errs.ErrLease) {
+			return nil, err // не конфликт занятости — повтор не поможет
+		}
+		if attempt == leaseAcquireRetries {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(leaseAcquireRetryDelay):
+		}
+	}
+	return nil, fmt.Errorf("после %d попыток за %v (линия связи занята другой операцией): %w",
+		leaseAcquireRetries, time.Duration(leaseAcquireRetries)*leaseAcquireRetryDelay, lastErr)
 }
 
 // Start runs two independent polling loops: current values (frequent,
@@ -356,7 +415,7 @@ func (d *Device) PollArchives(ctx context.Context) {
 			Params:       a.Params,
 		}
 
-		release, leaseErr := d.Lease.Acquire(ctx, d.ID, a.ID, 30*time.Second)
+		release, leaseErr := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
 		if leaseErr != nil {
 			log.Printf("[%s] архив %s: не удалось занять lease: %v\n", d.ID, a.ID, leaseErr)
 			continue

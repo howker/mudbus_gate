@@ -136,7 +136,15 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, period
 		Params:    a.Params,
 	}
 
-	release, leaseErr := d.Lease.Acquire(ctx, d.ID, a.ID, 30*time.Second)
+	// acquireLeaseWithRetry (см. device.go) — раньше здесь был прямой,
+	// однократный d.Lease.Acquire без повтора: если ровно в этот момент
+	// линия занята принудительным переопросом того же прибора (см.
+	// vkm_reload.go/ForceReloadVKMHourly), обычный плановый такт молча
+	// терял весь период до следующего срабатывания планировщика —
+	// ПОДТВЕРЖДЕНО ЖИВЬЁМ (найдено оператором 2026-08-27/29): "VKM архив
+	// main: период 27.08.2026 13:30: ошибка: lease held for device
+	// ...device lease held by another owner".
+	release, leaseErr := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
 	if leaseErr != nil {
 		return 0, fmt.Errorf("lease: %w", leaseErr)
 	}
