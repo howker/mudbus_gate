@@ -932,7 +932,21 @@ function currentDeviceFormAsJSON() {
     retries: intOrZero(document.getElementById('d_retries').value),
     current_poll_seconds: intOrZero(document.getElementById('d_current_poll_seconds').value),
     backfill_max_depth_hours: intOrZero(document.getElementById('d_backfill_max_depth_hours').value),
-    gap_scan_window_hours: 0,
+    // gap_scan_window_hours раньше было жёстко захардкожено в 0 —
+    // означало, что ПОСТОЯННОЕ самозалечивание пропусков (после каждого
+    // обычного цикла опроса архива, см. device.go: d.GapScan) было
+    // фактически всегда выключено для любого прибора через UI,
+    // независимо от того, что оператор вводил в «Глубину дозабора при
+    // старте» — то поле управляет ТОЛЬКО разовым дозабором при старте
+    // сервера (BackfillArchives), не текущей работающей сессией. Найдено
+    // оператором живьём (2026-08-29): принудительный переопрос столкнул
+    // с линией плановый такт, период 18:30 потерялся, и без этого
+    // изменения он бы не восстановился сам вплоть до следующего
+    // перезапуска mbgw.exe. Теперь одно и то же число из формы задаёт
+    // ОБА механизма разом — стартовый дозабор и постоянное
+    // самозалечивание одинаковой глубиной, отдельного смысла держать их
+    // разными в UI не было.
+    gap_scan_window_hours: intOrZero(document.getElementById('d_backfill_max_depth_hours').value),
     archive_at_minute: -1,
     enabled: document.getElementById('d_enabled').checked,
     overwrite: document.getElementById('d_id').disabled // true only when editing an existing device
