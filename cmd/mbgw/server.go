@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -304,6 +305,40 @@ func runServer() {
 	// чтобы новые данные появлялись в ЭС по ходу сбора, не дожидаясь
 	// обычного часового цикла (добавлено 2026-08-27).
 	esSyncTriggers := make(map[string]chan struct{})
+	// devicesMu защищает три карты выше (devices/deviceKinds/
+	// esSyncTriggers) от одновременного чтения и записи — НУЖНО именно
+	// потому, что теперь веб-сервер запускается (см. go webServer.Start
+	// ниже) ДО того, как цикл регистрации приборов их заполнит, а не
+	// после, как было раньше. Без мьютекса это была бы гонка данных
+	// (конкурентное чтение/запись обычной Go map — не просто гонка, а
+	// потенциальный runtime-краш "concurrent map read and map write"),
+	// если оператор откроет /admin и нажмёт что-то, использующее эти
+	// карты (например, «Принудительный переопрос»), пока цикл ниже ещё
+	// регистрирует следующий прибор.
+	var devicesMu sync.Mutex
+
+	// ИЗМЕНЕНО (2026-08-29, найдено оператором живьём): раньше
+	// webServer.Start запускался В САМОМ КОНЦЕ этой функции, ПОСЛЕ всего
+	// цикла регистрации приборов ниже — а внутри цикла для каждого
+	// прибора СИНХРОННО, блокирующе выполняется dev.BackfillArchives
+	// (дозабор при старте). Если у одного прибора дозабор долго и
+	// безуспешно ломится (например, физически неисправный датчик —
+	// каждый из сотен периодов не даёт данных, но всё равно требует
+	// полного цикла запрос/ожидание/таймаут) — /admin был недоступен
+	// ВООБЩЕ до конца всего цикла, включая ВСЕ остальные приборы после
+	// проблемного. Запуск здесь, ДО цикла, устраняет эту зависимость:
+	// /admin отвечает сразу, независимо от того, сколько времени займёт
+	// дозабор любого количества приборов ниже.
+	//
+	// Порядок «дозабор блокирует ДО регистрации ЭТОГО ЖЕ прибора в
+	// планировщике» (см. dev.BackfillArchives внутри цикла ниже) НЕ
+	// затронут этим изменением — это два независимых момента: ЭТОТ
+	// перенос касается только времени запуска HTTP-listener'а, не
+	// порядка операций внутри цикла для одного прибора (см. комментарий
+	// у dev.BackfillArchives ниже про инцидент 2026-07-29 — та гонка
+	// была между дозабором и ПЛАНОВЫМ опросом ОДНОГО И ТОГО ЖЕ прибора
+	// за lease, никак не связана с моментом запуска веб-сервера).
+	go webServer.Start(ctx)
 
 	// Devices come from the devices table (UpsertDevice/ListDevices,
 	// internal/storage/sqlite/repo_device_config.go) instead of
@@ -395,8 +430,10 @@ func runServer() {
 		if devRec.GapScanWindowHours > 0 {
 			dev.GapScanWindowHours = devRec.GapScanWindowHours
 		}
+		devicesMu.Lock()
 		devices[devRec.ID] = dev
 		deviceKinds[devRec.ID] = devRec.Kind
+		devicesMu.Unlock()
 
 		// Same blocking-backfill-before-scheduler-register reasoning as
 		// run.go/serve.go — see those files' identical comment for the
@@ -450,14 +487,27 @@ func runServer() {
 			startAkronNorthboundForDevice(ctx, repo, devRec.ID)
 		case "vkm360":
 			if trigger := startESyncForDevice(ctx, repo, devRec.ID, dbPath); trigger != nil {
+				devicesMu.Lock()
 				esSyncTriggers[devRec.ID] = trigger
+				devicesMu.Unlock()
 			}
 		}
 	}
 
 	webServer.SetManualPoll(func() {
-		log.Printf("[WEB] ручной опрос запрошен для %d прибор(ов)\n", len(devices))
+		// Снимок карты под мьютексом, а не итерация по ней напрямую —
+		// сама итерация тоже требует блокировки на всё время цикла, а
+		// это лишняя задержка HTTP-обработчика ради, по сути, короткой
+		// операции (RequestManualPoll — быстрый неблокирующий вызов).
+		devicesMu.Lock()
+		snapshot := make(map[string]*device.Device, len(devices))
 		for id, d := range devices {
+			snapshot[id] = d
+		}
+		devicesMu.Unlock()
+
+		log.Printf("[WEB] ручной опрос запрошен для %d прибор(ов)\n", len(snapshot))
+		for id, d := range snapshot {
 			sched.RequestManualPoll(id, scheduler.KindCurrent)
 			if len(d.Profile.Archives) > 0 {
 				sched.RequestManualPoll(id, scheduler.KindBackfill)
@@ -479,11 +529,13 @@ func runServer() {
 	// кнопкой «Отменить», не влияя на остальной процесс (добавлено
 	// 2026-08-27 — раньше общий ctx делал это в принципе невозможным).
 	webServer.SetForceReload(func(jobCtx context.Context, deviceID string, from, to time.Time, onProgress func(done, total int)) (int, error) {
+		devicesMu.Lock()
 		dev, ok := devices[deviceID]
-		if !ok {
-			return 0, fmt.Errorf("прибор %s не найден среди работающих (сохранён ли он и запущен ли server?)", deviceID)
-		}
 		kind := deviceKinds[deviceID]
+		devicesMu.Unlock()
+		if !ok {
+			return 0, fmt.Errorf("прибор %s не найден среди работающих (сохранён ли он и запущен ли server? если прибор добавлен только что — дождитесь окончания стартовой регистрации всех приборов)", deviceID)
+		}
 		log.Printf("[WEB] принудительный переопрос архива %s (%s) с %s по %s\n",
 			deviceID, kind, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
 		switch kind {
@@ -503,9 +555,11 @@ func runServer() {
 	// не обработан, повторный клик просто ничего не делает, не копит
 	// очередь.
 	webServer.SetSyncNow(func(deviceID string) error {
+		devicesMu.Lock()
 		trigger, ok := esSyncTriggers[deviceID]
+		devicesMu.Unlock()
 		if !ok {
-			return fmt.Errorf("для прибора %s es-sync не запущен (проверьте подключение к ЭС и каналы)", deviceID)
+			return fmt.Errorf("для прибора %s es-sync не запущен (проверьте подключение к ЭС и каналы, либо дождитесь окончания стартовой регистрации приборов)", deviceID)
 		}
 		select {
 		case trigger <- struct{}{}:
@@ -513,8 +567,6 @@ func runServer() {
 		}
 		return nil
 	})
-
-	go webServer.Start(ctx)
 
 	pl := poller.New(sched, devices, 1*time.Second)
 	go pl.Run(ctx)

@@ -72,13 +72,23 @@ var vkmHourlyParams = []string{"S", "ST", "T", "Pi"}
 // никогда, только несовпадение соглашения о подписи между Akron и ВКМ
 // внутри нашей же системы. Теперь оба типа приборов подписывают архив
 // одинаково — концом периода.
+//
+// ИСПРАВЛЕНО (2026-08-30, найдено оператором — лог разросся заметной
+// частью из-за одного хронически неисправного прибора): раньше строка
+// "поле X отсутствует (поля=...)" печаталась ОТДЕЛЬНО на каждое
+// отсутствующее поле — для прибора с несколькими одновременно
+// отсутствующими полями (например, оборванный датчик dP, из-за которого
+// не считаются сразу и S, и T, и Pi) один и тот же полный дамп rec.Fields
+// печатался по 2-3 раза подряд, почти без дополнительной пользы для
+// диагностики. Теперь одна строка на период со списком всех
+// отсутствующих полей сразу.
 func persistVKMHourly(ctx context.Context, d *Device, periodLabel time.Time, rec archive.ArchiveRecord) int {
 	saved := 0
+	var missing []string
 	for _, param := range vkmHourlyParams {
 		v, ok := fieldFloat(rec.Fields, param)
 		if !ok {
-			log.Printf("[%s] VKM период %s: поле %s отсутствует в ответе прибора (поля=%v)\n",
-				d.ID, periodLabel.Format("02.01.2006 15:04"), param, rec.Fields)
+			missing = append(missing, param)
 			continue
 		}
 		unit, _ := rec.Fields[param+"_unit"].(string)
@@ -97,6 +107,10 @@ func persistVKMHourly(ctx context.Context, d *Device, periodLabel time.Time, rec
 			continue
 		}
 		saved++
+	}
+	if len(missing) > 0 {
+		log.Printf("[%s] VKM период %s: поля %s отсутствуют в ответе прибора (поля=%v)\n",
+			d.ID, periodLabel.Format("02.01.2006 15:04"), strings.Join(missing, ", "), rec.Fields)
 	}
 	return saved
 }
@@ -266,6 +280,22 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, period
 			Reliable:  false,
 			Note:      "формат времени в ответе прибора не позволяет определить точный момент (голые секунды либо поле Time отсутствует)",
 		})
+		// Логируем ТОЛЬКО фрагмент вокруг Time= (не всю сырую строку —
+		// она может быть длинной), чтобы при следующем разборе "не
+		// определено" на дашборде можно было сразу увидеть ПОЧЕМУ, не
+		// гадая (найдено оператором 2026-08-30 — предыдущая версия
+		// вообще не логировала эту причину).
+		raw := string(records[0].Raw)
+		snippet := raw
+		if idx := strings.Index(raw, "Time="); idx >= 0 {
+			end := idx + 80
+			if end > len(raw) {
+				end = len(raw)
+			}
+			snippet = raw[idx:end]
+		}
+		log.Printf("[%s] VKM период %s: дрейф времени не определён, фрагмент ответа: %q\n",
+			d.ID, periodLabel.Format("02.01.2006 15:04"), snippet)
 	}
 
 	return persistVKMHourly(ctx, d, periodLabel, records[0]), nil
