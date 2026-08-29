@@ -268,73 +268,56 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 
 	resp := probeResponse{OK: true}
 
-	// Серийный номер (1810HR, int32) и версия встроенного ПО (1807HR,
-	// int16) — регистры "Идентификаторы и флаги" из карты регистров
-	// ЭЛЕМЕР-ВКМ-360 (registri_mbrrtu_vkm.pdf). Порядок байт "0123" —
-	// после успешного sess.Open() устройство уже подтверждено работающим
-	// в стандартном порядке (тот же приём, что в tools/vkmprobe).
-	if data, err := reader.ReadRaw(probeCtx, "HR", 1810, "int32"); err != nil {
-		resp.Error = firstNonEmpty(resp.Error, "серийный номер (HR 1810): "+err.Error())
-	} else if v, err := codec.DecodeInt32(data, "0123"); err == nil {
-		resp.SerialNumber = fmt.Sprintf("%d", v)
-	}
-	if data, err := reader.ReadRaw(probeCtx, "HR", 1807, "int16"); err != nil {
-		resp.Error = firstNonEmpty(resp.Error, "версия ПО (HR 1807): "+err.Error())
-	} else if v, err := codec.DecodeInt16(data); err == nil {
-		resp.FirmwareInfo = fmt.Sprintf("версия встроенного ПО = %d", v)
-	}
-
-	// Часы прибора — 1800-1805HR, только чтение (день/месяц/год/часы/
-	// минуты/секунды, каждый отдельным int16-регистром).
-	clock := make([]int16, 6)
-	clockOK := true
-	for i := range clock {
-		data, err := reader.ReadRaw(probeCtx, "HR", 1800+i, "int16")
-		if err != nil {
-			clockOK = false
-			resp.Error = firstNonEmpty(resp.Error, fmt.Sprintf("часы прибора (HR %d): %v", 1800+i, err))
-			break
-		}
-		v, err := codec.DecodeInt16(data)
-		if err != nil {
-			clockOK = false
-			break
-		}
-		clock[i] = v
-	}
-	if clockOK {
-		resp.DeviceTime = fmt.Sprintf("%02d.%02d.%04d %02d:%02d:%02d",
-			clock[0], clock[1], clock[2], clock[3], clock[4], clock[5])
-	}
-
-	// Мгновенные показания на трубопроводе №1 (addr_formula
-	// "2000+(pipe-1)*100+N" из profiles/vkm360.yaml при pipe=1 даёт
-	// смещение 0) — форма добавления прибора пока не собирает номер
+	// ИЗМЕНЕНО (2026-08-29, проверено живьём через tools/vkmtimeprobe на
+	// boylernaya_par): здесь раньше были попытки прочитать серийный номер
+	// (1810HR), версию ПО (1807HR) и часы прибора (1800-1805HR) — все три
+	// взяты из документации ЭЛЕМЕР (registri_mbrrtu_vkm.pdf) как "должны
+	// быть реализованы", но НИ ОДИН из них не ответил на реальном приборе
+	// (таймаут, не ошибка Modbus — устройство просто не отвечает на эти
+	// адреса вообще). Убраны совсем, а не оставлены "на всякий случай" —
+	// иначе КАЖДАЯ проверка прибора ждала бы retries×backoff по трём
+	// заведомо мёртвым регистрам, прежде чем дойти до полезных данных.
+	// Если для другого экземпляра/прошивки ВКМ-360 этот блок всё же
+	// работает — его стоит вернуть, но уже как проверенный факт для
+	// конкретного прибора, не как общее предположение по документации.
+	//
+	// Мгновенные показания на трубопроводе №1 — единственное, что
+	// реально проверено. Адреса взяты НЕ из чужой документации, а прямо
+	// из profiles/vkm360.yaml (тот же профиль, что использует боевой
+	// цикл опроса этого самого прибора): IR 2000 (Избыточное давление),
+	// IR 2004 (Температура), IR 2000+(pipe-1)*100+8 = IR 2008 при pipe=1
+	// (Массовый расход). Форма добавления прибора пока не собирает номер
 	// трубы отдельно (это делается позже, на вкладке каналов ЭС), так
-	// что пробник намеренно всегда проверяет трубу №1, просто как живой
-	// признак того, что прибор действительно отдаёт измерения, а не
-	// только отвечает на служебные регистры.
-	if data, err := reader.ReadRaw(probeCtx, "IR", 2000, "float"); err == nil {
-		if v, err := codec.DecodeFloat32(data, "0123"); err == nil {
-			resp.Pressure = fmt.Sprintf("%.0f Па", v)
-		}
+	// что пробник намеренно всегда проверяет трубу №1 — просто как живой
+	// признак того, что прибор действительно отдаёт измерения.
+	if data, err := reader.ReadRaw(probeCtx, "IR", 2000, "float"); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "давление (IR 2000): "+err.Error())
+	} else if v, err := codec.DecodeFloat32(data, "0123"); err == nil {
+		resp.Pressure = fmt.Sprintf("%.0f Па", v)
 	}
-	if data, err := reader.ReadRaw(probeCtx, "IR", 2004, "float"); err == nil {
-		if v, err := codec.DecodeFloat32(data, "0123"); err == nil {
-			resp.Temperature = fmt.Sprintf("%.2f °C", v)
-		}
+	if data, err := reader.ReadRaw(probeCtx, "IR", 2004, "float"); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "температура (IR 2004): "+err.Error())
+	} else if v, err := codec.DecodeFloat32(data, "0123"); err == nil {
+		resp.Temperature = fmt.Sprintf("%.2f °C", v)
 	}
-	if data, err := reader.ReadRaw(probeCtx, "IR", 2008, "float"); err == nil {
-		if v, err := codec.DecodeFloat32(data, "0123"); err == nil {
-			resp.MassFlow = fmt.Sprintf("%.4f кг/с", v)
-		}
+	if data, err := reader.ReadRaw(probeCtx, "IR", 2008, "float"); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "массовый расход (IR 2008): "+err.Error())
+	} else if v, err := codec.DecodeFloat32(data, "0123"); err == nil {
+		resp.MassFlow = fmt.Sprintf("%.4f кг/с", v)
 	}
 
-	// Если не прочиталось ВООБЩЕ ничего (ни серийника, ни часов) —
-	// сессия открылась, но за этим явно стоит неверный unit id или
+	// Если не прочиталось ВООБЩЕ ничего — сессия открылась, но за этим
+	// явно стоит неверный unit id, незасинхронизированная труба или
 	// нестандартная прошивка, а не частичный успех. Сообщаем как отказ,
 	// а не как "успех" с полностью пустым ответом.
-	if resp.SerialNumber == "" && resp.DeviceTime == "" {
+	//
+	// ИСПРАВЛЕНО (2026-08-29): раньше эта проверка смотрела на
+	// SerialNumber/DeviceTime — поля, которые probeVKM теперь вообще не
+	// заполняет (см. выше), так что она бы ВСЕГДА считала результат
+	// неуспешным, даже если все три мгновенных значения прочитались
+	// нормально. Теперь проверяет именно те поля, которые эта функция
+	// реально может заполнить.
+	if resp.Pressure == "" && resp.Temperature == "" && resp.MassFlow == "" {
 		resp.OK = false
 		resp.Error = firstNonEmpty(resp.Error, "сессия открыта, но ни один регистр не прочитался — проверьте unit id")
 	}
