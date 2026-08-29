@@ -357,142 +357,46 @@ func runServer() {
 		log.Println("[INFO] в БД не настроено ни одного прибора — сервер запущен, но опрашивать нечего")
 	}
 
+	// ИЗМЕНЕНО (2026-08-30, найдено оператором живьём): раньше приборы
+	// регистрировались ПОСЛЕДОВАТЕЛЬНО, один за другим, в одном простом
+	// for-цикле — а внутри каждой итерации дозабор (dev.BackfillArchives)
+	// блокирующий. Если у ОДНОГО прибора дозабор идёт очень долго
+	// (реальный случай: прибор "osmos" упёрся в длинный "мёртвый"
+	// участок кольцевого буфера — записи с нечитаемой/нулевой датой,
+	// которые НЕ считаются ни закрытием пропуска, ни концом архива, см.
+	// backfillAkronHourly в internal/device/backfill.go, — и продолжал
+	// методично перемалывать мусорные страницы) — КАЖДЫЙ прибор, идущий
+	// в списке ПОСЛЕ него, физически не доходил до
+	// sched.RegisterWithArchiveAnchor и потому не опрашивался вообще,
+	// хотя сам процесс был жив и /admin отвечал (тот фикс уже сделан
+	// раньше, 2026-08-29 — но он решил только доступность UI, не эту,
+	// более глубокую проблему).
+	//
+	// Теперь регистрация каждого прибора идёт в СВОЕЙ горутине —
+	// застрявший/медленный дозабор одного прибора больше не блокирует
+	// вообще ничего для остальных, независимо от причины (мусор в
+	// буфере, физически неисправный датчик, недоступный по сети прибор
+	// и т.п.). Порядок ВНУТРИ одного прибора (дозабор ДО регистрации
+	// ЭТОГО ЖЕ прибора в планировщике) не изменился — это по-прежнему
+	// нужно, чтобы избежать инцидента 2026-07-29 (гонка дозабора с
+	// плановым опросом ЗА ТОТ ЖЕ lease). wg.Wait() ниже гарантирует, что
+	// poller.New(sched, devices, ...) получит карту devices только
+	// после того, как ВСЕ горутины закончат в неё писать — без этого
+	// была бы гонка данных на самой карте.
+	var wg sync.WaitGroup
 	for _, devRec := range deviceRecords {
 		if !devRec.Enabled {
 			log.Printf("[INFO] прибор %s отключён (enabled=0) — пропускаю\n", devRec.ID)
 			continue
 		}
-
-		p, err := profile.Parse(devRec.Profile)
-		if err != nil {
-			log.Printf("[ERROR] прибор %s: ошибка профиля %s: %v\n", devRec.ID, devRec.Profile, err)
-			continue
-		}
-		sess, err := session.NewFromProfile(p.Session)
-		if err != nil {
-			log.Printf("[ERROR] неизвестный тип сессии %s: %v\n", p.Session.Type, err)
-			continue
-		}
-
-		retries := devRec.Retries
-		if retries <= 0 {
-			retries = 3 // matches devices table's DEFAULT and protocol/modbus/core.go's own fallback expectation
-		}
-		trParams := transport.Params{
-			Kind:            transport.Kind(devRec.TransportKind),
-			Host:            devRec.Host,
-			Port:            devRec.Port,
-			COM:             devRec.COM,
-			Baudrate:        devRec.Baudrate,
-			Parity:          devRec.Parity,
-			StopBits:        devRec.StopBits,
-			ResponseTimeout: time.Duration(devRec.TimeoutMs) * time.Millisecond,
-			Retries:         retries,
-		}
-		tr, err := transport.New(trParams)
-		if err != nil {
-			log.Printf("[ERROR] прибор %s: не удалось создать транспорт: %v\n", devRec.ID, err)
-			continue
-		}
-		if err := tr.Open(ctx); err != nil {
-			log.Printf("[ERROR] прибор %s: не удалось открыть транспорт: %v\n", devRec.ID, err)
-			continue
-		}
-		if err := sess.Open(ctx, tr); err != nil {
-			log.Printf("[ERROR] ошибка сессии %s: %v\n", devRec.ID, err)
-			continue
-		}
-		isTCP := devRec.TransportKind == "modbus_tcp"
-
-		unitID := devRec.UnitID
-		if unitID == 0 {
-			unitID = 1
-		}
-		reader := pollcore.New(tr, isTCP, uint8(unitID))
-
-		// Сбор паспорта прибора (заводской номер, тип, версия прошивки) —
-		// ОБЯЗАТЕЛЬНЫЙ шаг для Akron перед запуском приёма данных для ЭС:
-		// northbound-эмулятор (internal/northbound/akron_live.go) отвечает
-		// на команду идентификации (101) ТОЛЬКО если паспорт уже сохранён
-		// в БД — иначе молча игнорирует запрос, и ЭС никогда не проходит
-		// дальше первого шага опроса (см. живой лог 2026-08-23: ЭС раз за
-		// разом шлёт 101, carrier печатает «паспорт ещё не собран — на 101
-		// молчим»). Раньше паспорт собирала отдельная ручная утилита
-		// (akronread --save-passport); в едином процессе server этот шаг
-		// нужно делать здесь, автоматически, при каждой регистрации
-		// Akron-прибора — используя уже открытый транспорт, без отдельного
-		// подключения.
-		if devRec.Kind == "akron" {
-			collectAkronPassport(ctx, repo, devRec.ID, reader)
-		}
-
-		dev := device.New(devRec.ID, p, reader, sess, repo, leaseMgr)
-		if devRec.GapScanWindowHours > 0 {
-			dev.GapScanWindowHours = devRec.GapScanWindowHours
-		}
-		devicesMu.Lock()
-		devices[devRec.ID] = dev
-		deviceKinds[devRec.ID] = devRec.Kind
-		devicesMu.Unlock()
-
-		// Same blocking-backfill-before-scheduler-register reasoning as
-		// run.go/serve.go — see those files' identical comment for the
-		// 2026-07-29 incident this order avoids.
-		if len(p.Archives) > 0 {
-			dev.BackfillArchives(ctx, device.BackfillOptions{
-				MaxDepthHours: devRec.BackfillMaxDepthHours,
-			})
-		}
-
-		// Интервал опроса архива зависит от того, КАК прибор сам делит
-		// свой архив на записи — не универсальная константа. ВКМ360
-		// физически отдаёт получасовки (см. vkm_hourly.go, vkmArchivePeriod);
-		// опрос раз в час (как для Akron, у которого архив честно
-		// часовой) СИСТЕМАТИЧЕСКИ терял каждую вторую получасовку — на
-		// каждом часовом тике pollVKMHourlyLatest видит только ОДНУ,
-		// последнюю завершённую получасовку, а не обе, что успели
-		// закрыться с прошлого тика. Подтверждено живьём (2026-08-25):
-		// час опроса ловил стабильно только записи на ":30", записи на
-		// ":00" не собирались НИКОГДА обычным циклом (только дозабором
-		// при старте) — а прибор, судя по всему, копит показания между
-		// успешными опросами, из-за чего следующая пойманная получасовка
-		// выходила завышенной (несла в себе накопленное за оба
-		// пропущенных получаса), а не только за свои 30 минут.
-		archiveInterval := time.Duration(0)
-		if len(p.Archives) > 0 {
-			if devRec.Kind == "vkm360" {
-				archiveInterval = 30 * time.Minute
-			} else {
-				archiveInterval = 1 * time.Hour
-			}
-		}
-		currentInterval := time.Duration(devRec.CurrentPollSeconds) * time.Second
-		if devRec.CurrentPollSeconds <= 0 {
-			currentInterval = 3600 * time.Second
-		}
-		archiveAtMinute := devRec.ArchiveAtMinute
-		if archiveAtMinute < 0 {
-			archiveAtMinute = 5
-		}
-		sched.RegisterWithArchiveAnchor(devRec.ID, currentInterval, archiveInterval, nil, archiveAtMinute)
-		log.Printf("[OK] прибор %s (%s) зарегистрирован (текущие каждые %s, архив каждые %s в HH:%02d)\n",
-			devRec.ID, devRec.Kind, currentInterval, archiveInterval, archiveAtMinute)
-
-		// Per-kind upstream delivery, started right after the device is
-		// registered for southbound polling — same "additive, opt-in per
-		// row present in the DB" principle as serve()'s
-		// cfg.NorthboundAkron check.
-		switch devRec.Kind {
-		case "akron":
-			startAkronNorthboundForDevice(ctx, repo, devRec.ID)
-		case "vkm360":
-			if trigger := startESyncForDevice(ctx, repo, devRec.ID, dbPath); trigger != nil {
-				devicesMu.Lock()
-				esSyncTriggers[devRec.ID] = trigger
-				devicesMu.Unlock()
-			}
-		}
+		devRec := devRec // захват переменной цикла для горутины (go1.20 ещё требует явно)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			registerOneDevice(ctx, repo, devRec, leaseMgr, sched, dbPath, &devicesMu, devices, deviceKinds, esSyncTriggers)
+		}()
 	}
+	wg.Wait()
 
 	webServer.SetManualPoll(func() {
 		// Снимок карты под мьютексом, а не итерация по ней напрямую —
@@ -575,6 +479,154 @@ func runServer() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	<-sigChan
 	log.Println("=== получен сигнал завершения. остановка... ===")
+}
+
+// registerOneDevice делает всё, что раньше было одной итерацией
+// последовательного цикла в runServer: открывает транспорт/сессию,
+// собирает паспорт (Akron), выполняет БЛОКИРУЮЩИЙ стартовый дозабор
+// архива, регистрирует прибор в планировщике и запускает northbound/
+// es-sync. Теперь вызывается в СВОЕЙ горутине на каждый прибор (см.
+// комментарий в runServer у wg.Wait()) — ошибка/долгий дозабор одного
+// прибора здесь никак не влияет на остальные горутины, вызванные для
+// других приборов.
+//
+// devicesMu защищает devices/deviceKinds/esSyncTriggers — эти три карты
+// теперь пишутся ИЗ РАЗНЫХ горутин одновременно (раньше — из одной,
+// строго последовательно), так что блокировка обязательна на каждую
+// запись, не только ради HTTP-обработчиков, как было раньше.
+func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqliterepo.DeviceRecord, leaseMgr *lease.LocalLease, sched *scheduler.Scheduler, dbPath string, devicesMu *sync.Mutex, devices map[string]*device.Device, deviceKinds map[string]string, esSyncTriggers map[string]chan struct{}) {
+	p, err := profile.Parse(devRec.Profile)
+	if err != nil {
+		log.Printf("[ERROR] прибор %s: ошибка профиля %s: %v\n", devRec.ID, devRec.Profile, err)
+		return
+	}
+	sess, err := session.NewFromProfile(p.Session)
+	if err != nil {
+		log.Printf("[ERROR] неизвестный тип сессии %s: %v\n", p.Session.Type, err)
+		return
+	}
+
+	retries := devRec.Retries
+	if retries <= 0 {
+		retries = 3 // matches devices table's DEFAULT and protocol/modbus/core.go's own fallback expectation
+	}
+	trParams := transport.Params{
+		Kind:            transport.Kind(devRec.TransportKind),
+		Host:            devRec.Host,
+		Port:            devRec.Port,
+		COM:             devRec.COM,
+		Baudrate:        devRec.Baudrate,
+		Parity:          devRec.Parity,
+		StopBits:        devRec.StopBits,
+		ResponseTimeout: time.Duration(devRec.TimeoutMs) * time.Millisecond,
+		Retries:         retries,
+	}
+	tr, err := transport.New(trParams)
+	if err != nil {
+		log.Printf("[ERROR] прибор %s: не удалось создать транспорт: %v\n", devRec.ID, err)
+		return
+	}
+	if err := tr.Open(ctx); err != nil {
+		log.Printf("[ERROR] прибор %s: не удалось открыть транспорт: %v\n", devRec.ID, err)
+		return
+	}
+	if err := sess.Open(ctx, tr); err != nil {
+		log.Printf("[ERROR] ошибка сессии %s: %v\n", devRec.ID, err)
+		return
+	}
+	isTCP := devRec.TransportKind == "modbus_tcp"
+
+	unitID := devRec.UnitID
+	if unitID == 0 {
+		unitID = 1
+	}
+	reader := pollcore.New(tr, isTCP, uint8(unitID))
+
+	// Сбор паспорта прибора (заводской номер, тип, версия прошивки) —
+	// ОБЯЗАТЕЛЬНЫЙ шаг для Akron перед запуском приёма данных для ЭС:
+	// northbound-эмулятор (internal/northbound/akron_live.go) отвечает
+	// на команду идентификации (101) ТОЛЬКО если паспорт уже сохранён
+	// в БД — иначе молча игнорирует запрос, и ЭС никогда не проходит
+	// дальше первого шага опроса (см. живой лог 2026-08-23: ЭС раз за
+	// разом шлёт 101, carrier печатает «паспорт ещё не собран — на 101
+	// молчим»). Раньше паспорт собирала отдельная ручная утилита
+	// (akronread --save-passport); в едином процессе server этот шаг
+	// нужно делать здесь, автоматически, при каждой регистрации
+	// Akron-прибора — используя уже открытый транспорт, без отдельного
+	// подключения.
+	if devRec.Kind == "akron" {
+		collectAkronPassport(ctx, repo, devRec.ID, reader)
+	}
+
+	dev := device.New(devRec.ID, p, reader, sess, repo, leaseMgr)
+	if devRec.GapScanWindowHours > 0 {
+		dev.GapScanWindowHours = devRec.GapScanWindowHours
+	}
+	devicesMu.Lock()
+	devices[devRec.ID] = dev
+	deviceKinds[devRec.ID] = devRec.Kind
+	devicesMu.Unlock()
+
+	// Same blocking-backfill-before-scheduler-register reasoning as
+	// run.go/serve.go — see those files' identical comment for the
+	// 2026-07-29 incident this order avoids. Долгий дозабор здесь
+	// по-прежнему блокирует РЕГИСТРАЦИЮ ЭТОГО прибора в планировщике —
+	// это не изменилось и не должно меняться — но теперь блокирует
+	// только ЭТУ горутину, не остальные приборы.
+	if len(p.Archives) > 0 {
+		dev.BackfillArchives(ctx, device.BackfillOptions{
+			MaxDepthHours: devRec.BackfillMaxDepthHours,
+		})
+	}
+
+	// Интервал опроса архива зависит от того, КАК прибор сам делит
+	// свой архив на записи — не универсальная константа. ВКМ360
+	// физически отдаёт получасовки (см. vkm_hourly.go, vkmArchivePeriod);
+	// опрос раз в час (как для Akron, у которого архив честно
+	// часовой) СИСТЕМАТИЧЕСКИ терял каждую вторую получасовку — на
+	// каждом часовом тике pollVKMHourlyLatest видит только ОДНУ,
+	// последнюю завершённую получасовку, а не обе, что успели
+	// закрыться с прошлого тика. Подтверждено живьём (2026-08-25):
+	// час опроса ловил стабильно только записи на ":30", записи на
+	// ":00" не собирались НИКОГДА обычным циклом (только дозабором
+	// при старте) — а прибор, судя по всему, копит показания между
+	// успешными опросами, из-за чего следующая пойманная получасовка
+	// выходила завышенной (несла в себе накопленное за оба
+	// пропущенных получаса), а не только за свои 30 минут.
+	archiveInterval := time.Duration(0)
+	if len(p.Archives) > 0 {
+		if devRec.Kind == "vkm360" {
+			archiveInterval = 30 * time.Minute
+		} else {
+			archiveInterval = 1 * time.Hour
+		}
+	}
+	currentInterval := time.Duration(devRec.CurrentPollSeconds) * time.Second
+	if devRec.CurrentPollSeconds <= 0 {
+		currentInterval = 3600 * time.Second
+	}
+	archiveAtMinute := devRec.ArchiveAtMinute
+	if archiveAtMinute < 0 {
+		archiveAtMinute = 5
+	}
+	sched.RegisterWithArchiveAnchor(devRec.ID, currentInterval, archiveInterval, nil, archiveAtMinute)
+	log.Printf("[OK] прибор %s (%s) зарегистрирован (текущие каждые %s, архив каждые %s в HH:%02d)\n",
+		devRec.ID, devRec.Kind, currentInterval, archiveInterval, archiveAtMinute)
+
+	// Per-kind upstream delivery, started right after the device is
+	// registered for southbound polling — same "additive, opt-in per
+	// row present in the DB" principle as serve()'s
+	// cfg.NorthboundAkron check.
+	switch devRec.Kind {
+	case "akron":
+		startAkronNorthboundForDevice(ctx, repo, devRec.ID)
+	case "vkm360":
+		if trigger := startESyncForDevice(ctx, repo, devRec.ID, dbPath); trigger != nil {
+			devicesMu.Lock()
+			esSyncTriggers[devRec.ID] = trigger
+			devicesMu.Unlock()
+		}
+	}
 }
 
 // findFreePort returns preferred if it's currently bindable, or the
