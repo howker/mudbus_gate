@@ -131,10 +131,12 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
           <th style="cursor:pointer;" onclick="sortDashboard('kind')">Тип ⇅</th>
           <th>Включён</th>
           <th style="cursor:pointer;" onclick="sortDashboard('lag')">Отставание архива ⇅</th>
+          <th>Последний период</th>
+          <th style="cursor:pointer;" onclick="sortDashboard('next')">Следующий опрос ⇅</th>
           <th style="cursor:pointer;" onclick="sortDashboard('drift')">Расхождение времени ⇅</th>
           <th>Действие</th>
         </tr></thead>
-        <tbody id="dashboardTable"><tr><td colspan="6">Загрузка...</td></tr></tbody>
+        <tbody id="dashboardTable"><tr><td colspan="8">Загрузка...</td></tr></tbody>
       </table>
       <div id="dashboardSyncMsg" class="msg"></div>
     </div>
@@ -198,6 +200,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <div class="form-row"><label>Глубина дозабора при старте (часов)</label><input id="d_backfill_max_depth_hours" type="text" value="0"></div>
         <p class="small-note">Сколько часов назад искать и добирать пропуски при каждом запуске сервера. 0 — использовать значение по умолчанию (24ч для ВКМ). Если сервер может простаивать дольше суток (плановое обслуживание и т.п.) — увеличьте, например до 72-96, чтобы пропуски добирались автоматически при следующем старте, без ручного «Принудительного переопроса».</p>
         <p class="small-note">Как часто опрашивать мгновенные показания (не архив). Раз в час обычно достаточно — этот шлюз собирает архив, не ведёт непрерывную телеметрию.</p>
+        <div class="form-row"><label>Опрос архива, минута после границы</label><input id="d_archive_at_minute" type="text" value="5"></div>
+        <p class="small-note">Через сколько минут ПОСЛЕ границы периода запрашивать архив (получасовки у ВКМ — в HH:05 и HH:35, часовки у Akron — в HH:05, при значении по умолчанию 5). Прибору нужно время, чтобы закрыть период и подготовить данные — опрос точно на самой границе (0) обычно даёт ещё не готовый или неполный результат. Значение видно и настраивается здесь же, что и на вкладке «Главная» в столбце «Следующий опрос» — добавлено 2026-08-30, раньше это было изменить нельзя вообще (жёстко 5 минут для всех приборов).</p>
       </div>
 
       <p>
@@ -888,10 +892,23 @@ function sortDashboard(key) {
   renderDashboardTable();
 }
 
+// parseRuDateTime парсит "ДД.ММ.ГГГГ ЧЧ:ММ:СС" (формат, которым сервер
+// форматирует next_poll_at/last_period) в число миллисекунд — для
+// сортировки по времени, раз сама строка лексикографически не
+// сортируется как дата (день идёт первым).
+function parseRuDateTime(s) {
+  if (!s) { return 0; }
+  var parts = s.split(' ');
+  var d = parts[0].split('.');
+  var t = (parts[1] || '00:00:00').split(':');
+  return new Date(+d[2], +d[1] - 1, +d[0], +t[0], +t[1], +(t[2] || 0)).getTime();
+}
+
 function dashboardSortValue(row, key) {
   if (key === 'name') { return (row.name || row.id || '').toLowerCase(); }
   if (key === 'kind') { return row.kind || ''; }
   if (key === 'lag') { return row.lag_known ? row.lag_hours : -999999; } // "нет данных" — в самый низ при сортировке по возрастанию
+  if (key === 'next') { return row.next_poll_at ? parseRuDateTime(row.next_poll_at) : 9999999999999; } // без расписания — в самый низ
   if (key === 'drift') {
     if (!row.time_drift_known || !row.time_drift_reliable) { return -999999; }
     return row.time_drift_seconds;
@@ -938,16 +955,20 @@ function renderDashboardTable() {
     }
     var driftTitle = d.time_drift_checked_at ? ' title="проверено: ' + d.time_drift_checked_at + '"' : '';
 
+    var lastPeriodText = d.last_period || '—';
+    var nextPollText = d.next_poll_at || '—';
+
     var actionCell = '';
     if (d.sync_supported) {
       actionCell = '<button class="btn secondary" onclick="syncNow(\'' + d.id + '\')">Синхронизировать сейчас</button>';
     }
 
     html += '<tr><td>' + (d.name || d.id) + ' (' + d.id + ')</td><td>' + d.kind + '</td><td>' +
-      enabledText + '</td><td class="' + lagClass + '">' + lagText + '</td><td class="' + driftClass + '"' + driftTitle + '>' +
+      enabledText + '</td><td class="' + lagClass + '">' + lagText + '</td><td>' + lastPeriodText +
+      '</td><td>' + nextPollText + '</td><td class="' + driftClass + '"' + driftTitle + '>' +
       driftText + '</td><td>' + actionCell + '</td></tr>';
   }
-  if (html === '') { html = '<tr><td colspan="6">Приборов пока нет</td></tr>'; }
+  if (html === '') { html = '<tr><td colspan="8">Приборов пока нет</td></tr>'; }
   document.getElementById('dashboardTable').innerHTML = html;
 }
 
@@ -1018,6 +1039,11 @@ function editDevice(id) {
   document.getElementById('d_retries').value = d.retries || '3';
   document.getElementById('d_current_poll_seconds').value = d.current_poll_seconds || '';
   document.getElementById('d_backfill_max_depth_hours').value = d.backfill_max_depth_hours || '0';
+  // archive_at_minute: -1 в БД означает "не задано явно" (сентинел, см.
+  // internal/web/api_devices.go) — показываем оператору сразу
+  // реальное действующее значение (5), а не сырое "-1", чтобы не
+  // пришлось разбираться, что оно значит.
+  document.getElementById('d_archive_at_minute').value = (d.archive_at_minute !== undefined && d.archive_at_minute >= 0) ? d.archive_at_minute : '5';
   document.getElementById('d_enabled').checked = !!d.enabled;
   onTransportKindChange();
   showTab('devices');
@@ -1046,6 +1072,7 @@ function resetDeviceForm() {
   document.getElementById('d_retries').value = '3';
   document.getElementById('d_current_poll_seconds').value = '3600';
   document.getElementById('d_backfill_max_depth_hours').value = '0';
+  document.getElementById('d_archive_at_minute').value = '5';
   document.getElementById('d_enabled').checked = true;
   onTransportKindChange();
   document.getElementById('probeMsg').className = 'msg';
@@ -1085,7 +1112,16 @@ function currentDeviceFormAsJSON() {
     // самозалечивание одинаковой глубиной, отдельного смысла держать их
     // разными в UI не было.
     gap_scan_window_hours: intOrZero(document.getElementById('d_backfill_max_depth_hours').value),
-    archive_at_minute: -1,
+    // archive_at_minute раньше было жёстко захардкожено в -1 (что на
+    // сервере трактуется как "используй умолчание 5") — поля для его
+    // настройки в форме вообще не было, оператор не мог посмотреть или
+    // изменить, когда именно опрашивается архив (добавлено 2026-08-30,
+    // прямой запрос оператора — "непонятно, когда следующий опрос
+    // запланирован", и заодно "нужна настройка", не только отображение
+    // на вкладке «Главная»). Поле в форме уже показывает 5 по умолчанию
+    // (см. HTML value="5"), так что для типового случая оператору
+    // ничего менять не нужно — то же самое поведение, что и раньше.
+    archive_at_minute: intOrZero(document.getElementById('d_archive_at_minute').value),
     enabled: document.getElementById('d_enabled').checked,
     overwrite: document.getElementById('d_id').disabled // true only when editing an existing device
   };
