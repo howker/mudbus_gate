@@ -191,10 +191,10 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <table>
         <thead><tr><th>Величина</th><th>Номер канала ЭС (ID_Channel)</th><th>Множитель</th></tr></thead>
         <tbody>
-          <tr><td>Тепловая энергия (ST)</td><td><input id="ch_ST_id" type="text"></td><td><input id="ch_ST_factor" type="text" value="1"></td></tr>
-          <tr><td>Масса (S)</td><td><input id="ch_S_id" type="text"></td><td><input id="ch_S_factor" type="text" value="1"></td></tr>
-          <tr><td>Температура (T)</td><td><input id="ch_T_id" type="text"></td><td><input id="ch_T_factor" type="text" value="1"></td></tr>
-          <tr><td>Давление (Pi)</td><td><input id="ch_Pi_id" type="text"></td><td><input id="ch_Pi_factor" type="text" value="1"></td></tr>
+          <tr><td>Тепловая энергия (ST)</td><td><input id="ch_ST_id" type="text"></td><td><input id="ch_ST_factor" type="text" value="1"><div class="small-note">Сырое значение с прибора — Джоули. Множитель 1 = в ЭС уйдут джоули «как есть» (большие числа). Чтобы в ЭС сразу приходили готовые Гкал — поставьте <b>0.000000000238846</b> (это 1&nbsp;/&nbsp;4.1868e9 — точное определение Гкал в Дж).</div></td></tr>
+          <tr><td>Масса (S)</td><td><input id="ch_S_id" type="text"></td><td><input id="ch_S_factor" type="text" value="1"><div class="small-note">Сырое значение с прибора — килограммы. Множитель 1 = в ЭС уйдут кг. Чтобы в ЭС приходили тонны (как в архиве МШ и в родном ПО прибора) — поставьте <b>0.001</b>.</div></td></tr>
+          <tr><td>Температура (T)</td><td><input id="ch_T_id" type="text"></td><td><input id="ch_T_factor" type="text" value="1"><div class="small-note">Сырое значение уже в °C — множитель 1 (без пересчёта), как правило, верен, менять обычно не нужно.</div></td></tr>
+          <tr><td>Давление (Pi)</td><td><input id="ch_Pi_id" type="text"></td><td><input id="ch_Pi_factor" type="text" value="1"><div class="small-note">Сырое значение с прибора — Паскали (Па). Множитель 1 = в ЭС уйдут Па. Для МПа поставьте <b>0.000001</b>; для кгс/см² — <b>0.0000101972</b>.</div></td></tr>
         </tbody>
       </table>
       <p><button class="btn" onclick="saveChannels()">Сохранить каналы</button></p>
@@ -523,81 +523,38 @@ function onArchiveDeviceChange() {
   var isVKM = !!(d && d.kind === 'vkm360');
   document.getElementById('rl_to_row').style.display = isVKM ? 'block' : 'none';
 
-  // Смена прибора в списке — сбрасываем отображение прежнего переопроса
-  // немедленно, НЕ дожидаясь ответа сети. Без этого старое сообщение
-  // ("Идёт переопрос...") от ПРЕЖНЕГО прибора продолжало висеть на
-  // экране до следующего тика фонового цикла (см. reloadPollGeneration
-  // ниже) — на практике оператор просто не успевал заметить разницу и
-  // думал, что переопрос идёт для только что выбранного прибора, хотя
-  // на самом деле это был "хвост" от предыдущего (баг, найден оператором
-  // 2026-08-29: переключился на другой прибор, а внизу всё ещё "идёт
-  // переопрос", хотя выбран уже другой прибор).
-  document.getElementById('reloadMsg').innerHTML = '';
-  document.getElementById('reloadMsg').className = 'msg';
-  document.getElementById('reloadCancelBtn').style.display = 'none';
-  currentReloadDeviceId = null;
-
-  // reloadPollGeneration — счётчик "поколений" фонового опроса прогресса.
-  // При каждой смене прибора увеличиваем его; каждый уже запущенный цикл
-  // pollReloadProgress сверяет СВОЁ поколение с текущим глобальным перед
-  // тем, как показать сообщение или запланировать следующий тик — если
-  // они разошлись, значит оператор уже переключился на другой прибор, и
-  // цикл прежнего прибора молча самоуничтожается, не трогая экран
-  // (добавлено 2026-08-29, тот же фикс).
-  reloadPollGeneration++;
-
   // Проверяем, не идёт ли УЖЕ переопрос для этого прибора — важно после
   // обновления страницы (F5): сам переопрос на сервере продолжает
   // работать независимо от браузера, но обычное состояние JS-переменных
   // (currentReloadDeviceId и т.п.) при перезагрузке страницы стирается,
   // и без этой проверки оператор увидел бы пустую форму, как будто
   // ничего не происходит, хотя на сервере переопрос по-прежнему идёт
-  // (добавлено 2026-08-27, прямой вопрос). Та же проверка теперь ЕЩЁ и
-  // при обычной смене прибора без перезагрузки страницы — покажет
-  // прогресс, если у НОВОГО выбранного прибора реально что-то идёт
-  // в фоне (например, оператор запустил переопрос, ушёл на другую
-  // вкладку, вернулся и выбрал именно этот прибор).
+  // (добавлено 2026-08-27, прямой вопрос).
   if (showReload && deviceId) {
     checkExistingReload(deviceId);
   }
 }
 
 function checkExistingReload(deviceId) {
-  // Запоминаем поколение, актуальное НА МОМЕНТ запуска этого запроса —
-  // если к моменту прихода ответа оператор уже переключился на другой
-  // прибор (глобальное поколение успело вырасти), ответ безопасно
-  // игнорируем, не трогая экран текущего прибора.
-  var myGeneration = reloadPollGeneration;
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/api/devices/reload-progress?device_id=' + encodeURIComponent(deviceId), true);
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
-    if (myGeneration !== reloadPollGeneration) { return; } // прибор уже сменили, пока ждали ответ
     var data;
     try { data = JSON.parse(xhr.responseText); } catch (e) { return; }
     if (data.found && !data.finished) {
       // переопрос уже идёт (запущен раньше, страница была обновлена или
-      // открыта заново, либо оператор просто переключился обратно на
-      // прибор, для которого уже что-то идёт в фоне) — сразу
-      // возобновляем отображение прогресса, как будто мы его и
-      // запускали
+      // открыта заново) — сразу возобновляем отображение прогресса,
+      // как будто мы его и запускали
       currentReloadDeviceId = deviceId;
       document.getElementById('reloadCancelBtn').style.display = 'inline-block';
-      pollReloadProgress(deviceId, myGeneration);
+      pollReloadProgress(deviceId);
     }
   };
   xhr.send();
 }
 
 var currentReloadDeviceId = null; // для кнопки «Отменить» — какой прибор сейчас переопрашивается
-
-// reloadPollGeneration растёт при каждой смене прибора в списке
-// (см. onArchiveDeviceChange) — используется, чтобы фоновые циклы
-// pollReloadProgress прежних приборов узнавали, что они больше не
-// актуальны, и переставали и опрашивать сервер, и подменять собой
-// статус-сообщение под текущим выбранным прибором (баг, найден
-// оператором 2026-08-29).
-var reloadPollGeneration = 0;
 
 function forceReload() {
   var deviceId = document.getElementById('ar_device').value;
@@ -634,7 +591,7 @@ function forceReload() {
       showMsg('reloadMsg', true, 'Переопрос запущен, идёт сбор данных с прибора...');
       currentReloadDeviceId = deviceId;
       document.getElementById('reloadCancelBtn').style.display = 'inline-block';
-      pollReloadProgress(deviceId, reloadPollGeneration);
+      pollReloadProgress(deviceId);
     } else {
       showMsg('reloadMsg', false, 'Не удалось запустить переопрос');
     }
@@ -687,24 +644,11 @@ function syncNow() {
   xhr.send(JSON.stringify({ device_id: deviceId }));
 }
 
-// pollReloadProgress(deviceId, generation) — generation фиксируется
-// вызывающей стороной (checkExistingReload / forceReload) в момент
-// запуска ЭТОГО конкретного цикла отслеживания. Если к моменту прихода
-// очередного ответа сервера оператор уже сменил прибор в списке
-// (глобальный reloadPollGeneration успел вырасти) — цикл молча
-// останавливается: не показывает сообщение (не затирает статус нового
-// выбранного прибора) и не планирует следующий тик (баг, найден
-// оператором 2026-08-29: сообщение "идёт переопрос" продолжало висеть
-// после переключения на другой прибор). Сам фоновый переопрос на
-// сервере при этом никак не останавливается — это только отключение
-// ОТОБРАЖЕНИЯ в браузере, ровно как и задумано (переключение вкладок
-// без выбора другого прибора прогресс не теряет).
-function pollReloadProgress(deviceId, generation) {
+function pollReloadProgress(deviceId) {
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/api/devices/reload-progress?device_id=' + encodeURIComponent(deviceId), true);
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
-    if (generation !== reloadPollGeneration) { return; } // прибор сменили — этот цикл больше не актуален
     var data;
     try { data = JSON.parse(xhr.responseText); } catch (e) { return; }
     if (!data.found) { return; }
@@ -712,10 +656,7 @@ function pollReloadProgress(deviceId, generation) {
     if (!data.finished) {
       var pct = data.total > 0 ? Math.round(100 * data.done / data.total) : 0;
       showMsg('reloadMsg', true, 'Идёт переопрос: обработано ' + data.done + ' из ' + data.total + ' периодов (' + pct + '%). Данные постепенно появляются в ЭС по ходу сбора...');
-      setTimeout(function() {
-        if (generation !== reloadPollGeneration) { return; } // сменили прибор, пока ждали таймаут
-        pollReloadProgress(deviceId, generation);
-      }, 1500);
+      setTimeout(function() { pollReloadProgress(deviceId); }, 1500);
       return;
     }
 
