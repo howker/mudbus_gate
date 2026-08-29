@@ -41,8 +41,13 @@ import (
 // A device kind outside this map (should not happen given handleDevices'
 // own kind validation) yields an empty param list, not an error — an
 // empty table is a safer failure than a 500.
+//
+// ИСПРАВЛЕНО (2026-08-29, найдено оператором): T и Pi раньше отсутствовали
+// здесь — вкладка «Архивы» показывала для ВКМ только 2 параметра из 4
+// (масса и тепло), температура и давление не отображались вообще, хотя
+// в archive_hourly они (после фикса в vkm_hourly.go) уже сохраняются.
 var devicesParams = map[string][]string{
-	"vkm360": {"S", "ST"},
+	"vkm360": {"S", "ST", "T", "Pi"},
 	"akron":  {"V"},
 }
 
@@ -51,6 +56,8 @@ var devicesParams = map[string][]string{
 var paramLabels = map[string]string{
 	"S":  "Масса, т",
 	"ST": "Тепловая энергия, Гкал",
+	"T":  "Температура, °C",
+	"Pi": "Давление, Па",
 	"V":  "Расход за период, м³",
 }
 
@@ -62,8 +69,11 @@ var paramLabels = map[string]string{
 // третьего знака; тепло переводится тем же коэффициентом, что уже
 // подтверждён сверкой с официальным отчётом прибора в
 // internal/integration/energosphere_sync.go (4.1868e9 Дж в одной Гкал).
-// Отсутствие ключа = множитель 1 (без пересчёта) — так остаётся, например,
-// для "V" (Akron), которое уже в м³ как есть.
+// Отсутствие ключа = множитель 1 (без пересчёта) — так остаётся для "V"
+// (Akron, уже в м³ как есть), для "T" (уже в °C, пересчёт не нужен) и
+// для "Pi" (сырое значение — Паскали, показываем как есть; при желании
+// более привычных единиц — см. аналогичный множитель для Pi в
+// подсказках вкладки «Каналы ЭС», internal/web/api_admin_ui.go).
 var paramDisplayFactor = map[string]float64{
 	"S":  1.0 / 1000.0,   // кг -> т
 	"ST": 1.0 / 4.1868e9, // Дж -> Гкал
@@ -89,6 +99,22 @@ var paramDisplayFactor = map[string]float64{
 // bucket (daily/monthly) is correct and stays unchanged.
 var paramCumulative = map[string]bool{
 	"V": true,
+}
+
+// paramAverage marks params whose STORED value is an INSTANTANEOUS
+// reading at the end of each period (not an interval sum) — ВКМ's T
+// (температура) and Pi (давление), see vkm_hourly.go's vkmHourlyParams
+// doc comment for the full history. At the finest ("raw"/"как хранится")
+// granularity this distinction doesn't matter — each bucket is exactly
+// one stored period either way. It matters ONLY for "по суткам"/"по
+// месяцам": summing a whole day of instantaneous temperature readings
+// (like S/ST's additive path does) would be physically meaningless —
+// AVERAGING them across the bucket is the correct aggregation instead
+// (added 2026-08-29, together with adding T/Pi to devicesParams — see
+// that doc comment for the bug this fixes).
+var paramAverage = map[string]bool{
+	"T":  true,
+	"Pi": true,
 }
 
 type archiveRow struct {
@@ -150,8 +176,14 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 	// SUM as rows are read (unchanged). Cumulative params (V) instead
 	// keep the LAST raw reading seen in each bucket — a snapshot, not a
 	// sum — which gets converted to a delta-from-previous-bucket in the
-	// second pass below.
+	// second pass below. Average params (T/Pi, добавлено 2026-08-29) тоже
+	// накапливаются суммой здесь, как обычные аддитивные — но параллельно
+	// bucketCounts считает, сколько сырых периодов попало в каждую
+	// корзину, чтобы в конце поделить сумму на количество и получить
+	// среднее (см. цикл ниже) — сумма мгновенных показаний сама по себе
+	// физического смысла не имеет, только их среднее.
 	buckets := make(map[string]map[string]float64)
+	bucketCounts := make(map[string]map[string]int)
 	var order []string
 
 	for _, param := range params {
@@ -180,6 +212,12 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 					order = append(order, key)
 				}
 				buckets[key][param] += row.Value
+				if paramAverage[param] {
+					if _, ok := bucketCounts[key]; !ok {
+						bucketCounts[key] = make(map[string]int)
+					}
+					bucketCounts[key][param]++
+				}
 			}
 		}
 	}
@@ -202,8 +240,19 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 		// или накопительный. Значения в buckets до этого момента остаются
 		// в СЫРЫХ единицах прибора — так проще было считать сумму/разницу
 		// выше, не путая единицы измерения с арифметикой.
+		//
+		// Для average-параметров (T/Pi, добавлено 2026-08-29) сумма из
+		// buckets сначала делится на bucketCounts — превращая сумму
+		// мгновенных показаний в их среднее — и только ПОСЛЕ этого
+		// применяется paramDisplayFactor, тем же порядком, что и для
+		// обычных аддитивных параметров.
 		converted := make(map[string]float64, len(buckets[key]))
 		for param, v := range buckets[key] {
+			if paramAverage[param] {
+				if c := bucketCounts[key][param]; c > 0 {
+					v = v / float64(c)
+				}
+			}
 			factor := paramDisplayFactor[param]
 			if factor == 0 {
 				factor = 1.0

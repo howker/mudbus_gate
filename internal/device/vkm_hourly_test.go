@@ -25,11 +25,23 @@ func newTestDeviceForVKM(t *testing.T) *Device {
 	return &Device{ID: "vkm_test", Repo: repo, Lease: lease.New()}
 }
 
-// TestPersistVKMHourly_SavesBothParams confirms S and ST are saved as two
-// separate archive_hourly rows (param="S", param="ST") for the requested
-// hour — NOT the instantaneous fields (Pi/Pbar/T/dP/H), which are
-// deliberately excluded (see vkmHourlyParams's doc comment).
-func TestPersistVKMHourly_SavesBothParams(t *testing.T) {
+// TestPersistVKMHourly_SavesAllParams confirms S, ST, T, and Pi are ALL
+// saved as separate archive_hourly rows (param="S"/"ST"/"T"/"Pi") for the
+// requested period.
+//
+// ИЗМЕНЕНО (2026-08-29, найдено оператором): раньше этот тест
+// (назывался TestPersistVKMHourly_SavesBothParams) проверял ОБРАТНОЕ —
+// что Pi/T сознательно НЕ сохраняются как мгновенные показания. Это
+// решение привело к другому, более заметному багу: вкладка «Архивы» в
+// UI показывала для ВКМ только 2 параметра из 4 (масса и тепло),
+// давление и температура не отображались вообще. Правильное решение —
+// сохранять и их тоже (см. vkmHourlyParams в vkm_hourly.go), а
+// физически корректную агрегацию мгновенных показаний (среднее, а не
+// сумма, для «по суткам»/«по месяцам») делать отдельно на уровне
+// отображения архива (internal/web/api_archive.go, paramAverage) — эта
+// функция сама по себе просто сохраняет то, что реально пришло от
+// прибора, без какой-либо агрегации.
+func TestPersistVKMHourly_SavesAllParams(t *testing.T) {
 	d := newTestDeviceForVKM(t)
 	hour := time.Date(2026, 8, 1, 14, 0, 0, 0, time.UTC)
 
@@ -39,14 +51,16 @@ func TestPersistVKMHourly_SavesBothParams(t *testing.T) {
 			"S_unit":  "кг",
 			"ST":      5.2585298e+09,
 			"ST_unit": "Дж",
-			"Pi":      4.2206e+05, // instantaneous — must NOT be saved
+			"T":       40.3497543,
+			"T_unit":  "°C",
+			"Pi":      4.2206e+05,
 			"Pi_unit": "Па",
 		},
 	}
 
 	saved := persistVKMHourly(context.Background(), d, hour, rec)
-	if saved != 2 {
-		t.Fatalf("expected 2 fields saved (S, ST), got %d", saved)
+	if saved != 4 {
+		t.Fatalf("expected 4 fields saved (S, ST, T, Pi), got %d", saved)
 	}
 
 	got, err := d.Repo.GetHourlyArchiveDesc(context.Background(), "vkm_test", "", "S", 0, 10)
@@ -65,13 +79,20 @@ func TestPersistVKMHourly_SavesBothParams(t *testing.T) {
 		t.Fatalf("unexpected ST row: %+v", gotST)
 	}
 
-	// Pi must never have been written as an hourly row.
+	gotT, err := d.Repo.GetHourlyArchiveDesc(context.Background(), "vkm_test", "", "T", 0, 10)
+	if err != nil {
+		t.Fatalf("read back T: %v", err)
+	}
+	if len(gotT) != 1 || gotT[0].Value != 40.3497543 || gotT[0].Unit != "°C" {
+		t.Fatalf("unexpected T row: %+v", gotT)
+	}
+
 	gotPi, err := d.Repo.GetHourlyArchiveDesc(context.Background(), "vkm_test", "", "Pi", 0, 10)
 	if err != nil {
 		t.Fatalf("read back Pi: %v", err)
 	}
-	if len(gotPi) != 0 {
-		t.Fatalf("Pi (instantaneous) should never be saved to archive_hourly, got %d rows", len(gotPi))
+	if len(gotPi) != 1 || gotPi[0].Value != 4.2206e+05 || gotPi[0].Unit != "Па" {
+		t.Fatalf("unexpected Pi row: %+v", gotPi)
 	}
 }
 
