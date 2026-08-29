@@ -99,7 +99,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 
 <div class="topbar"><h2>mbgw — Управление приборами</h2></div>
 <div class="tabs">
-  <button class="tab-btn active" onclick="showTab('devices')">Приборы</button>
+  <button class="tab-btn active" onclick="showTab('dashboard')">Главная</button>
+  <button class="tab-btn" onclick="showTab('devices')">Приборы</button>
   <button class="tab-btn" onclick="showTab('channels')">Каналы ЭС</button>
   <button class="tab-btn" onclick="showTab('esconn')">Подключение к ЭС</button>
   <button class="tab-btn" onclick="showTab('akron')">Приём Акрона (ЭС)</button>
@@ -111,7 +112,28 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 <div class="content">
 
   <!-- ===================== РџР РР‘РћР Р« ===================== -->
-  <div id="panel-devices" class="panel active">
+  <!-- ===================== ГЛАВНАЯ (ДАШБОРД) ===================== -->
+  <div id="panel-dashboard" class="panel active">
+    <div class="section">
+      <h3>Статус приборов</h3>
+      <p class="small-note">Отставание архива — сколько последних периодов ещё не собрано, в часах (получасовки ВКМ и часовки Акрона — на одной шкале). 0 = данные свежие. Проверка учитывает плановую задержку опроса (обычно 5 минут после границы периода + небольшой запас), чтобы не показывать ложное отставание сразу после границы часа/получаса.</p>
+      <p class="small-note">Расхождение времени — на сколько часы ПРИБОРА (не сервера) отличаются от ожидаемого, по данным последнего собранного архива ВКМ. Положительное = часы прибора спешат, отрицательное = отстают. Коррекция времени прибора через mbgw НЕ реализована (проверено живьём, 2026-08-29 — прибор не отвечает ни на один из известных регистров коррекции времени) — это только наблюдение, не исправление.</p>
+      <table>
+        <thead><tr>
+          <th style="cursor:pointer;" onclick="sortDashboard('name')">Прибор ⇅</th>
+          <th style="cursor:pointer;" onclick="sortDashboard('kind')">Тип ⇅</th>
+          <th>Включён</th>
+          <th style="cursor:pointer;" onclick="sortDashboard('lag')">Отставание архива ⇅</th>
+          <th style="cursor:pointer;" onclick="sortDashboard('drift')">Расхождение времени ⇅</th>
+          <th>Действие</th>
+        </tr></thead>
+        <tbody id="dashboardTable"><tr><td colspan="6">Загрузка...</td></tr></tbody>
+      </table>
+      <div id="dashboardSyncMsg" class="msg"></div>
+    </div>
+  </div>
+
+  <div id="panel-devices" class="panel">
     <div class="section">
       <h3>Список приборов</h3>
       <table>
@@ -231,14 +253,10 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       </p>
       <div id="esTestMsg" class="msg"></div>
       <div id="esSaveMsg" class="msg"></div>
-
-      <h3 style="margin-top:30px;">Внеплановая синхронизация</h3>
-      <p class="small-note">Обычно синхронизация с ЭС идёт раз в час сама. Если нужно отправить уже собранные данные немедленно, не дожидаясь этого часа — выберите прибор и нажмите кнопку.</p>
-      <div class="form-row"><label>Прибор</label>
-        <select id="sync_device"></select>
-      </div>
-      <p><button class="btn secondary" onclick="syncNow()">Синхронизировать сейчас</button></p>
-      <div id="syncNowMsg" class="msg"></div>
+      <!-- Кнопка «Синхронизировать сейчас» переехала на вкладку «Главная»
+           (2026-08-29, прямой запрос оператора) — там она стоит рядом с
+           каждым прибором в общей таблице статуса, а не отдельно здесь,
+           вдалеке от общего обзора приборов. -->
     </div>
   </div>
 
@@ -390,9 +408,10 @@ function showTab(name) {
   if (name === 'current') { populateDeviceSelect('cur_device', null); loadCurrentData(); }
   if (name === 'channels') { populateDeviceSelect('ch_device', 'vkm360'); }
   if (name === 'akron') { populateDeviceSelect('ak_device', 'akron'); }
-  if (name === 'esconn') { loadESConnection(); populateDeviceSelect('sync_device', 'vkm360'); }
+  if (name === 'esconn') { loadESConnection(); }
   if (name === 'settings') { loadSettings(); }
   if (name === 'archive') { populateDeviceSelect('ar_device', null); setArchivePreset('week'); }
+  if (name === 'dashboard') { loadDashboard(); }
 }
 
 function showMsg(elId, ok, text) {
@@ -664,24 +683,26 @@ function cancelReload() {
 // (обработано X из Y периодов) вместо полной тишины на много минут
 // (добавлено 2026-08-27 по прямому запросу — раньше было непонятно,
 // работает ли вообще что-то, или процесс завис).
-// syncNow — кнопка «Синхронизировать сейчас» на вкладке «Подключение к
-// ЭС» — просит уже работающий цикл es-sync конкретного прибора сделать
-// внеплановый проход немедленно (добавлено 2026-08-27).
-function syncNow() {
-  var deviceId = document.getElementById('sync_device').value;
-  if (!deviceId) { showMsg('syncNowMsg', false, 'Выберите прибор'); return; }
-  document.getElementById('syncNowMsg').className = 'msg';
+// syncNow — кнопка «Синхронизировать сейчас» напротив прибора на вкладке
+// «Главная» (переехала сюда со вкладки «Подключение к ЭС», 2026-08-29 по
+// прямому запросу оператора — раньше стояла отдельно от общего обзора
+// приборов, с собственным выпадающим списком; теперь просто передаётся
+// id конкретной строки таблицы) — просит уже работающий цикл es-sync
+// конкретного прибора сделать внеплановый проход немедленно (сама
+// логика на сервере не менялась, добавлена 2026-08-27).
+function syncNow(deviceId) {
+  document.getElementById('dashboardSyncMsg').className = 'msg';
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/es-sync/trigger', true);
   xhr.setRequestHeader('Content-Type', 'application/json');
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
     var data;
-    try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('syncNowMsg', false, 'Ошибка ответа сервера'); return; }
+    try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('dashboardSyncMsg', false, 'Ошибка ответа сервера'); return; }
     if (data.ok) {
-      showMsg('syncNowMsg', true, 'Синхронизация запрошена — проверьте ЭС через несколько секунд.');
+      showMsg('dashboardSyncMsg', true, deviceId + ': синхронизация запрошена — проверьте ЭС через несколько секунд.');
     } else {
-      showMsg('syncNowMsg', false, 'Ошибка: ' + (data.error || 'неизвестная'));
+      showMsg('dashboardSyncMsg', false, deviceId + ': ошибка — ' + (data.error || 'неизвестная'));
     }
   };
   xhr.send(JSON.stringify({ device_id: deviceId }));
@@ -819,6 +840,107 @@ function exportArchiveCSV() {
     return;
   }
   window.location = '/api/archive/export?' + archiveQueryString();
+}
+
+// ===================== ГЛАВНАЯ (ДАШБОРД) =====================
+// Добавлено 2026-08-29 по прямому запросу оператора: "мы никак не
+// отслеживаем какое время сейчас в приборе... нужен дашборд". Данные
+// приходят одним запросом с сервера (GET /api/dashboard, см.
+// internal/web/api_dashboard.go) — вся сортировка/раскраска чисто на
+// стороне браузера, сервер всегда отдаёт один и тот же порядок (по id
+// прибора), сортировка не сохраняется между обновлениями (перегрузка
+// каждые 30с — см. вызов setInterval в самом низу файла — сбросила бы
+// её всё равно, так что запоминать выбранную сортировку смысла нет).
+var dashboardData = [];
+var dashboardSortKey = null;
+var dashboardSortAsc = true;
+
+function loadDashboard() {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/dashboard', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    if (xhr.status !== 200) { return; }
+    try { dashboardData = JSON.parse(xhr.responseText) || []; } catch (e) { return; }
+    renderDashboardTable();
+  };
+  xhr.send();
+}
+
+// sortDashboard — вызывается кликом по заголовку столбца. Повторный клик
+// по тому же столбцу переключает направление (по возрастанию/убыванию),
+// клик по другому столбцу сортирует по нему заново, по возрастанию.
+function sortDashboard(key) {
+  if (dashboardSortKey === key) {
+    dashboardSortAsc = !dashboardSortAsc;
+  } else {
+    dashboardSortKey = key;
+    dashboardSortAsc = true;
+  }
+  renderDashboardTable();
+}
+
+function dashboardSortValue(row, key) {
+  if (key === 'name') { return (row.name || row.id || '').toLowerCase(); }
+  if (key === 'kind') { return row.kind || ''; }
+  if (key === 'lag') { return row.lag_known ? row.lag_hours : -999999; } // "нет данных" — в самый низ при сортировке по возрастанию
+  if (key === 'drift') {
+    if (!row.time_drift_known || !row.time_drift_reliable) { return -999999; }
+    return row.time_drift_seconds;
+  }
+  return '';
+}
+
+function renderDashboardTable() {
+  var rows = dashboardData.slice(); // копия — не трогаем исходный порядок с сервера
+  if (dashboardSortKey) {
+    rows.sort(function(a, b) {
+      var va = dashboardSortValue(a, dashboardSortKey);
+      var vb = dashboardSortValue(b, dashboardSortKey);
+      var cmp = 0;
+      if (va < vb) { cmp = -1; } else if (va > vb) { cmp = 1; }
+      return dashboardSortAsc ? cmp : -cmp;
+    });
+  }
+
+  var html = '';
+  for (var i = 0; i < rows.length; i++) {
+    var d = rows[i];
+    var enabledText = d.enabled ? '<span class="status-good">да</span>' : '<span class="status-bad">нет</span>';
+
+    var lagText, lagClass;
+    if (!d.lag_known) {
+      lagText = 'нет данных'; lagClass = 'status-bad';
+    } else if (d.lag_hours === 0) {
+      lagText = '0'; lagClass = 'status-good';
+    } else {
+      lagText = d.lag_hours.toFixed(1) + ' ч'; lagClass = 'status-bad';
+    }
+
+    var driftText, driftClass;
+    if (!d.time_drift_known) {
+      driftText = 'нет данных'; driftClass = '';
+    } else if (!d.time_drift_reliable) {
+      driftText = 'не определено'; driftClass = '';
+    } else {
+      var absSec = Math.abs(d.time_drift_seconds);
+      var sign = d.time_drift_seconds >= 0 ? '+' : '-';
+      driftText = sign + Math.round(absSec) + ' сек';
+      driftClass = absSec > 300 ? 'status-bad' : (absSec > 60 ? '' : 'status-good');
+    }
+    var driftTitle = d.time_drift_checked_at ? ' title="проверено: ' + d.time_drift_checked_at + '"' : '';
+
+    var actionCell = '';
+    if (d.sync_supported) {
+      actionCell = '<button class="btn secondary" onclick="syncNow(\'' + d.id + '\')">Синхронизировать сейчас</button>';
+    }
+
+    html += '<tr><td>' + (d.name || d.id) + ' (' + d.id + ')</td><td>' + d.kind + '</td><td>' +
+      enabledText + '</td><td class="' + lagClass + '">' + lagText + '</td><td class="' + driftClass + '"' + driftTitle + '>' +
+      driftText + '</td><td>' + actionCell + '</td></tr>';
+  }
+  if (html === '') { html = '<tr><td colspan="6">Приборов пока нет</td></tr>'; }
+  document.getElementById('dashboardTable').innerHTML = html;
 }
 
 function loadDevices() {
@@ -1561,6 +1683,14 @@ attachCalendar('rl_to');
 loadDevices();
 loadProfiles();
 resetDeviceForm();
+loadDashboard();
+// Автообновление вкладки «Главная» — раз в 30с, независимо от того,
+// какая вкладка сейчас открыта (дёшево: один маленький GET-запрос), так
+// что оператор видит актуальную картину сразу при переключении на неё,
+// без ожидания. Тот же интервал, что у старого диагностического
+// дашборда на / (см. handleDashboard в server.go, setInterval(loadData,
+// 30000)) — уже проверенное на практике значение для этого проекта.
+setInterval(loadDashboard, 30000);
 </script>
 </body>
 </html>`

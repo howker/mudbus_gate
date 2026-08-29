@@ -152,6 +152,7 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/devices/reload-progress", s.handleReloadProgress)
 	mux.HandleFunc("/api/devices/reload-cancel", s.handleReloadCancel)
 	mux.HandleFunc("/api/es-sync/trigger", s.handleSyncNow)
+	mux.HandleFunc("/api/dashboard", s.handleDashboardStatus)
 	mux.HandleFunc("/admin", s.handleAdminUI)
 
 	mux.HandleFunc("/", s.handleDashboard)

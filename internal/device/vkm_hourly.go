@@ -9,6 +9,7 @@ import (
 
 	"mbgw/internal/archive"
 	"mbgw/internal/dbg"
+	"mbgw/internal/devicestatus"
 	"mbgw/internal/profile"
 	"mbgw/internal/storage"
 )
@@ -126,6 +127,59 @@ func isVKMTimeAnomalous(raw string) bool {
 	return !strings.Contains(value, "/")
 }
 
+// parseVKMPeriodEndTime extracts the device-reported END-of-period
+// timestamp from the raw archive string's Time= field — for time-drift
+// monitoring (см. internal/devicestatus), добавлено 2026-08-29 по
+// прямому запросу оператора ("мы никак не отслеживаем какое время
+// сейчас в приборе").
+//
+// Возвращает ok=false, если поле Time отсутствует ИЛИ использует формат
+// "голых секунд" (см. doc-комментарий isVKMTimeAnomalous выше) — эти
+// числа НЕ подтверждены как секунды Unix-эпохи в какой-либо известной
+// базе отсчёта, так что разбирать их как реальный момент времени значило
+// бы молча придумать неверный дрейф вместо честного "сейчас не можем
+// определить".
+//
+// Формат нормальной строки (оба варианта встречались живьём, см.
+// TestIsVKMTimeAnomalous_RealExamples в vkm_hourly_test.go):
+//
+//	Time={Время  }28/07/26 15:00:00-28/07/26 15:30:00;...
+//	Time=28/07/26 15:00:00-28/07/26 15:30:00;...
+//
+// Берём вторую (правую) дату-время — конец периода, тот же момент,
+// которым мы сами подписываем periodLabel в collectVKMPeriod.
+func parseVKMPeriodEndTime(raw string) (time.Time, bool) {
+	idx := strings.Index(raw, "Time=")
+	if idx < 0 {
+		return time.Time{}, false
+	}
+	rest := raw[idx+len("Time="):]
+	value := rest
+	if semi := strings.Index(rest, ";"); semi >= 0 {
+		value = rest[:semi]
+	}
+	// Необязательный заголовок вида "{Время  }" перед самой датой —
+	// убираем, если есть (у компактного формата его нет вообще).
+	if brace := strings.Index(value, "}"); brace >= 0 {
+		value = value[brace+1:]
+	}
+	if !strings.Contains(value, "/") {
+		return time.Time{}, false // "голые секунды" — не парсим, см. выше
+	}
+
+	dash := strings.Index(value, "-")
+	if dash < 0 {
+		return time.Time{}, false
+	}
+	endStr := strings.TrimSpace(value[dash+1:])
+
+	t, err := time.ParseInLocation("02/01/06 15:04:05", endStr, time.Local)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // collectVKMPeriod РґРµР»Р°РµС‚ РћР”РРќ РїРѕР»РЅС‹Р№ С‚Р°РЅРµС† Р·Р°РїРёСЃСЊ/РѕР¶РёРґР°РЅРёРµ/С‡С‚РµРЅРёРµ Р°СЂС…РёРІР°
 // для окна [periodStart, periodStart+vkmArchivePeriod) и сохраняет то, что
 // пришло. Возвращает, сколько из vkmHourlyParams реально сохранено (0 без
@@ -188,6 +242,30 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, period
 	if err := d.Repo.SaveVKMRawString(ctx, d.ID, q.Instance, periodLabel, string(records[0].Raw)); err != nil {
 		log.Printf("[%s] VKM период %s: ошибка сохранения сырой строки: %v\n",
 			d.ID, periodLabel.Format("02.01.2006 15:04"), err)
+	}
+
+	// Мониторинг дрейфа часов прибора (см. internal/devicestatus) —
+	// сравниваем время конца периода, которое НАЗЫВАЕТ САМ ПРИБОР в
+	// своём ответе, с periodLabel (то же самое время, но по НАШИМ часам
+	// сервера, от которого мы формировали запрос q.To). Расхождение
+	// между ними и есть дрейф часов прибора относительно сервера.
+	// Обновляем при КАЖДОМ успешном чтении архива, включая случаи, когда
+	// формат не позволяет определить точное время (Reliable=false) — это
+	// тоже полезная, актуальная информация ("сейчас не можем сказать"),
+	// а не повод молча оставить старое, возможно уже устаревшее значение
+	// висеть на дашборде.
+	if deviceEnd, ok := parseVKMPeriodEndTime(string(records[0].Raw)); ok {
+		devicestatus.Set(d.ID, devicestatus.TimeDrift{
+			CheckedAt:    time.Now(),
+			DriftSeconds: deviceEnd.Sub(periodLabel).Seconds(),
+			Reliable:     true,
+		})
+	} else {
+		devicestatus.Set(d.ID, devicestatus.TimeDrift{
+			CheckedAt: time.Now(),
+			Reliable:  false,
+			Note:      "формат времени в ответе прибора не позволяет определить точный момент (голые секунды либо поле Time отсутствует)",
+		})
 	}
 
 	return persistVKMHourly(ctx, d, periodLabel, records[0]), nil
