@@ -174,9 +174,23 @@ func runServer() {
 
 	dbPath = nextToExe(dbPath)
 
-	logFile, _ := os.OpenFile(nextToExe("mbgw_server.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	defer logFile.Close()
-	multiWriter := io.MultiWriter(os.Stdout, logFile)
+	// rotatingFile (см. rotating_log.go) — раньше здесь был обычный
+	// os.OpenFile с O_APPEND, растущий БЕСКОНЕЧНО без единого ограничения
+	// на размер, пока процесс работает — найдено оператором живьём
+	// (2026-08-29): mbgw_server.log и *_akron_live.jsonl на проде растут
+	// без остановки, потому что перезапуск сервера (единственный момент,
+	// когда файл раньше начинал расти "с нуля" — при старом os.OpenFile
+	// он всё равно ДОПИСЫВАЛ поверх старого через O_APPEND, так что даже
+	// перезапуск не помогал) происходит редко и не по расписанию.
+	// 20 МБ на файл, храним последние 10 архивов — с запасом хватает на
+	// много дней работы для диагностики, не давая диску заполниться при
+	// долгой непрерывной работе без перезапуска.
+	logWriter, err := newRotatingFile(nextToExe("mbgw_server.log"), 20*1024*1024, 10)
+	if err != nil {
+		log.Fatalf("[FATAL] не удалось открыть файл лога: %v", err)
+	}
+	defer logWriter.Close()
+	multiWriter := io.MultiWriter(os.Stdout, logWriter)
 	log.SetOutput(multiWriter)
 	log.SetFlags(log.Ldate | log.Ltime)
 	log.Println("=== запуск шлюза mbgw (server: единый процесс, конфигурация из БД) ===")
@@ -578,25 +592,6 @@ func startAkronNorthboundForDevice(ctx context.Context, repo *sqliterepo.Repo, d
 	}()
 }
 
-// startESyncForDevice starts the ВКМ→Энергосфера direct-DB sync loop for
-// one device, IF the operator has configured both the SQL Server
-// connection (es_connection) AND at least one channel mapping
-// (es_vkm_channels) for it — same "opt-in, missing config = skip with a
-// log line, not a fatal error" principle as the Akron branch above.
-// startESyncForDevice starts the ВКМ→Энергосфера direct-DB sync loop for
-// one device, IF the operator has configured both the SQL Server
-// connection (es_connection) AND at least one channel mapping
-// (es_vkm_channels) for it — same "opt-in, missing config = skip with a
-// log line, not a fatal error" principle as the Akron branch above.
-//
-// dbPath — путь к ЕДИНОЙ базе процесса server (та же, что открыта в
-// runServer как repo), а не отдельный "mbgw_vkm.db". Раньше здесь стоял
-// захардкоженный "mbgw_vkm.db" — рабочий путь в старой схеме "четыре
-// окна", где southbound ВКМ реально писал в отдельный файл с этим именем.
-// В единой базе server всё (включая archive_vkm_raw) пишется в ОДИН
-// файл, путь к которому передаётся через --db при запуске — es-sync
-// обязан читать оттуда же, иначе получает "no such table: archive_vkm_raw"
-// (подтверждено живьём, 2026-08-23).
 // startESyncForDevice starts the ВКМ→Энергосфера direct-DB sync loop for
 // one device, IF the operator has configured both the SQL Server
 // connection (es_connection) AND at least one channel mapping
