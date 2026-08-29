@@ -54,9 +54,9 @@ func main() {
 	showTo := flag.String("show-to", "", "LIST mode: window end (e.g. \"2026-07-30 01:00\"). Read-only.")
 	vkmRaw := flag.Bool("vkm-raw", false, "с --show-from/--show-to: вместо archive_hourly (S/ST) показать сырые строки архива ВКМ из archive_vkm_raw")
 	vkmPipe := flag.Int("pipe", 1, "с --vkm-raw: номер трубы (по умолчанию 1)")
-	vkmForget := flag.Bool("vkm-forget", false, "с --show-from/--show-to и --vkm-raw: УДАЛИТЬ периоды в этом окне из archive_hourly (S/ST) и archive_vkm_raw, чтобы дозабор/gap-scan переснял их заново — полезно, если прибор один раз отдал битую/непривычную строку и нужно попробовать ещё раз")
+	vkmForget := flag.Bool("vkm-forget", false, "СЃ --show-from/--show-to Рё --vkm-raw: РЈР”РђР›РРўР¬ РїРµСЂРёРѕРґС‹ РІ СЌС‚РѕРј РѕРєРЅРµ РёР· archive_hourly (S/ST) Рё archive_vkm_raw, С‡С‚РѕР±С‹ РґРѕР·Р°Р±РѕСЂ/gap-scan РїРµСЂРµСЃРЅСЏР» РёС… Р·Р°РЅРѕРІРѕ вЂ” РїРѕР»РµР·РЅРѕ, РµСЃР»Рё РїСЂРёР±РѕСЂ РѕРґРёРЅ СЂР°Р· РѕС‚РґР°Р» Р±РёС‚СѓСЋ/РЅРµРїСЂРёРІС‹С‡РЅСѓСЋ СЃС‚СЂРѕРєСѓ Рё РЅСѓР¶РЅРѕ РїРѕРїСЂРѕР±РѕРІР°С‚СЊ РµС‰С‘ СЂР°Р·")
 	vkmScan := flag.Bool("vkm-scan", false, "просканировать ВСЮ историю archive_vkm_raw для устройства на посторонние символы (переносы строк, управляющие байты) — вместо точечной проверки одного периода за раз. Read-only.")
-	vkmForgetAnomalous := flag.Bool("vkm-forget-anomalous", false, "просканировать ВСЮ историю archive_vkm_raw и УДАЛИТЬ разом все периоды с 'чужим' форматом Time (голые секунды вместо даты — тот же признак, что детектирует mbgw при сборе) — вместо точечной чистки по одному периоду за раз, каждый раз как встретится в ЭС")
+	vkmForgetAnomalous := flag.Bool("vkm-forget-anomalous", false, "РїСЂРѕСЃРєР°РЅРёСЂРѕРІР°С‚СЊ Р’РЎР® РёСЃС‚РѕСЂРёСЋ archive_vkm_raw Рё РЈР”РђР›РРўР¬ СЂР°Р·РѕРј РІСЃРµ РїРµСЂРёРѕРґС‹ СЃ 'С‡СѓР¶РёРј' С„РѕСЂРјР°С‚РѕРј Time (РіРѕР»С‹Рµ СЃРµРєСѓРЅРґС‹ РІРјРµСЃС‚Рѕ РґР°С‚С‹ вЂ” С‚РѕС‚ Р¶Рµ РїСЂРёР·РЅР°Рє, С‡С‚Рѕ РґРµС‚РµРєС‚РёСЂСѓРµС‚ mbgw РїСЂРё СЃР±РѕСЂРµ) вЂ” РІРјРµСЃС‚Рѕ С‚РѕС‡РµС‡РЅРѕР№ С‡РёСЃС‚РєРё РїРѕ РѕРґРЅРѕРјСѓ РїРµСЂРёРѕРґСѓ Р·Р° СЂР°Р·, РєР°Р¶РґС‹Р№ СЂР°Р· РєР°Рє РІСЃС‚СЂРµС‚РёС‚СЃСЏ РІ Р­РЎ")
 	flag.Parse()
 
 	if *dbPath == "" || *deviceID == "" {
@@ -306,6 +306,7 @@ ORDER BY ts_hour
 		lengths      []int
 		controlChars []finding
 		noTimePrefix []finding
+		bareSeconds  []finding
 	)
 
 	for rows.Next() {
@@ -325,6 +326,17 @@ ORDER BY ts_hour
 		}
 		if !strings.HasPrefix(raw, "Time=") {
 			noTimePrefix = append(noTimePrefix, finding{ts, "строка не начинается с 'Time='"})
+		}
+		// Третий, ранее не учитывавшийся в скане вид аномалии (найден
+		// живьём 2026-08-27, boylernaya_par, период 10.08.2026): поле
+		// Time= содержит "голые секунды через дефис" вместо обычной
+		// календарной даты с "/" — тот же самый признак, что уже
+		// проверяет isRawTimeAnomalous (используется в --vkm-forget-
+		// anomalous), но раньше НЕ подсчитывался здесь, в --vkm-scan —
+		// поэтому масштаб этой конкретной аномалии до сих пор был
+		// неизвестен, приходилось искать точечно по одному периоду.
+		if isRawTimeAnomalous(raw) {
+			bareSeconds = append(bareSeconds, finding{ts, "поле Time= содержит голые секунды вместо календарной даты (нет '/')"})
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -351,8 +363,14 @@ ORDER BY ts_hour
 	}
 	fmt.Println()
 
-	if len(controlChars) == 0 && len(noTimePrefix) == 0 {
-		fmt.Println("Ничего постороннего не найдено — вся история чистая по этим двум критериям.")
+	fmt.Printf("Строк с 'голыми секундами' вместо календарной даты в Time=: %d из %d\n", len(bareSeconds), total)
+	for _, f := range bareSeconds {
+		fmt.Printf("  %s — %s\n", f.ts.Format("02.01.2006 15:04"), f.what)
+	}
+	fmt.Println()
+
+	if len(controlChars) == 0 && len(noTimePrefix) == 0 && len(bareSeconds) == 0 {
+		fmt.Println("Ничего постороннего не найдено — вся история чистая по этим трём критериям.")
 	}
 }
 
