@@ -115,6 +115,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <button class="tab-btn" onclick="showTab('archive')">Архив</button>
   <button class="tab-btn" onclick="showTab('current')">Последний опрос</button>
   <button class="tab-btn" onclick="showTab('log')">Лог</button>
+  <button class="tab-btn" onclick="showTab('service')">Служба</button>
 </div>
 
 <div class="content">
@@ -331,7 +332,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <div id="panel-log" class="panel">
     <div class="section">
       <h3>Лог сервера</h3>
-      <p class="small-note">Обновляется автоматически каждые 2 секунды. «Пауза» останавливает подгрузку новых строк на экране (уже показанное остаётся на месте, удобно спокойно прочитать/скопировать) — на сервере запись в лог при этом не останавливается, пропущенное просто появится всё сразу при нажатии «Продолжить». Цвет: зелёный — успешные операции ([OK]), красный — ошибки ([ERROR]/[FATAL]), жёлтый — предупреждения ([WARN]). Жирным — метки прибора и периода архива, для быстрого поиска глазами.</p>
+      <p class="small-note">Обновляется автоматически каждые 2 секунды. Новые записи появляются СВЕРХУ (самая свежая — первой строкой), чтобы не приходилось прокручивать полосой вниз каждый раз. «Пауза» останавливает подгрузку новых строк на экране (уже показанное остаётся на месте, удобно спокойно прочитать/скопировать) — на сервере запись в лог при этом не останавливается, пропущенное просто появится всё сразу сверху при нажатии «Продолжить». Цвет: зелёный — успешные операции ([OK]), красный — ошибки ([ERROR]/[FATAL]), жёлтый — предупреждения ([WARN]). Жирным — метки прибора и периода архива, для быстрого поиска глазами.</p>
       <p>
         <button class="btn secondary" id="logPauseBtn" onclick="toggleLogPause()">Пауза</button>
         <button class="btn secondary" onclick="copyLog()">Скопировать всё</button>
@@ -340,6 +341,15 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       </p>
       <div id="logMsg" class="msg"></div>
       <pre id="logView" style="background:#0c0c0c;color:#cccccc;padding:12px;height:520px;overflow-y:scroll;font-family:Consolas,'Courier New',monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;border:1px solid #3e3e42;"></pre>
+    </div>
+  </div>
+
+  <!-- ===================== СЛУЖБА ===================== -->
+  <div id="panel-service" class="panel">
+    <div class="section">
+      <h3>Служба</h3>
+      <div id="serviceContent">Загрузка...</div>
+      <div id="serviceMsg" class="msg"></div>
     </div>
   </div>
 
@@ -458,6 +468,7 @@ function showTab(name) {
   if (name === 'settings') { loadSettings(); }
   if (name === 'archive') { populateDeviceSelect('ar_device', null); setArchivePreset('week'); }
   if (name === 'dashboard') { loadDashboard(); }
+  if (name === 'service') { loadServiceStatus(); }
 }
 
 function showMsg(elId, ok, text) {
@@ -995,14 +1006,27 @@ function loadLog() {
     if (!data.entries || !data.entries.length) { return; }
 
     var view = document.getElementById('logView');
-    var atBottom = (view.scrollTop + view.clientHeight >= view.scrollHeight - 10);
 
-    var html = '';
+    // Новые строки добавляются СВЕРХУ, а не снизу (изменено 2026-08-30,
+    // прямой запрос оператора: "лог автоматически не прокрутился на
+    // новую запись... может сделать наоборот - новые записи вверху
+    // будут добавляться?") — так самая свежая запись всегда видна
+    // сразу, без прокрутки полосой вниз, и не нужно угадывать, где
+    // сейчас находится взгляд оператора, чтобы решить, прокручивать
+    // экран автоматически или нет.
+    //
+    // logRawLines (для копирования/сохранения в файл) остаётся в
+    // ХРОНОЛОГИЧЕСКОМ порядке (старые сверху) — это по-прежнему
+    // естественный порядок чтения для сохранённого файла; порядок на
+    // ЭКРАНЕ и порядок в СОХРАНЁННОМ файле — разные, независимые вещи.
     for (var i = 0; i < data.entries.length; i++) {
       logRawLines.push(data.entries[i].text);
-      html += formatLogLine(data.entries[i].text) + '\n';
     }
-    view.innerHTML += html;
+    var html = '';
+    for (var j = data.entries.length - 1; j >= 0; j--) {
+      html += formatLogLine(data.entries[j].text) + '\n';
+    }
+    view.innerHTML = html + view.innerHTML;
     logAfterSeq = data.latest_seq;
 
     // Держим в браузере не больше строк, чем сервер держит в своём
@@ -1011,7 +1035,6 @@ function loadLog() {
     if (logRawLines.length > 5000) {
       logRawLines = logRawLines.slice(logRawLines.length - 5000);
     }
-    if (atBottom) { view.scrollTop = view.scrollHeight; }
   };
   xhr.send();
 }
@@ -1045,6 +1068,82 @@ function downloadLog() {
 function clearLogView() {
   document.getElementById('logView').innerHTML = '';
   logRawLines = [];
+}
+
+// ===================== СЛУЖБА =====================
+// Добавлено 2026-08-30 по прямому запросу оператора: "автоматизировать
+// в юай" статус и остановку службы Windows, плюс защиту от двойного
+// запуска (та часть — целиком на сервере, single_instance_windows.go,
+// здесь показывать нечего). Опрос статуса — ТОЛЬКО при открытии
+// вкладки (не по таймеру, в отличие от Главной/Лога) — состояние
+// службы меняется редко, а если процесс вот-вот остановится, лишний
+// фоновый опрос всё равно ничего полезного не покажет.
+function loadServiceStatus() {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/service/status', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    if (xhr.status !== 200) {
+      document.getElementById('serviceContent').innerHTML = '<p class="small-note">Не удалось получить статус.</p>';
+      return;
+    }
+    var data;
+    try { data = JSON.parse(xhr.responseText); } catch (e) { return; }
+    renderServiceContent(data);
+  };
+  xhr.send();
+}
+
+function renderServiceContent(data) {
+  var html = '';
+
+  if (data.goos !== 'windows') {
+    // Управление службой реализовано только для Windows — единственной
+    // реальной платформы развёртывания этого проекта. Отдельная
+    // Linux-вкладка с реальным функционалом (например, через systemd)
+    // не сделана намеренно: нет ни одного подтверждённого сценария
+    // развёртывания на Linux, добавлять код "на будущее" без
+    // подтверждённой необходимости — то, чего этот проект старается
+    // избегать (см. общий принцип в IMPLEMENTATION_BACKLOG.md).
+    html += '<p class="small-note">Управление службой пока реализовано только для Windows. Этот процесс сейчас работает на другой ОС (' + data.goos + ') — здесь пока нечего показывать; если появится реальная потребность в управлении на Linux, функционал для неё стоит добавить отдельно, когда она возникнет.</p>';
+    document.getElementById('serviceContent').innerHTML = html;
+    return;
+  }
+
+  html += '<p class="small-note">Режим запуска сейчас: <b>' + (data.running_as_service ? 'служба Windows' : 'обычный ручной запуск (консоль)') + '</b>.</p>';
+
+  if (!data.service_installed) {
+    html += '<p class="small-note">Служба mbgw_service ещё не установлена. Установка делается один раз на сервере, из PowerShell от имени администратора:</p>';
+    html += '<pre style="background:#0c0c0c;color:#cccccc;padding:10px;border:1px solid #3e3e42;">mbgw.exe install-service --port 8080</pre>';
+  } else {
+    var stateClass = (data.service_state === 'работает') ? 'status-good' : 'status-bad';
+    html += '<p>Состояние службы: <span class="' + stateClass + '">' + data.service_state + '</span></p>';
+    html += '<p><button class="btn secondary" onclick="stopService()">Остановить</button></p>';
+    // Кнопки «Запустить» здесь нет НАМЕРЕННО, не забыли — см. подробное
+    // объяснение прямо в тексте ниже, оно же и для оператора, который
+    // будет читать этот экран, а не только для будущих читателей кода.
+    html += '<p class="small-note"><b>Кнопки «Запустить» здесь намеренно нет:</b> этот веб-интерфейс обслуживается ТЕМ ЖЕ процессом, который пришлось бы запускать — если он уже остановлен, обслуживать нажатие кнопки просто некому. Запустить снова: команда <code>sc start mbgw_service</code> (полный путь <code>C:\\Windows\\System32\\sc.exe</code>, НЕ просто <code>sc</code> — в PowerShell это алиас для Set-Content, а не вызов настоящего sc.exe!), через «Службы Windows» (services.msc), либо служба сама поднимется при следующей перезагрузке сервера — автозапуск уже настроен командой install-service выше.</p>';
+  }
+
+  document.getElementById('serviceContent').innerHTML = html;
+}
+
+function stopService() {
+  if (!confirm('Остановить mbgw? Опрос приборов и приём данных прекратится до следующего запуска.')) { return; }
+  document.getElementById('serviceMsg').className = 'msg';
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/service/stop', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    var data;
+    try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('serviceMsg', false, 'Ошибка ответа сервера'); return; }
+    if (data.ok) {
+      showMsg('serviceMsg', true, 'Остановка запрошена. Через несколько секунд процесс завершится — эта страница перестанет отвечать, это ожидаемо, а не поломка.');
+    } else {
+      showMsg('serviceMsg', false, 'Ошибка: ' + (data.error || 'неизвестная'));
+    }
+  };
+  xhr.send();
 }
 
 function loadDashboard() {

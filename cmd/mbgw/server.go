@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"sync"
 	"syscall"
@@ -150,17 +151,47 @@ func nextToExe(name string) string {
 // and every file this process creates appears right there, regardless of
 // how it's launched.
 func runServer() {
+	// Защита от двойного запуска — САМАЯ ПЕРВАЯ проверка, даже раньше
+	// регистрации в диспетчере служб (добавлено 2026-08-30, прямой
+	// запрос оператора). Теперь, когда появилось ДВА способа запустить
+	// один и тот же процесс (служба Windows и обычный ручной запуск),
+	// нужна защита от случайного одновременного запуска обоих —
+	// иначе оба экземпляра начали бы опрашивать одни и те же приборы
+	// параллельно, мешая друг другу физически на линии связи, плюс
+	// конфликт за порт веб-интерфейса и одновременная запись в один и
+	// тот же файл лога/БД. См. single_instance_windows.go —
+	// именованный Windows-мьютекс, освобождается автоматически при
+	// завершении процесса-владельца.
+	if ok, err := acquireSingleInstanceLock(); err != nil {
+		log.Printf("[WARN] не удалось проверить, не запущен ли уже другой экземпляр mbgw: %v — продолжаю без этой защиты\n", err)
+	} else if !ok {
+		log.Println("[FATAL] mbgw.exe уже запущен (службой или вручную) — второй экземпляр не может стартовать одновременно с первым.")
+		log.Println("        Остановите уже работающий процесс (вкладка «Служба» в /admin, либо sc stop mbgw_service, либо Ctrl+C в его консоли), прежде чем запускать снова.")
+		os.Exit(1)
+	}
+
 	// Проверка/регистрация в диспетчере управления службами Windows —
-	// ДОЛЖНА идти самой первой строкой, до открытия БД и уж тем более до
-	// регистрации приборов (добавлено 2026-08-30, найдено оператором
-	// живьём: без этого "sc start mbgw_service" падал с ошибкой 1053,
-	// "служба не ответила на запрос своевременно" — SCM ждёт
-	// подтверждение "я запущен" в течение ограниченного времени, а
-	// регистрация приборов, как мы уже видели на живом примере с
-	// прибором osmos, может идти очень долго). Если процесс запущен НЕ
-	// как служба (обычный ручной запуск) — serviceStop будет nil, и
-	// весь код ниже ведёт себя ровно как раньше, без единого изменения.
+	// ДОЛЖНА идти самой первой строкой (после защиты от двойного
+	// запуска выше), до открытия БД и уж тем более до регистрации
+	// приборов (добавлено 2026-08-30, найдено оператором живьём: без
+	// этого "sc start mbgw_service" падал с ошибкой 1053, "служба не
+	// ответила на запрос своевременно" — SCM ждёт подтверждение "я
+	// запущен" в течение ограниченного времени, а регистрация приборов,
+	// как мы уже видели на живом примере с прибором osmos, может идти
+	// очень долго). Если процесс запущен НЕ как служба (обычный ручной
+	// запуск) — serviceStop будет nil, и весь код ниже ведёт себя ровно
+	// как раньше, без единого изменения.
 	serviceStop := runServerAsWindowsServiceIfApplicable()
+
+	// webStop закрывается кнопкой «Остановить» на вкладке «Служба» в
+	// /admin, КОГДА процесс запущен НЕ как служба Windows (обычный
+	// ручной запуск) — добавлено 2026-08-30. Для случая "мы запущены
+	// службой" веб-кнопка идёт другим, более правильным путём — через
+	// SCM (см. stopSelfAsWindowsService в service_run_windows.go),
+	// который в итоге закрывает serviceStop выше, а не webStop; этот
+	// канал нужен именно для случая, когда никакого SCM вообще нет и
+	// закрывать больше нечего, кроме как напрямую.
+	webStop := make(chan struct{})
 
 	dbPath := "mbgw_server.db"
 	// portFlagGiven distinguishes "--port was explicitly typed" from "not
@@ -538,6 +569,41 @@ func runServer() {
 		return integration.ForceResyncRange(ctx, repo, writer, cfg, from, to)
 	})
 
+	// Вкладка «Служба» в /admin (добавлено 2026-08-30, прямой запрос
+	// оператора: "автоматизировать в юай" статус/остановку). Работает
+	// на любой платформе — queryWindowsServiceStatus/isRunningAsWindowsService
+	// имеют заглушки для не-Windows сборок (см. service_run_other.go),
+	// возвращающие "нет службы" вместо ошибки компиляции.
+	webServer.SetServiceStatus(func() (goos string, runningAsService, serviceInstalled bool, serviceState string) {
+		goos = runtime.GOOS
+		runningAsService = isRunningAsWindowsService()
+		if goos != "windows" {
+			return goos, runningAsService, false, ""
+		}
+		status, err := queryWindowsServiceStatus()
+		if err != nil {
+			log.Printf("[ERROR] не удалось узнать статус службы: %v\n", err)
+			return goos, runningAsService, false, ""
+		}
+		return goos, runningAsService, status.Installed, status.State
+	})
+
+	// «Остановить» на вкладке «Служба» — способ зависит от того, КАК мы
+	// сейчас запущены: если службой — команда идёт через SCM (тот же
+	// путь, что и "sc stop mbgw_service", попадает в уже проверенный
+	// обработчик mbgwServiceHandler.Execute, который закрывает
+	// serviceStop выше); если обычным ручным запуском — закрываем
+	// webStop напрямую, тем же путём, что и Ctrl+C.
+	webServer.SetServiceStop(func() {
+		if isRunningAsWindowsService() {
+			if err := stopSelfAsWindowsService(); err != nil {
+				log.Printf("[ERROR] не удалось остановить службу через SCM: %v\n", err)
+			}
+			return
+		}
+		close(webStop)
+	})
+
 	pl := poller.New(sched, devices, 1*time.Second)
 	go pl.Run(ctx)
 
@@ -548,6 +614,8 @@ func runServer() {
 		log.Println("=== получен сигнал завершения (Ctrl+C). остановка... ===")
 	case <-serviceStop:
 		log.Println("=== получен запрос на остановку от диспетчера служб Windows. остановка... ===")
+	case <-webStop:
+		log.Println("=== получен запрос на остановку через веб-интерфейс. остановка... ===")
 	}
 }
 

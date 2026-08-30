@@ -3,9 +3,11 @@
 package main
 
 import (
+	"fmt"
 	"log"
 
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
 )
 
 // mbgwServiceName должно СОВПАДАТЬ с именем, под которым служба
@@ -96,4 +98,117 @@ func (h *mbgwServiceHandler) Execute(args []string, r <-chan svc.ChangeRequest, 
 		}
 	}
 	return false, 0
+}
+
+// windowsServiceStatus — то, что показывает вкладка «Служба» в /admin
+// (добавлено 2026-08-30, прямой запрос оператора: "автоматизировать в
+// юай" остановку/просмотр статуса службы). Installed=false означает,
+// что служба вообще не зарегистрирована в Windows (install-service ещё
+// ни разу не запускали) — отдельное, более раннее состояние, чем
+// "остановлена".
+type windowsServiceStatus struct {
+	Installed bool
+	State     string // человекочитаемое состояние на русском, см. serviceStateToRussian
+}
+
+// queryWindowsServiceStatus узнаёт текущее состояние службы через API
+// диспетчера управления службами (mgr/svc) — НЕ через запуск sc.exe
+// подпроцессом и разбор текстового вывода: так надёжнее (нет риска
+// напороться на то, что "sc" в PowerShell — это алиас для Set-Content,
+// а не вызов настоящего sc.exe, — ровно та ловушка, в которую живьём
+// попал оператор 2026-08-30 при ручной проверке) и не зависит от языка
+// системы, на котором sc.exe печатает свой текстовый вывод.
+func queryWindowsServiceStatus() (windowsServiceStatus, error) {
+	m, err := mgr.Connect()
+	if err != nil {
+		return windowsServiceStatus{}, fmt.Errorf("подключение к диспетчеру служб: %w", err)
+	}
+	defer m.Disconnect()
+
+	s, err := m.OpenService(mbgwServiceName)
+	if err != nil {
+		// Открыть описание службы не удалось — почти наверняка потому,
+		// что она ещё не установлена (install-service не запускали).
+		// Это НЕ ошибка в смысле "что-то сломалось", а нормальное,
+		// ожидаемое состояние для свежего сервера.
+		return windowsServiceStatus{Installed: false}, nil
+	}
+	defer s.Close()
+
+	status, err := s.Query()
+	if err != nil {
+		return windowsServiceStatus{}, fmt.Errorf("опрос состояния службы: %w", err)
+	}
+	return windowsServiceStatus{Installed: true, State: serviceStateToRussian(status.State)}, nil
+}
+
+func serviceStateToRussian(state svc.State) string {
+	switch state {
+	case svc.Stopped:
+		return "остановлена"
+	case svc.StartPending:
+		return "запускается"
+	case svc.StopPending:
+		return "останавливается"
+	case svc.Running:
+		return "работает"
+	case svc.ContinuePending:
+		return "возобновляется"
+	case svc.PausePending:
+		return "приостанавливается"
+	case svc.Paused:
+		return "приостановлена"
+	default:
+		return "неизвестно"
+	}
+}
+
+// stopSelfAsWindowsService отправляет службе mbgw_service команду
+// остановки ЧЕРЕЗ ДИСПЕТЧЕР УПРАВЛЕНИЯ СЛУЖБАМИ (тот же путь, что и
+// "sc stop mbgw_service" или кнопка «Остановить» в services.msc) — а
+// НЕ напрямую завершает текущий процесс изнутри себя. Это важно: раз
+// запрос идёт через SCM, он попадает в тот же самый обработчик
+// mbgwServiceHandler.Execute выше (в канал r), который уже правильно
+// обрабатывает штатную остановку (StopPending -> закрытие stopChan,
+// которое слушает runServer -> Stopped) — используется УЖЕ
+// подтверждённый рабочий путь остановки, без дублирования логики.
+//
+// Используется кнопкой «Остановить» на вкладке «Служба» в /admin —
+// вызывается ИЗ обработчика веб-запроса ЭТОГО ЖЕ процесса, который сам
+// себя просит остановиться через SCM; это нормально и работает, потому
+// что HTTP-ответ браузеру отправляется веб-слоем ДО того, как процесс
+// реально завершится (см. api_service.go).
+func stopSelfAsWindowsService() error {
+	m, err := mgr.Connect()
+	if err != nil {
+		return fmt.Errorf("подключение к диспетчеру служб: %w", err)
+	}
+	defer m.Disconnect()
+
+	s, err := m.OpenService(mbgwServiceName)
+	if err != nil {
+		return fmt.Errorf("открытие описания службы: %w", err)
+	}
+	defer s.Close()
+
+	if _, err := s.Control(svc.Stop); err != nil {
+		return fmt.Errorf("отправка команды остановки: %w", err)
+	}
+	return nil
+}
+
+// isRunningAsWindowsService сообщает, запущен ли ТЕКУЩИЙ процесс
+// диспетчером управления службами Windows ПРЯМО СЕЙЧАС — используется
+// веб-обработчиком «Остановить» на вкладке «Служба» (см. api_service.go
+// через cmd/mbgw/server.go), чтобы решить, каким путём останавливаться:
+// через SCM (stopSelfAsWindowsService — правильный путь, когда мы
+// реально служба) или напрямую, закрыв локальный канал остановки без
+// участия SCM (для случая обычного ручного запуска, где никакого SCM
+// вообще нет).
+func isRunningAsWindowsService() bool {
+	isService, err := svc.IsWindowsService()
+	if err != nil {
+		return false
+	}
+	return isService
 }

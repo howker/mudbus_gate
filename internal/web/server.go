@@ -61,6 +61,14 @@ type Server struct {
 	// (например, старый диагностический дашборд).
 	onForceResyncES ForceResyncESFunc
 
+	// onServiceStatus/onServiceStop подключают вкладку «Служба» в /admin
+	// (добавлено 2026-08-30, прямой запрос оператора) — см.
+	// SetServiceStatus/SetServiceStop, api_service.go. nil означает, что
+	// режим запуска не поддерживает (например, старый диагностический
+	// дашборд).
+	onServiceStatus ServiceStatusFunc
+	onServiceStop   ServiceStopFunc
+
 	// baseCtx — долгоживущий контекст всего процесса (тот же, что
 	// передан в Start), от которого выводятся ОТМЕНЯЕМЫЕ дочерние
 	// контексты для отдельных фоновых переопросов (см. api_reload.go).
@@ -141,6 +149,16 @@ func (s *Server) SetForceResyncES(fn ForceResyncESFunc) {
 	s.onForceResyncES = fn
 }
 
+// SetServiceStatus/SetServiceStop подключают вкладку «Служба» в /admin
+// (добавлено 2026-08-30, прямой запрос оператора: "автоматизировать в
+// юай" статус и остановку службы Windows).
+func (s *Server) SetServiceStatus(fn ServiceStatusFunc) {
+	s.onServiceStatus = fn
+}
+func (s *Server) SetServiceStop(fn ServiceStopFunc) {
+	s.onServiceStop = fn
+}
+
 func (s *Server) Start(ctx context.Context) {
 	s.baseCtx = ctx
 	mux := http.NewServeMux()
@@ -170,6 +188,8 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/dashboard", s.handleDashboardStatus)
 	mux.HandleFunc("/api/log", s.handleLog)
 	mux.HandleFunc("/api/log/download", s.handleLogDownload)
+	mux.HandleFunc("/api/service/status", s.handleServiceStatus)
+	mux.HandleFunc("/api/service/stop", s.handleServiceStop)
 	mux.HandleFunc("/admin", s.handleAdminUI)
 
 	mux.HandleFunc("/", s.handleDashboard)
