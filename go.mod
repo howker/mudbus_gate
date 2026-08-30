@@ -5,6 +5,7 @@ go 1.20
 require (
 	github.com/microsoft/go-mssqldb v1.6.0
 	go.bug.st/serial v1.6.4
+	golang.org/x/sys v0.20.0
 	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.29.10
 )
@@ -21,7 +22,6 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
 	golang.org/x/crypto v0.12.0 // indirect
-	golang.org/x/sys v0.20.0 // indirect
 	golang.org/x/text v0.12.0 // indirect
 	golang.org/x/tools v0.20.0 // indirect
 	modernc.org/gc/v3 v3.0.0-20240107210532-573471604cb6 // indirect

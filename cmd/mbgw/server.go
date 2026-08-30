@@ -150,6 +150,18 @@ func nextToExe(name string) string {
 // and every file this process creates appears right there, regardless of
 // how it's launched.
 func runServer() {
+	// Проверка/регистрация в диспетчере управления службами Windows —
+	// ДОЛЖНА идти самой первой строкой, до открытия БД и уж тем более до
+	// регистрации приборов (добавлено 2026-08-30, найдено оператором
+	// живьём: без этого "sc start mbgw_service" падал с ошибкой 1053,
+	// "служба не ответила на запрос своевременно" — SCM ждёт
+	// подтверждение "я запущен" в течение ограниченного времени, а
+	// регистрация приборов, как мы уже видели на живом примере с
+	// прибором osmos, может идти очень долго). Если процесс запущен НЕ
+	// как служба (обычный ручной запуск) — serviceStop будет nil, и
+	// весь код ниже ведёт себя ровно как раньше, без единого изменения.
+	serviceStop := runServerAsWindowsServiceIfApplicable()
+
 	dbPath := "mbgw_server.db"
 	// portFlagGiven distinguishes "--port was explicitly typed" from "not
 	// passed at all" — this matters because the port-selection rule below
@@ -531,8 +543,12 @@ func runServer() {
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	<-sigChan
-	log.Println("=== получен сигнал завершения. остановка... ===")
+	select {
+	case <-sigChan:
+		log.Println("=== получен сигнал завершения (Ctrl+C). остановка... ===")
+	case <-serviceStop:
+		log.Println("=== получен запрос на остановку от диспетчера служб Windows. остановка... ===")
+	}
 }
 
 // registerOneDevice делает всё, что раньше было одной итерацией
