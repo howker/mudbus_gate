@@ -55,6 +55,12 @@ type Server struct {
 	// (например, старый диагностический дашборд).
 	onSyncNow func(deviceID string) error
 
+	// onForceResyncES, если задан, принудительно ПЕРЕЗАПИСЫВАЕТ точки
+	// Mains за диапазон, а не только вставляет новое — см. SetForceResyncES,
+	// api_es_resync.go. nil означает, что режим запуска не поддерживает
+	// (например, старый диагностический дашборд).
+	onForceResyncES ForceResyncESFunc
+
 	// baseCtx — долгоживущий контекст всего процесса (тот же, что
 	// передан в Start), от которого выводятся ОТМЕНЯЕМЫЕ дочерние
 	// контексты для отдельных фоновых переопросов (см. api_reload.go).
@@ -127,6 +133,14 @@ func (s *Server) SetSyncNow(fn func(deviceID string) error) {
 	s.onSyncNow = fn
 }
 
+// SetForceResyncES подключает возможность принудительно ПЕРЕЗАПИСАТЬ
+// точки Mains за диапазон, а не только вставить новое — используется
+// кнопкой «Принудительная пересинхронизация с ЭС» на вкладке
+// «Подключение к ЭС» (добавлено 2026-08-30, прямой запрос оператора).
+func (s *Server) SetForceResyncES(fn ForceResyncESFunc) {
+	s.onForceResyncES = fn
+}
+
 func (s *Server) Start(ctx context.Context) {
 	s.baseCtx = ctx
 	mux := http.NewServeMux()
@@ -152,7 +166,10 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/devices/reload-progress", s.handleReloadProgress)
 	mux.HandleFunc("/api/devices/reload-cancel", s.handleReloadCancel)
 	mux.HandleFunc("/api/es-sync/trigger", s.handleSyncNow)
+	mux.HandleFunc("/api/es-sync/force-resync", s.handleForceResyncES)
 	mux.HandleFunc("/api/dashboard", s.handleDashboardStatus)
+	mux.HandleFunc("/api/log", s.handleLog)
+	mux.HandleFunc("/api/log/download", s.handleLogDownload)
 	mux.HandleFunc("/admin", s.handleAdminUI)
 
 	mux.HandleFunc("/", s.handleDashboard)

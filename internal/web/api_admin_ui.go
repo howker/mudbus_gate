@@ -99,6 +99,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 .small-note { color: #858585; font-size: 12px; margin-top: 4px; }
 .status-good { color: #4caf50; font-weight: bold; }
 .status-bad { color: #f44336; font-weight: bold; }
+.log-warn { color: #ffb300; font-weight: bold; }
 </style>
 </head>
 <body>
@@ -113,6 +114,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <button class="tab-btn" onclick="showTab('settings')">Настройки</button>
   <button class="tab-btn" onclick="showTab('archive')">Архив</button>
   <button class="tab-btn" onclick="showTab('current')">Последний опрос</button>
+  <button class="tab-btn" onclick="showTab('log')">Лог</button>
 </div>
 
 <div class="content">
@@ -124,7 +126,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <h3>Статус приборов</h3>
       <p class="small-note">Отставание архива — сколько последних периодов ещё не собрано, в часах (получасовки ВКМ и часовки Акрона — на одной шкале). 0 = данные свежие. Проверка учитывает плановую задержку опроса (обычно 5 минут после границы периода + небольшой запас), чтобы не показывать ложное отставание сразу после границы часа/получаса.</p>
       <p class="small-note">Расхождение времени — на сколько часы ПРИБОРА (не сервера) отличаются от ожидаемого, по данным последнего собранного архива ВКМ. Положительное = часы прибора спешат, отрицательное = отстают. Коррекция времени прибора через mbgw не реализована — это только наблюдение.</p>
-      <p class="small-note">«Синхронизировать сейчас» (только для ВКМ) — просит уже работающий цикл отправки в ЭС сделать внеплановый проход немедленно, не дожидаясь обычного часового цикла. Полезно, если вы только что запустили принудительный переопрос или вручную дозагрузили данные и хотите увидеть их в ЭС сразу, не ожидая часа. Саму архивную запись у прибора эта кнопка НЕ переопрашивает — она лишь отправляет то, что уже собрано в нашей базе.</p>
+      <p class="small-note">«Синхронизировать сейчас» (только для ВКМ) — просит уже работающий цикл отправки в ЭС сделать внеплановый проход немедленно, не дожидаясь обычного часового цикла. Полезно, если вы только что запустили принудительный переопрос или вручную дозагрузили данные и хотите увидеть их в ЭС сразу, не ожидая часа. Саму архивную запись у прибора эта кнопка НЕ переопрашивает — она лишь отправляет то, что уже собрано в нашей базе. <b>Важно:</b> эта кнопка добавляет только НОВЫЕ точки — если за какой-то момент времени в ЭС уже что-то есть (пусть даже неверное), она это не тронет. Если нужно ИСПРАВИТЬ уже отправленные в ЭС данные (например, поменяли множитель канала, или в ЭС успели уйти искажённые значения, которые вы потом переопросили) — используйте «Принудительную пересинхронизацию с ЭС» на вкладке «Подключение к ЭС»: та явно перезаписывает уже существующие точки за выбранный период.</p>
       <table>
         <thead><tr>
           <th style="cursor:pointer;" onclick="sortDashboard('name')">Прибор ⇅</th>
@@ -201,7 +203,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <p class="small-note">Сколько часов назад искать и добирать пропуски при каждом запуске сервера. 0 — использовать значение по умолчанию (24ч для ВКМ). Если сервер может простаивать дольше суток (плановое обслуживание и т.п.) — увеличьте, например до 72-96, чтобы пропуски добирались автоматически при следующем старте, без ручного «Принудительного переопроса».</p>
         <p class="small-note">Как часто опрашивать мгновенные показания (не архив). Раз в час обычно достаточно — этот шлюз собирает архив, не ведёт непрерывную телеметрию.</p>
         <div class="form-row"><label>Опрос архива, минута после границы</label><input id="d_archive_at_minute" type="text" value="5"></div>
-        <p class="small-note">Через сколько минут ПОСЛЕ границы периода запрашивать архив (получасовки у ВКМ — в HH:05 и HH:35, часовки у Akron — в HH:05, при значении по умолчанию 5). Прибору нужно время, чтобы закрыть период и подготовить данные — опрос точно на самой границе (0) обычно даёт ещё не готовый или неполный результат. Значение видно и настраивается здесь же, что и на вкладке «Главная» в столбце «Следующий опрос» — добавлено 2026-08-30, раньше это было изменить нельзя вообще (жёстко 5 минут для всех приборов).</p>
+        <p class="small-note">Через сколько минут ПОСЛЕ границы периода запрашивать архив (получасовки у ВКМ — в HH:05 и HH:35, часовки у Akron — в HH:05, при значении по умолчанию 5). Прибору нужно время, чтобы закрыть период и подготовить данные — опрос точно на самой границе (0) обычно даёт ещё не готовый или неполный результат. Значение видно и настраивается здесь же, что и на вкладке «Главная» в столбце «Следующий опрос».</p>
       </div>
 
       <p>
@@ -268,6 +270,22 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
            (2026-08-29, прямой запрос оператора) — там она стоит рядом с
            каждым прибором в общей таблице статуса, а не отдельно здесь,
            вдалеке от общего обзора приборов. -->
+
+      <h3 style="margin-top:30px;">Принудительная пересинхронизация с ЭС</h3>
+      <p class="small-note">Обычная синхронизация (в том числе кнопка «Синхронизировать сейчас» на «Главной») только ДОБАВЛЯЕТ новые точки — если точка за какой-то момент времени уже есть в базе ЭС, она НЕ трогается, даже если у нас данные с тех пор изменились. Это действие — наоборот: перезаписывает уже отправленные точки заново посчитанными значениями (по ТЕКУЩЕМУ множителю канала). Нужно, например: с прибора один раз пришли искажённые данные, вы их переопросили и получили верные — но в ЭС уже успело уйти старое; либо вы поменяли множитель канала (см. вкладку «Каналы ЭС») — новые точки и так пойдут в правильных единицах, а вот уже отправленная история сама не пересчитается, пока её явно не переписать этой кнопкой. Работает только для приборов ВКМ (только у них есть прямая запись в базу ЭС).</p>
+      <div class="form-row"><label>Прибор</label>
+        <select id="rs_device"></select>
+      </div>
+      <div class="form-row"><label>С какой даты</label>
+        <input id="rs_from" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
+        <select id="rs_from_h" style="width:55px;"></select>:<select id="rs_from_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
+      </div>
+      <div class="form-row"><label>По какую дату</label>
+        <input id="rs_to" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД (пусто = сейчас)">
+        <select id="rs_to_h" style="width:55px;"></select>:<select id="rs_to_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
+      </div>
+      <p><button class="btn secondary" onclick="forceResyncES()">Пересчитать и переписать в ЭС</button></p>
+      <div id="resyncMsg" class="msg"></div>
     </div>
   </div>
 
@@ -306,6 +324,22 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <thead><tr><th>Прибор</th><th>Параметр</th><th>№</th><th>Значение</th><th>Ед.изм.</th><th>Статус</th><th>Время</th></tr></thead>
         <tbody id="currentData"><tr><td colspan="7">Загрузка...</td></tr></tbody>
       </table>
+    </div>
+  </div>
+
+  <!-- ===================== ЛОГ ===================== -->
+  <div id="panel-log" class="panel">
+    <div class="section">
+      <h3>Лог сервера</h3>
+      <p class="small-note">Обновляется автоматически каждые 2 секунды. «Пауза» останавливает подгрузку новых строк на экране (уже показанное остаётся на месте, удобно спокойно прочитать/скопировать) — на сервере запись в лог при этом не останавливается, пропущенное просто появится всё сразу при нажатии «Продолжить». Цвет: зелёный — успешные операции ([OK]), красный — ошибки ([ERROR]/[FATAL]), жёлтый — предупреждения ([WARN]). Жирным — метки прибора и периода архива, для быстрого поиска глазами.</p>
+      <p>
+        <button class="btn secondary" id="logPauseBtn" onclick="toggleLogPause()">Пауза</button>
+        <button class="btn secondary" onclick="copyLog()">Скопировать всё</button>
+        <button class="btn secondary" onclick="downloadLog()">Сохранить в файл</button>
+        <button class="btn secondary" onclick="clearLogView()">Очистить экран (сам лог на сервере не трогает)</button>
+      </p>
+      <div id="logMsg" class="msg"></div>
+      <pre id="logView" style="background:#0c0c0c;color:#cccccc;padding:12px;height:520px;overflow-y:scroll;font-family:Consolas,'Courier New',monospace;font-size:12px;white-space:pre-wrap;word-break:break-all;border:1px solid #3e3e42;"></pre>
     </div>
   </div>
 
@@ -420,7 +454,7 @@ function showTab(name) {
   if (name === 'current') { populateDeviceSelect('cur_device', null); loadCurrentData(); }
   if (name === 'channels') { populateDeviceSelect('ch_device', 'vkm360'); }
   if (name === 'akron') { populateDeviceSelect('ak_device', 'akron'); }
-  if (name === 'esconn') { loadESConnection(); }
+  if (name === 'esconn') { loadESConnection(); populateDeviceSelect('rs_device', 'vkm360'); }
   if (name === 'settings') { loadSettings(); }
   if (name === 'archive') { populateDeviceSelect('ar_device', null); setArchivePreset('week'); }
   if (name === 'dashboard') { loadDashboard(); }
@@ -720,6 +754,51 @@ function syncNow(deviceId) {
   xhr.send(JSON.stringify({ device_id: deviceId }));
 }
 
+// forceResyncES — «Принудительная пересинхронизация с ЭС» на вкладке
+// «Подключение к ЭС» (добавлено 2026-08-30, прямой запрос оператора:
+// "бывает что с прибора попали искажённые данные и нужно переопросить
+// прибор и чтобы новые данные попали в эс"). В отличие от syncNow
+// выше (просит обычный цикл сделать внеплановый проход «только новое»
+// пораньше), это ЯВНО перезаписывает уже отправленные в ЭС точки за
+// указанный диапазон свежепосчитанными значениями — редкое,
+// осознанное действие, поэтому подтверждение обязательно.
+function forceResyncES() {
+  var deviceId = document.getElementById('rs_device').value;
+  var fromDate = document.getElementById('rs_from').value;
+  var toDate = document.getElementById('rs_to').value;
+  if (!deviceId) { showMsg('resyncMsg', false, 'Выберите прибор'); return; }
+  if (!fromDate) { showMsg('resyncMsg', false, 'Выберите дату начала в календаре'); return; }
+  if (!confirm('Это ПЕРЕЗАПИШЕТ уже отправленные в ЭС точки за указанный период свежими значениями. Продолжить?')) { return; }
+
+  var fromH = document.getElementById('rs_from_h').value;
+  var fromM = document.getElementById('rs_from_m').value;
+  var fromVal = fromDate + 'T' + fromH + ':' + fromM;
+
+  var toVal = '';
+  if (toDate) {
+    var toH = document.getElementById('rs_to_h').value;
+    var toM = document.getElementById('rs_to_m').value;
+    toVal = toDate + 'T' + toH + ':' + toM;
+  }
+
+  document.getElementById('resyncMsg').className = 'msg';
+  showMsg('resyncMsg', true, 'Идёт пересинхронизация, подождите...');
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/es-sync/force-resync', true);
+  xhr.setRequestHeader('Content-Type', 'application/json');
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    var data;
+    try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('resyncMsg', false, 'Ошибка ответа сервера'); return; }
+    if (data.ok) {
+      showMsg('resyncMsg', true, 'Готово: переписано ' + data.updated + ', вставлено новых ' + data.inserted + ', ошибок ' + data.failed + '.');
+    } else {
+      showMsg('resyncMsg', false, 'Ошибка: ' + (data.error || 'неизвестная'));
+    }
+  };
+  xhr.send(JSON.stringify({ device_id: deviceId, from: fromVal, to: toVal }));
+}
+
 // pollReloadProgress(deviceId, generation) — generation фиксируется
 // вызывающей стороной (checkExistingReload / forceReload) в момент
 // запуска ЭТОГО конкретного цикла отслеживания. Если к моменту прихода
@@ -866,6 +945,107 @@ function exportArchiveCSV() {
 var dashboardData = [];
 var dashboardSortKey = null;
 var dashboardSortAsc = true;
+
+// ===================== ЛОГ =====================
+// Добавлено 2026-08-30 по прямому запросу оператора: "добавить в юай
+// вкладку где будет крутится лог нашего сервера опроса как он сейчас в
+// окне крутится". Опрос GET /api/log?after=N каждые 2с (см.
+// internal/web/api_log.go — сервер отдаёт только НОВЫЕ строки с
+// прошлого опроса, не всё заново). Раскраска/подсветка — не переписывает
+// сами термины лога (это открытый, субъективный список, лучше уточнять
+// по мере конкретных жалоб на конкретные фразы, а не пытаться угадать
+// всё сразу), а лишь визуально помогает быстро находить главное:
+// уровень сообщения, какого прибора касается строка, метки периода.
+var logPaused = false;
+var logAfterSeq = 0;
+var logRawLines = []; // сырой текст без HTML-разметки — для копирования и скачивания
+
+function toggleLogPause() {
+  logPaused = !logPaused;
+  document.getElementById('logPauseBtn').innerText = logPaused ? 'Продолжить' : 'Пауза';
+}
+
+function escapeHtmlForLog(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function formatLogLine(line) {
+  var html = escapeHtmlForLog(line);
+  var cls = '';
+  if (line.indexOf('[ERROR]') !== -1 || line.indexOf('[FATAL]') !== -1) { cls = 'status-bad'; }
+  else if (line.indexOf('[WARN]') !== -1) { cls = 'log-warn'; }
+  else if (line.indexOf('[OK]') !== -1) { cls = 'status-good'; }
+  // Метка периода архива ("период 29.08.2026 22:30") — жирным, чтобы
+  // легко находить глазами момент, о котором идёт речь в строке.
+  html = html.replace(/(период \d{2}\.\d{2}\.\d{4} \d{2}:\d{2})/g, '<b>$1</b>');
+  // Префикс прибора в квадратных скобках в начале строки — тоже жирным.
+  html = html.replace(/^(\[[^\]]+\])/, '<b>$1</b>');
+  if (cls) { return '<span class="' + cls + '">' + html + '</span>'; }
+  return html;
+}
+
+function loadLog() {
+  if (logPaused) { return; }
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/log?after=' + logAfterSeq, true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
+    var data;
+    try { data = JSON.parse(xhr.responseText); } catch (e) { return; }
+    if (!data.entries || !data.entries.length) { return; }
+
+    var view = document.getElementById('logView');
+    var atBottom = (view.scrollTop + view.clientHeight >= view.scrollHeight - 10);
+
+    var html = '';
+    for (var i = 0; i < data.entries.length; i++) {
+      logRawLines.push(data.entries[i].text);
+      html += formatLogLine(data.entries[i].text) + '\n';
+    }
+    view.innerHTML += html;
+    logAfterSeq = data.latest_seq;
+
+    // Держим в браузере не больше строк, чем сервер держит в своём
+    // буфере — иначе вкладка, открытая долго, будет бесконечно
+    // разрастаться в памяти самой страницы.
+    if (logRawLines.length > 5000) {
+      logRawLines = logRawLines.slice(logRawLines.length - 5000);
+    }
+    if (atBottom) { view.scrollTop = view.scrollHeight; }
+  };
+  xhr.send();
+}
+
+function copyLog() {
+  var text = logRawLines.join('\n');
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  var ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+  document.body.removeChild(ta);
+  if (ok) {
+    showMsg('logMsg', true, 'Скопировано в буфер обмена (' + logRawLines.length + ' строк).');
+  } else {
+    showMsg('logMsg', false, 'Не удалось скопировать автоматически — выделите текст в окне лога вручную и нажмите Ctrl+C.');
+  }
+}
+
+function downloadLog() {
+  // Обычная ссылка на серверный эндпоинт вместо Blob/File API в
+  // браузере — работает в любом браузере, включая старый IE на целевой
+  // платформе (см. doc-комментарий handleDashboard в server.go про
+  // ES5/IE-совместимость всего фронтенда этого проекта).
+  window.location.href = '/api/log/download';
+}
+
+function clearLogView() {
+  document.getElementById('logView').innerHTML = '';
+  logRawLines = [];
+}
 
 function loadDashboard() {
   var xhr = new XMLHttpRequest();
@@ -1724,6 +1904,11 @@ populateHourSelect('rl_to_h');
 attachCalendar('rl_from');
 attachCalendar('rl_to');
 
+populateHourSelect('rs_from_h');
+populateHourSelect('rs_to_h');
+attachCalendar('rs_from');
+attachCalendar('rs_to');
+
 loadDevices();
 loadProfiles();
 resetDeviceForm();
@@ -1735,6 +1920,12 @@ loadDashboard();
 // дашборда на / (см. handleDashboard в server.go, setInterval(loadData,
 // 30000)) — уже проверенное на практике значение для этого проекта.
 setInterval(loadDashboard, 30000);
+
+loadLog();
+// Опрос новых строк лога каждые 2с — независимо от того, какая вкладка
+// открыта сейчас, тот же принцип, что и у loadDashboard выше (дёшево:
+// сервер отдаёт только НОВЫЕ строки, не весь буфер целиком).
+setInterval(loadLog, 2000);
 </script>
 </body>
 </html>`

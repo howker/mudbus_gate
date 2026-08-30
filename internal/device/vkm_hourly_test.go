@@ -147,3 +147,46 @@ func TestIsVKMTimeAnomalous_NoTimeField(t *testing.T) {
 		t.Fatalf("отсутствие поля Time не должно считаться аномалией: %q", raw)
 	}
 }
+
+// TestParseVKMPeriodEndTime_SlashFormat — "датный" формат Time= (со
+// слэшами) должен разбираться в правильный time.Time.
+func TestParseVKMPeriodEndTime_SlashFormat(t *testing.T) {
+	raw := "Time={Время  }28/07/26 15:00:00-28/07/26 15:30:00;Pi={Изб. давление *}4.1494e+05Па;"
+	got, ok := parseVKMPeriodEndTime(raw)
+	if !ok {
+		t.Fatal("ожидался успешный разбор для датного формата")
+	}
+	want := time.Date(2026, 7, 28, 15, 30, 0, 0, time.Local)
+	if !got.Equal(want) {
+		t.Fatalf("получено %v, ожидалось %v", got, want)
+	}
+}
+
+// TestParseVKMPeriodEndTime_RawSecondsFormat — реальный пример из живого
+// лога boylernaya_par (2026-08-30): 841440600-841442400сек соответствует
+// 29.08.2026 22:30:00 при vkmRawSecondsEpoch (31.12.1999 00:30:00) —
+// сверено на 6 последовательных периодах подряд живьём, совпадение
+// точное до секунды на каждом (см. doc-комментарий vkmRawSecondsEpoch в
+// vkm_hourly.go). ИЗМЕНЕНО (2026-08-30): раньше секундный формат вообще
+// не парсился (эпоха была не подтверждена) — теперь парсится так же
+// успешно, как и датный.
+func TestParseVKMPeriodEndTime_RawSecondsFormat(t *testing.T) {
+	raw := "Time=841440600-841442400сек;Pi=425096.5Па;"
+	got, ok := parseVKMPeriodEndTime(raw)
+	if !ok {
+		t.Fatal("ожидался успешный разбор для секундного формата")
+	}
+	want := time.Date(2026, 8, 29, 22, 30, 0, 0, time.Local)
+	if !got.Equal(want) {
+		t.Fatalf("получено %v, ожидалось %v", got, want)
+	}
+}
+
+// TestParseVKMPeriodEndTime_NoTimeField — если поля Time вообще нет,
+// разбор должен честно вернуть ok=false, а не панику или мусор.
+func TestParseVKMPeriodEndTime_NoTimeField(t *testing.T) {
+	raw := "Pi=4.1494e+05Па;S=1230.7Кг;"
+	if _, ok := parseVKMPeriodEndTime(raw); ok {
+		t.Fatal("ожидался ok=false при отсутствии поля Time")
+	}
+}

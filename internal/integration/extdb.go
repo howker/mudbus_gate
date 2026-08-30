@@ -195,6 +195,36 @@ func (w *MainsWriter) InsertPoint(ctx context.Context, channel int, ts time.Time
 	return err
 }
 
+// UpdatePoint overwrites Value/State for an EXISTING row in Mains — used
+// by the «Принудительная пересинхронизация с ЭС» operator action
+// (добавлено 2026-08-30, прямой запрос оператора: "бывает что с прибора
+// попали искажённые данные и нужно переопросить прибор и чтобы новые
+// данные попали в эс"). The ordinary sync loop
+// (energosphere_sync.go's runEnergosphereSyncOnce) NEVER calls this —
+// it only inserts new points and skips existing ones, deliberately, to
+// avoid touching every already-synced point on every routine hourly
+// pass. This is a separate, explicitly operator-triggered path (see
+// ForceResyncRange) for the case where a point already in Mains needs
+// correcting — either the source data was garbled and has since been
+// re-collected correctly (see internal/device/vkm_reload.go), or the
+// channel's unit conversion factor changed after the point was already
+// sent in the wrong unit (see api_admin_ui.go's «Каналы ЭС» tab).
+//
+// Returns the number of rows actually changed (0 if the point didn't
+// exist at all yet — ForceResyncRange falls back to InsertPoint in that
+// case, giving "insert if missing, overwrite if present" semantics
+// overall).
+func (w *MainsWriter) UpdatePoint(ctx context.Context, channel int, ts time.Time, value float64, state int) (int64, error) {
+	q := fmt.Sprintf(
+		"UPDATE [%s].dbo.Mains SET Value = @p3, State = @p4 WHERE ID_Channel = @p1 AND MeasureDate = CAST(@p2 AS datetime)",
+		w.database)
+	res, err := w.db.ExecContext(ctx, q, channel, ts, value, state)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // IsDuplicateKeyError reports whether err is a SQL Server unique-constraint
 // violation — used by the sync loop to treat "someone else already wrote
 // this point" as a benign skip rather than a hard failure (can happen if

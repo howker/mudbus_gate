@@ -381,6 +381,94 @@ func runEnergosphereSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer 
 	}
 }
 
+// ForceResyncRange принудительно ПЕРЕЗАПИСЫВАЕТ (не пропускает уже
+// существующие) точки Mains за указанный диапазон [from, to] для
+// заданного прибора — отдельное, явно запрошенное оператором действие
+// (добавлено 2026-08-30, прямой запрос оператора: "бывает что с прибора
+// попали искажённые данные и нужно переопросить прибор и чтобы новые
+// данные попали в эс"). НЕ часть обычного автоматического прохода —
+// runEnergosphereSyncOnce выше по-прежнему только вставляет новое и
+// пропускает существующее, это сознательный выбор, чтобы не создавать
+// лишнюю нагрузку на БД ЭС проверкой/перезаписью каждой точки при
+// каждом обычном часовом цикле.
+//
+// Типичные поводы: (а) с прибора один раз пришли искажённые данные,
+// потом сделали «Принудительный переопрос» — свежие верные значения
+// появились в НАШЕЙ локальной базе, но в ЭС остались старые, раз там
+// уже что-то есть под той же меткой времени и обычная синхронизация их
+// не трогает; (б) поменяли множитель канала (см. «Каналы ЭС» в
+// api_admin_ui.go) — новые точки сами пойдут в правильных единицах, а
+// уже отправленная история так и останется в старых, пока её явно не
+// перезаписать.
+//
+// Для каждой точки диапазона: пробуем UpdatePoint (перезаписать, если
+// уже есть); если затронуто 0 строк — точки ещё не было, вставляем
+// обычным InsertPoint.
+func ForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *MainsWriter, cfg Config, from, to time.Time) (updated, inserted, failed int, err error) {
+	rows, err := repo.GetVKMRawStringsRange(ctx, cfg.DeviceID, cfg.Pipe, from, to)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("чтение исходной БД: %w", err)
+	}
+	if len(rows) == 0 {
+		return 0, 0, 0, nil
+	}
+
+	targets := []tagFactor{
+		{"ST", cfg.ChanHeat, cfg.FactorHeat, "тепло"},
+		{"S", cfg.ChanMass, cfg.FactorMass, "масса"},
+		{"T", cfg.ChanTemp, cfg.FactorTemp, "температура"},
+		{"Pi", cfg.ChanPressure, cfg.FactorPressure, "давление"},
+	}
+
+	for _, row := range rows {
+		// Тот же сдвиг метки времени, что и в обычном проходе выше —
+		// см. runEnergosphereSyncOnce, тот же принцип: применяется один
+		// раз, до всех дальнейших действий.
+		esTime := row.TsHour.Add(time.Duration(cfg.TimeShiftMinutes) * time.Minute)
+
+		for _, t := range targets {
+			rawVal, ok := parseVKMTagFloat(row.RawString, t.tag)
+			if !ok {
+				continue
+			}
+			value := rawVal * t.factor
+
+			affected, uerr := writer.UpdatePoint(ctx, t.channel, esTime, value, 0)
+			if uerr != nil {
+				log.Printf("[es-sync] принудительная перезапись (%s ch=%d %s): %v\n",
+					t.label, t.channel, esTime.Format("02.01 15:04"), uerr)
+				failed++
+				continue
+			}
+			if affected > 0 {
+				updated++
+				continue
+			}
+
+			// Точки ещё не было вообще — вставляем как обычно.
+			if ierr := writer.InsertPoint(ctx, t.channel, esTime, value, 0); ierr != nil {
+				if IsDuplicateKeyError(ierr) {
+					// Гонка: кто-то вставил её между UpdatePoint и
+					// InsertPoint — не беда, пробуем перезаписать ещё раз.
+					if _, uerr2 := writer.UpdatePoint(ctx, t.channel, esTime, value, 0); uerr2 == nil {
+						updated++
+						continue
+					}
+				}
+				log.Printf("[es-sync] принудительная запись (%s ch=%d %s): %v\n",
+					t.label, t.channel, esTime.Format("02.01 15:04"), ierr)
+				failed++
+				continue
+			}
+			inserted++
+		}
+	}
+
+	log.Printf("[es-sync] принудительная пересинхронизация завершена: переписано %d, вставлено новых %d, ошибок %d, окно %s..%s\n",
+		updated, inserted, failed, from.Format("02.01 15:04"), to.Format("02.01 15:04"))
+	return updated, inserted, failed, nil
+}
+
 // parseVKMTagFloat extracts one tag's numeric value from a raw ВКМ archive
 // string ("tag{header}=value unit;…"). Same convention the northbound
 // carriers' parsers use; duplicated here (tiny, self-contained) so

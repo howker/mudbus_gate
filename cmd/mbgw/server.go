@@ -18,6 +18,7 @@ import (
 	"mbgw/internal/device"
 	"mbgw/internal/integration"
 	"mbgw/internal/lease"
+	"mbgw/internal/logbuf"
 	"mbgw/internal/monitor"
 	"mbgw/internal/northbound"
 	"mbgw/internal/pollcore"
@@ -191,7 +192,12 @@ func runServer() {
 		log.Fatalf("[FATAL] не удалось открыть файл лога: %v", err)
 	}
 	defer logWriter.Close()
-	multiWriter := io.MultiWriter(os.Stdout, logWriter)
+	// logbuf.Writer{} — третий получатель лога, наравне с os.Stdout и
+	// файлом: кольцевой буфер в памяти для вкладки «Лог» в /admin
+	// (добавлено 2026-08-30, прямой запрос оператора). См. internal/
+	// logbuf/logbuf.go — не пишет на диск, переживать перезапуск ему
+	// не нужно, для полной истории есть сам mbgw_server.log.
+	multiWriter := io.MultiWriter(os.Stdout, logWriter, logbuf.Writer{})
 	log.SetOutput(multiWriter)
 	log.SetFlags(log.Ldate | log.Ltime)
 	log.Println("=== запуск шлюза mbgw (server: единый процесс, конфигурация из БД) ===")
@@ -472,6 +478,54 @@ func runServer() {
 		return nil
 	})
 
+	// Принудительная пересинхронизация с ЭС (см. internal/web/
+	// api_es_resync.go, internal/integration/energosphere_sync.go's
+	// ForceResyncRange) — добавлено 2026-08-30, прямой запрос
+	// оператора: "бывает что с прибора попали искажённые данные и нужно
+	// переопросить прибор и чтобы новые данные попали в эс". В отличие
+	// от SetSyncNow выше (просит уже работающий цикл поторопиться со
+	// «только новым»), здесь ОТКРЫВАЕТСЯ ОТДЕЛЬНОЕ подключение к БД ЭС
+	// на время самой операции (не переиспользует подключение
+	// работающего es-sync цикла) — это редкое, явно запрошенное
+	// оператором действие с указанным диапазоном, а не часть обычного
+	// расписания, так что отдельное подключение проще и не рискует
+	// помешать штатному циклу синхронизации.
+	webServer.SetForceResyncES(func(ctx context.Context, deviceID string, from, to time.Time) (updated, inserted, failed int, err error) {
+		devicesMu.Lock()
+		kind := deviceKinds[deviceID]
+		devicesMu.Unlock()
+		if kind != "vkm360" {
+			return 0, 0, 0, fmt.Errorf("принудительная пересинхронизация с ЭС поддерживается только для приборов ВКМ (у прибора %s тип %q)", deviceID, kind)
+		}
+
+		cfg, found, cerr := buildIntegrationConfig(ctx, repo, deviceID)
+		if cerr != nil {
+			return 0, 0, 0, cerr
+		}
+		if !found {
+			return 0, 0, 0, fmt.Errorf("для прибора %s не настроено подключение к ЭС или каналы", deviceID)
+		}
+
+		writer, werr := integration.OpenMainsWriter(integration.SQLServerConfig{
+			Server: cfg.SQLServer, Database: cfg.SQLDatabase,
+			User: cfg.SQLUser, Password: cfg.SQLPassword, Port: cfg.SQLPort,
+		})
+		if werr != nil {
+			return 0, 0, 0, fmt.Errorf("подключение к БД ЭС: %w", werr)
+		}
+		defer writer.Close()
+
+		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		if perr := writer.Ping(pingCtx); perr != nil {
+			return 0, 0, 0, fmt.Errorf("проверка подключения к БД ЭС: %w", perr)
+		}
+
+		log.Printf("[WEB] принудительная пересинхронизация с ЭС: прибор %s, %s..%s\n",
+			deviceID, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
+		return integration.ForceResyncRange(ctx, repo, writer, cfg, from, to)
+	})
+
 	pl := poller.New(sched, devices, 1*time.Second)
 	go pl.Run(ctx)
 
@@ -717,28 +771,37 @@ func startAkronNorthboundForDevice(ctx context.Context, repo *sqliterepo.Repo, d
 // чтобы кнопка «Синхронизировать сейчас» и «Принудительный переопрос»
 // могли попросить внеплановый проход, не дожидаясь часового тикера
 // (добавлено 2026-08-27).
-func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, dbPath string) chan struct{} {
-	conn, found, err := repo.GetESConnection(ctx)
+// buildIntegrationConfig собирает integration.Config из текущих
+// настроек в БД (подключение к ЭС + каналы ВКМ для конкретного прибора)
+// — вынесено из startESyncForDevice в отдельную функцию (2026-08-30),
+// чтобы её же мог переиспользовать колбэк «Принудительной
+// пересинхронизации с ЭС» (см. SetForceResyncES ниже): та операция
+// должна использовать САМЫЕ СВЕЖИЕ настройки (например, только что
+// изменённый множитель канала), а не что-то закэшированное при старте
+// процесса — поэтому читает из БД заново при каждом вызове, точно так
+// же, как это делает startESyncForDevice при регистрации прибора.
+//
+// found=false означает, что для этого прибора нет ни подключения к ЭС,
+// ни настроенных каналов — не ошибка, просто «для этого прибора
+// интеграция с ЭС не настроена».
+func buildIntegrationConfig(ctx context.Context, repo *sqliterepo.Repo, deviceID string) (cfg integration.Config, found bool, err error) {
+	conn, connFound, err := repo.GetESConnection(ctx)
 	if err != nil {
-		log.Printf("[ERROR] прибор %s: ошибка чтения параметров подключения к БД ЭС: %v\n", deviceID, err)
-		return nil
+		return integration.Config{}, false, fmt.Errorf("чтение параметров подключения к БД ЭС: %w", err)
 	}
-	if !found {
-		log.Printf("[INFO] прибор %s: подключение к БД ЭС не настроено — es-sync не запущен\n", deviceID)
-		return nil
+	if !connFound {
+		return integration.Config{}, false, nil
 	}
 
 	channels, err := repo.GetVKMChannels(ctx, deviceID)
 	if err != nil {
-		log.Printf("[ERROR] прибор %s: ошибка чтения каналов ЭС: %v\n", deviceID, err)
-		return nil
+		return integration.Config{}, false, fmt.Errorf("чтение каналов ЭС: %w", err)
 	}
 	if len(channels) == 0 {
-		log.Printf("[INFO] прибор %s: каналы ЭС не настроены — es-sync не запущен\n", deviceID)
-		return nil
+		return integration.Config{}, false, nil
 	}
 
-	cfg := integration.Config{
+	cfg = integration.Config{
 		SQLServer:   conn.SQLServer,
 		SQLDatabase: conn.SQLDatabase,
 		SQLUser:     conn.SQLUser,
@@ -779,9 +842,23 @@ func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, d
 	// более глубокая история, а не отбрасывается ещё до проверки.
 	cfg.BackfillHours = 2160
 
+	return cfg, true, nil
+}
+
+func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, dbPath string) chan struct{} {
+	cfg, found, err := buildIntegrationConfig(ctx, repo, deviceID)
+	if err != nil {
+		log.Printf("[ERROR] прибор %s: %v — es-sync не запущен\n", deviceID, err)
+		return nil
+	}
+	if !found {
+		log.Printf("[INFO] прибор %s: подключение к БД ЭС или каналы не настроены — es-sync не запущен\n", deviceID)
+		return nil
+	}
+
 	trigger := make(chan struct{}, 1)
 	go func() {
-		log.Printf("[OK] es-sync для %s: старт (сервер БД ЭС=%s, база=%s)\n", deviceID, conn.SQLServer, conn.SQLDatabase)
+		log.Printf("[OK] es-sync для %s: старт (сервер БД ЭС=%s, база=%s)\n", deviceID, cfg.SQLServer, cfg.SQLDatabase)
 		if err := integration.RunEnergosphereSync(ctx, dbPath, cfg, trigger); err != nil {
 			log.Printf("[ERROR] es-sync %s: %v\n", deviceID, err)
 		}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -141,27 +142,51 @@ func isVKMTimeAnomalous(raw string) bool {
 	return !strings.Contains(value, "/")
 }
 
+// vkmRawSecondsEpoch — опорная точка отсчёта для "секундного" формата
+// поля Time= (см. doc-комментарий isVKMTimeAnomalous выше про сам
+// формат). Подобрана ЭМПИРИЧЕСКИ 2026-08-30 сверкой 6 последовательных
+// периодов архива boylernaya_par подряд (охват ~11 часов, через
+// полночь) — вычисленное «эпоха + сырые секунды конца периода» СОВПАЛО
+// С НАШЕЙ СОБСТВЕННОЙ меткой periodLabel ТОЧНО ДО СЕКУНДЫ на всех 6
+// записях без единого расхождения. Это не совпадение — устойчивое
+// повторение на 6 независимых точках такую вероятность практически
+// исключает.
+//
+// ВНИМАНИЕ: подобрано по одной сессии наблюдения, без перехода через
+// летнее/зимнее время и без данных за другие даты года. Если после
+// этого фикса дрейф вдруг начнёт показывать резкие скачки или
+// подозрительно круглые числа (например, ровно ±1ч в момент смены
+// времени) — повод пересмотреть эту эпоху, возможно её расчёт зависит
+// от даты сложнее, чем предполагается здесь.
+var vkmRawSecondsEpoch = time.Date(1999, 12, 31, 0, 30, 0, 0, time.Local)
+
 // parseVKMPeriodEndTime extracts the device-reported END-of-period
 // timestamp from the raw archive string's Time= field — for time-drift
 // monitoring (см. internal/devicestatus), добавлено 2026-08-29 по
 // прямому запросу оператора ("мы никак не отслеживаем какое время
 // сейчас в приборе").
 //
-// Возвращает ok=false, если поле Time отсутствует ИЛИ использует формат
-// "голых секунд" (см. doc-комментарий isVKMTimeAnomalous выше) — эти
-// числа НЕ подтверждены как секунды Unix-эпохи в какой-либо известной
-// базе отсчёта, так что разбирать их как реальный момент времени значило
-// бы молча придумать неверный дрейф вместо честного "сейчас не можем
-// определить".
+// ИЗМЕНЕНО (2026-08-30): раньше "секундный" формат (см. doc-комментарий
+// isVKMTimeAnomalous выше) считался непарсимым в принципе — числа не
+// были подтверждены как секунды Unix-эпохи в какой-либо известной базе
+// отсчёта, разбирать их как реальный момент значило бы молча придумать
+// неверный дрейф. Теперь эпоха подобрана и подтверждена (см.
+// vkmRawSecondsEpoch выше) — оба формата разбираются одинаково успешно.
+// Возвращает ok=false только если поле Time отсутствует вовсе, или ни
+// один из двух известных форматов не подошёл.
 //
-// Формат нормальной строки (оба варианта встречались живьём, см.
-// TestIsVKMTimeAnomalous_RealExamples в vkm_hourly_test.go):
+// Формат нормальной (датной) строки (оба варианта встречались живьём,
+// см. TestIsVKMTimeAnomalous_RealExamples в vkm_hourly_test.go):
 //
 //	Time={Время  }28/07/26 15:00:00-28/07/26 15:30:00;...
 //	Time=28/07/26 15:00:00-28/07/26 15:30:00;...
 //
-// Берём вторую (правую) дату-время — конец периода, тот же момент,
-// которым мы сами подписываем periodLabel в collectVKMPeriod.
+// Формат "голых секунд":
+//
+//	Time=841440600-841442400сек;...
+//
+// В обоих случаях берём вторую (правую) дату-время — конец периода, тот
+// же момент, которым мы сами подписываем periodLabel в collectVKMPeriod.
 func parseVKMPeriodEndTime(raw string) (time.Time, bool) {
 	idx := strings.Index(raw, "Time=")
 	if idx < 0 {
@@ -177,9 +202,6 @@ func parseVKMPeriodEndTime(raw string) (time.Time, bool) {
 	if brace := strings.Index(value, "}"); brace >= 0 {
 		value = value[brace+1:]
 	}
-	if !strings.Contains(value, "/") {
-		return time.Time{}, false // "голые секунды" — не парсим, см. выше
-	}
 
 	dash := strings.Index(value, "-")
 	if dash < 0 {
@@ -187,11 +209,23 @@ func parseVKMPeriodEndTime(raw string) (time.Time, bool) {
 	}
 	endStr := strings.TrimSpace(value[dash+1:])
 
-	t, err := time.ParseInLocation("02/01/06 15:04:05", endStr, time.Local)
+	if strings.Contains(value, "/") {
+		t, err := time.ParseInLocation("02/01/06 15:04:05", endStr, time.Local)
+		if err != nil {
+			return time.Time{}, false
+		}
+		return t, true
+	}
+
+	// Секундный формат: endStr выглядит как "841442400сек" — отрезаем
+	// суффикс единицы измерения и парсим как целое число секунд от
+	// vkmRawSecondsEpoch.
+	endStr = strings.TrimSuffix(strings.TrimSpace(endStr), "сек")
+	secs, err := strconv.ParseInt(strings.TrimSpace(endStr), 10, 64)
 	if err != nil {
 		return time.Time{}, false
 	}
-	return t, true
+	return vkmRawSecondsEpoch.Add(time.Duration(secs) * time.Second), true
 }
 
 // collectVKMPeriod РґРµР»Р°РµС‚ РћР”РРќ РїРѕР»РЅС‹Р№ С‚Р°РЅРµС† Р·Р°РїРёСЃСЊ/РѕР¶РёРґР°РЅРёРµ/С‡С‚РµРЅРёРµ Р°СЂС…РёРІР°
@@ -278,7 +312,7 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, period
 		devicestatus.Set(d.ID, devicestatus.TimeDrift{
 			CheckedAt: time.Now(),
 			Reliable:  false,
-			Note:      "формат времени в ответе прибора не позволяет определить точный момент (голые секунды либо поле Time отсутствует)",
+			Note:      "поле Time отсутствует в ответе прибора, или его формат не подошёл ни под один из двух известных вариантов",
 		})
 		// Логируем ТОЛЬКО фрагмент вокруг Time= (не всю сырую строку —
 		// она может быть длинной), чтобы при следующем разборе "не
