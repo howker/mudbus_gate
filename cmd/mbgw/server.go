@@ -151,19 +151,78 @@ func nextToExe(name string) string {
 // and every file this process creates appears right there, regardless of
 // how it's launched.
 func runServer() {
-	// Защита от двойного запуска — САМАЯ ПЕРВАЯ проверка, даже раньше
-	// регистрации в диспетчере служб (добавлено 2026-08-30, прямой
-	// запрос оператора). Теперь, когда появилось ДВА способа запустить
-	// один и тот же процесс (служба Windows и обычный ручной запуск),
-	// нужна защита от случайного одновременного запуска обоих —
-	// иначе оба экземпляра начали бы опрашивать одни и те же приборы
-	// параллельно, мешая друг другу физически на линии связи, плюс
-	// конфликт за порт веб-интерфейса и одновременная запись в один и
-	// тот же файл лога/БД. См. single_instance_windows.go —
-	// именованный Windows-мьютекс, освобождается автоматически при
-	// завершении процесса-владельца.
+	// Файл лога открываем ПЕРВЫМ делом, даже раньше проверки на двойной
+	// запуск ниже (переставлено 2026-08-30, найдено оператором живьём):
+	// если отказ в запуске случится у СЛУЖБЫ (без консоли, вывод в
+	// stderr никто не увидит), причина должна остаться видна хотя бы в
+	// mbgw_server.log — иначе диагностировать отказ можно было бы
+	// только у процесса, запущенного вручную в открытой консоли, а это
+	// именно тот случай, где нам нужнее всего понять причину, раз служба
+	// работает без присмотра. Сам путь к файлу лога ("mbgw_server.log"
+	// рядом с exe) не зависит ни от --db, ни от других флагов — их
+	// разбор можно спокойно оставить ниже.
+	//
+	// rotatingFile (см. rotating_log.go) — раньше здесь был обычный
+	// os.OpenFile с O_APPEND, растущий БЕСКОНЕЧНО без единого ограничения
+	// на размер, пока процесс работает — найдено оператором живьём
+	// (2026-08-29): mbgw_server.log и *_akron_live.jsonl на проде растут
+	// без остановки, потому что перезапуск сервера (единственный момент,
+	// когда файл раньше начинал расти "с нуля" — при старом os.OpenFile
+	// он всё равно ДОПИСЫВАЛ поверх старого через O_APPEND, так что даже
+	// перезапуск не помогал) происходит редко и не по расписанию.
+	// 20 МБ на файл, храним последние 10 архивов — с запасом хватает на
+	// много дней работы для диагностики, не давая диску заполниться при
+	// долгой непрерывной работе без перезапуска.
+	logWriter, err := newRotatingFile(nextToExe("mbgw_server.log"), 20*1024*1024, 10)
+	if err != nil {
+		log.Fatalf("[FATAL] не удалось открыть файл лога: %v", err)
+	}
+	defer logWriter.Close()
+	// logbuf.Writer{} — третий получатель лога, наравне с os.Stdout и
+	// файлом: кольцевой буфер в памяти для вкладки «Лог» в /admin
+	// (добавлено 2026-08-30, прямой запрос оператора). См. internal/
+	// logbuf/logbuf.go — не пишет на диск, переживать перезапуск ему
+	// не нужно, для полной истории есть сам mbgw_server.log.
+	multiWriter := io.MultiWriter(os.Stdout, logWriter, logbuf.Writer{})
+	log.SetOutput(multiWriter)
+	log.SetFlags(log.Ldate | log.Ltime)
+	log.Println("=== запуск шлюза mbgw (server: единый процесс, конфигурация из БД) ===")
+
+	// Защита от двойного запуска — сразу после открытия лога, до
+	// регистрации в диспетчере служб и уж тем более до регистрации
+	// приборов (добавлено 2026-08-30, прямой запрос оператора). Теперь,
+	// когда появилось ДВА способа запустить один и тот же процесс
+	// (служба Windows и обычный ручной запуск), нужна защита от
+	// случайного одновременного запуска обоих — иначе оба экземпляра
+	// начали бы опрашивать одни и те же приборы параллельно, мешая друг
+	// другу физически на линии связи, плюс конфликт за порт
+	// веб-интерфейса и одновременная запись в один и тот же файл лога/БД.
+	// См. single_instance_windows.go — именованный Windows-мьютекс,
+	// освобождается автоматически при завершении процесса-владельца.
+	//
+	// ИЗМЕНЕНО (2026-08-30, найдено оператором живьём): раньше при
+	// ОШИБКЕ проверки (не при подтверждённом конфликте, а именно при
+	// сбое самой проверки) код продолжал запуск БЕЗ защиты — с одной
+	// лишь строкой предупреждения в логе. Ровно так и произошло на
+	// практике: мьютекс, созданный службой (LocalSystem, изолированная
+	// Session 0), не давал доступа ручному процессу администратора
+	// (другая сессия/учётная запись) без явного дескриптора
+	// безопасности — CreateMutex падал с "Access is denied", защита
+	// молча отключалась, и оба процесса благополучно стартовали
+	// параллельно (подтверждено живьём: одновременная регистрация
+	// приборов и подключение к ЭС из обоих). Первопричина (отсутствие
+	// дескриптора безопасности) исправлена в single_instance_windows.go
+	// — но раз mbgw пишет в финансово значимую базу учёта (ЭС), для
+	// ЛЮБОЙ ошибки самой проверки теперь выбран более строгий отказ:
+	// лучше видимый, понятный простой (служба явно не стартует,
+	// STATE виден в sc query, оператор идёт смотреть лог), чем
+	// невидимая порча данных из-за незамеченной строки в логе при
+	// автоматическом перезапуске без присмотра (например, после
+	// планового обновления Windows).
 	if ok, err := acquireSingleInstanceLock(); err != nil {
-		log.Printf("[WARN] не удалось проверить, не запущен ли уже другой экземпляр mbgw: %v — продолжаю без этой защиты\n", err)
+		log.Printf("[FATAL] не удалось проверить, не запущен ли уже другой экземпляр mbgw: %v\n", err)
+		log.Println("        Это защита от конфликта двух процессов — раз проверить не удалось, безопаснее отказать в запуске, чем рискнуть двойным опросом приборов и порчей данных в ЭС.")
+		os.Exit(1)
 	} else if !ok {
 		log.Println("[FATAL] mbgw.exe уже запущен (службой или вручную) — второй экземпляр не может стартовать одновременно с первым.")
 		log.Println("        Остановите уже работающий процесс (вкладка «Служба» в /admin, либо sc stop mbgw_service, либо Ctrl+C в его консоли), прежде чем запускать снова.")
@@ -171,8 +230,7 @@ func runServer() {
 	}
 
 	// Проверка/регистрация в диспетчере управления службами Windows —
-	// ДОЛЖНА идти самой первой строкой (после защиты от двойного
-	// запуска выше), до открытия БД и уж тем более до регистрации
+	// ДОЛЖНА идти до открытия БД и уж тем более до регистрации
 	// приборов (добавлено 2026-08-30, найдено оператором живьём: без
 	// этого "sc start mbgw_service" падал с ошибкой 1053, "служба не
 	// ответила на запрос своевременно" — SCM ждёт подтверждение "я
@@ -218,32 +276,6 @@ func runServer() {
 	}
 
 	dbPath = nextToExe(dbPath)
-
-	// rotatingFile (см. rotating_log.go) — раньше здесь был обычный
-	// os.OpenFile с O_APPEND, растущий БЕСКОНЕЧНО без единого ограничения
-	// на размер, пока процесс работает — найдено оператором живьём
-	// (2026-08-29): mbgw_server.log и *_akron_live.jsonl на проде растут
-	// без остановки, потому что перезапуск сервера (единственный момент,
-	// когда файл раньше начинал расти "с нуля" — при старом os.OpenFile
-	// он всё равно ДОПИСЫВАЛ поверх старого через O_APPEND, так что даже
-	// перезапуск не помогал) происходит редко и не по расписанию.
-	// 20 МБ на файл, храним последние 10 архивов — с запасом хватает на
-	// много дней работы для диагностики, не давая диску заполниться при
-	// долгой непрерывной работе без перезапуска.
-	logWriter, err := newRotatingFile(nextToExe("mbgw_server.log"), 20*1024*1024, 10)
-	if err != nil {
-		log.Fatalf("[FATAL] не удалось открыть файл лога: %v", err)
-	}
-	defer logWriter.Close()
-	// logbuf.Writer{} — третий получатель лога, наравне с os.Stdout и
-	// файлом: кольцевой буфер в памяти для вкладки «Лог» в /admin
-	// (добавлено 2026-08-30, прямой запрос оператора). См. internal/
-	// logbuf/logbuf.go — не пишет на диск, переживать перезапуск ему
-	// не нужно, для полной истории есть сам mbgw_server.log.
-	multiWriter := io.MultiWriter(os.Stdout, logWriter, logbuf.Writer{})
-	log.SetOutput(multiWriter)
-	log.SetFlags(log.Ldate | log.Ltime)
-	log.Println("=== запуск шлюза mbgw (server: единый процесс, конфигурация из БД) ===")
 
 	repo, err := sqliterepo.New(dbPath)
 	if err != nil {
@@ -537,19 +569,23 @@ func runServer() {
 		devicesMu.Lock()
 		kind := deviceKinds[deviceID]
 		devicesMu.Unlock()
-		if kind != "vkm360" {
-			return 0, 0, 0, fmt.Errorf("принудительная пересинхронизация с ЭС поддерживается только для приборов ВКМ (у прибора %s тип %q)", deviceID, kind)
+		// ИЗМЕНЕНО (2026-08-31): раньше работало только для ВКМ — теперь
+		// оба типа приборов пишут в ЭС одним и тем же путём
+		// (buildIntegrationConfig сам умеет и в тот, и в другой), так что
+		// ограничение убрано; неизвестный/пустой kind по-прежнему отказ.
+		if kind != "vkm360" && kind != "akron" {
+			return 0, 0, 0, fmt.Errorf("принудительная пересинхронизация с ЭС не поддерживается для типа прибора %q (прибор %s)", kind, deviceID)
 		}
 
-		cfg, found, cerr := buildIntegrationConfig(ctx, repo, deviceID)
+		cfg, found, cerr := buildIntegrationConfig(ctx, repo, deviceID, kind)
 		if cerr != nil {
 			return 0, 0, 0, cerr
 		}
 		if !found {
-			return 0, 0, 0, fmt.Errorf("для прибора %s не настроено подключение к ЭС или каналы", deviceID)
+			return 0, 0, 0, fmt.Errorf("для прибора %s не настроено подключение к ЭС или точки", deviceID)
 		}
 
-		writer, werr := integration.OpenMainsWriter(integration.SQLServerConfig{
+		writer, werr := integration.OpenPointMainsWriter(integration.SQLServerConfig{
 			Server: cfg.SQLServer, Database: cfg.SQLDatabase,
 			User: cfg.SQLUser, Password: cfg.SQLPassword, Port: cfg.SQLPort,
 		})
@@ -752,14 +788,26 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 		devRec.ID, devRec.Kind, currentInterval, archiveInterval, archiveAtMinute)
 
 	// Per-kind upstream delivery, started right after the device is
-	// registered for southbound polling — same "additive, opt-in per
-	// row present in the DB" principle as serve()'s
-	// cfg.NorthboundAkron check.
+	// registered for southbound polling.
+	//
+	// ИЗМЕНЕНО (2026-08-31, прямой запрос оператора: "переделать опрос
+	// акрона... сделать также как вкм... убрать как атавизм... опрос
+	// через драйвер энергосферы"): раньше Akron получал данные в ЭС
+	// СОВСЕМ ДРУГИМ путём — эмуляцией физического прибора для родного
+	// драйвера ЭС (startAkronNorthboundForDevice, определена ниже,
+	// оставлена в коде НЕЗАКОММЕНТИРОВАННОЙ как функция — но её ВЫЗОВ
+	// здесь закомментирован, вдруг понадобится вернуться к этому пути).
+	// Теперь оба типа приборов идут через ОДИН общий механизм прямой
+	// записи в PointMains (startESyncForDevice) — единственная разница
+	// между ними теперь в самом механизме — сколько точек и откуда
+	// берутся исходные данные (см. buildIntegrationConfig,
+	// internal/integration/energosphere_sync.go).
 	switch devRec.Kind {
-	case "akron":
-		startAkronNorthboundForDevice(ctx, repo, devRec.ID)
-	case "vkm360":
-		if trigger := startESyncForDevice(ctx, repo, devRec.ID, dbPath); trigger != nil {
+	case "akron", "vkm360":
+		// startAkronNorthboundForDevice(ctx, repo, devRec.ID) — старый
+		// путь через эмуляцию прибора для драйвера ЭС, закомментирован,
+		// см. пояснение выше.
+		if trigger := startESyncForDevice(ctx, repo, devRec.ID, devRec.Kind, dbPath); trigger != nil {
 			devicesMu.Lock()
 			esSyncTriggers[devRec.ID] = trigger
 			devicesMu.Unlock()
@@ -806,6 +854,18 @@ func isPortFree(port int) bool {
 // its own goroutine; a missing/misconfigured address logs and skips
 // rather than failing the whole server startup, so one bad device
 // doesn't take down polling for every other device.
+//
+// ОТКЛЮЧЕНО (2026-08-31, прямой запрос оператора: "переделать опрос
+// акрона - убрать как атавизм (закомментировать код может когда-то
+// понадобится вернуться к опросу через драйвер энергосферы)"). Функция
+// НЕ УДАЛЕНА и по-прежнему компилируется — только единственный вызов
+// в registerOneDevice закомментирован (ищите "startAkronNorthboundForDevice(ctx,
+// repo, devRec.ID) — старый путь" в этом же файле). Akron теперь
+// получает данные в ЭС ТЕМ ЖЕ путём, что и ВКМ — прямой записью в
+// PointMains через startESyncForDevice, см. buildIntegrationConfig
+// выше. Если когда-нибудь понадобится вернуться к эмуляции прибора для
+// родного драйвера ЭС — раскомментировать тот один вызов, эта функция
+// уже готова к работе как есть.
 func startAkronNorthboundForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID string) {
 	addr, found, err := repo.GetAkronNorthboundAddr(ctx, deviceID)
 	if err != nil {
@@ -856,19 +916,30 @@ func startAkronNorthboundForDevice(ctx context.Context, repo *sqliterepo.Repo, d
 // могли попросить внеплановый проход, не дожидаясь часового тикера
 // (добавлено 2026-08-27).
 // buildIntegrationConfig собирает integration.Config из текущих
-// настроек в БД (подключение к ЭС + каналы ВКМ для конкретного прибора)
-// — вынесено из startESyncForDevice в отдельную функцию (2026-08-30),
+// настроек в БД (подключение к ЭС + точки для конкретного прибора) —
+// вынесено из startESyncForDevice в отдельную функцию (2026-08-30),
 // чтобы её же мог переиспользовать колбэк «Принудительной
 // пересинхронизации с ЭС» (см. SetForceResyncES ниже): та операция
 // должна использовать САМЫЕ СВЕЖИЕ настройки (например, только что
-// изменённый множитель канала), а не что-то закэшированное при старте
+// изменённый множитель точки), а не что-то закэшированное при старте
 // процесса — поэтому читает из БД заново при каждом вызове, точно так
 // же, как это делает startESyncForDevice при регистрации прибора.
 //
+// ИЗМЕНЕНО (2026-08-31, прямой запрос оператора: "переделать опрос
+// акрона... сделать также как вкм"): теперь работает ОДИНАКОВО для
+// обоих типов приборов — принимает kind явным параметром (кладётся в
+// cfg.Kind, дальше используется в internal/integration для выбора
+// источника исходных данных). Таблица es_vkm_channels в SQLite физически
+// НЕ ограничена типом прибора (просто device_id/tag/es_channel_id/
+// factor, без привязки к kind — проверено в самой схеме, 2026-08-31),
+// так что GetVKMChannels можно смело переиспользовать и для Akron,
+// несмотря на «VKM» в названии — переименовывать сам метод/таблицу не
+// стали, это внутренняя деталь реализации, не видимая оператору.
+//
 // found=false означает, что для этого прибора нет ни подключения к ЭС,
-// ни настроенных каналов — не ошибка, просто «для этого прибора
+// ни настроенных точек — не ошибка, просто «для этого прибора
 // интеграция с ЭС не настроена».
-func buildIntegrationConfig(ctx context.Context, repo *sqliterepo.Repo, deviceID string) (cfg integration.Config, found bool, err error) {
+func buildIntegrationConfig(ctx context.Context, repo *sqliterepo.Repo, deviceID, kind string) (cfg integration.Config, found bool, err error) {
 	conn, connFound, err := repo.GetESConnection(ctx)
 	if err != nil {
 		return integration.Config{}, false, fmt.Errorf("чтение параметров подключения к БД ЭС: %w", err)
@@ -879,7 +950,7 @@ func buildIntegrationConfig(ctx context.Context, repo *sqliterepo.Repo, deviceID
 
 	channels, err := repo.GetVKMChannels(ctx, deviceID)
 	if err != nil {
-		return integration.Config{}, false, fmt.Errorf("чтение каналов ЭС: %w", err)
+		return integration.Config{}, false, fmt.Errorf("чтение точек ЭС: %w", err)
 	}
 	if len(channels) == 0 {
 		return integration.Config{}, false, nil
@@ -893,26 +964,29 @@ func buildIntegrationConfig(ctx context.Context, repo *sqliterepo.Repo, deviceID
 		SQLPort:     conn.SQLPort,
 		DeviceID:    deviceID,
 		Pipe:        1,
-		// Сдвиг метки времени при записи в Mains — берётся из настроек
-		// подключения к ЭС (вкладка «Подключение к ЭС» в /admin), см.
-		// ESConnection.TimeShiftMinutes.
+		Kind:        kind,
+		// Сдвиг метки времени при записи в PointMains — берётся из
+		// настроек подключения к ЭС (вкладка «Подключение к ЭС» в
+		// /admin), см. ESConnection.TimeShiftMinutes.
 		TimeShiftMinutes: conn.TimeShiftMinutes,
+	}
+
+	humanLabels := map[string]string{
+		"ST": "тепло", "S": "масса", "T": "температура", "Pi": "давление",
+		"V": "объём",
 	}
 	for _, ch := range channels {
 		factor := ch.Factor
 		if factor == 0 {
 			factor = 1.0
 		}
-		switch ch.Tag {
-		case "ST":
-			cfg.ChanHeat, cfg.FactorHeat = ch.ESChannelID, factor
-		case "S":
-			cfg.ChanMass, cfg.FactorMass = ch.ESChannelID, factor
-		case "T":
-			cfg.ChanTemp, cfg.FactorTemp = ch.ESChannelID, factor
-		case "Pi":
-			cfg.ChanPressure, cfg.FactorPressure = ch.ESChannelID, factor
+		label := humanLabels[ch.Tag]
+		if label == "" {
+			label = ch.Tag
 		}
+		cfg.Points = append(cfg.Points, integration.PointMapping{
+			Tag: ch.Tag, PointID: ch.ESChannelID, Factor: factor, Label: label,
+		})
 	}
 	cfg.IntervalSec = 60
 	// 90 суток (2160 часов), не 168 (7 суток) — с 7 сутками es-sync
@@ -929,20 +1003,20 @@ func buildIntegrationConfig(ctx context.Context, repo *sqliterepo.Repo, deviceID
 	return cfg, true, nil
 }
 
-func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, dbPath string) chan struct{} {
-	cfg, found, err := buildIntegrationConfig(ctx, repo, deviceID)
+func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, kind, dbPath string) chan struct{} {
+	cfg, found, err := buildIntegrationConfig(ctx, repo, deviceID, kind)
 	if err != nil {
 		log.Printf("[ERROR] прибор %s: %v — es-sync не запущен\n", deviceID, err)
 		return nil
 	}
 	if !found {
-		log.Printf("[INFO] прибор %s: подключение к БД ЭС или каналы не настроены — es-sync не запущен\n", deviceID)
+		log.Printf("[INFO] прибор %s: подключение к БД ЭС или точки не настроены — es-sync не запущен\n", deviceID)
 		return nil
 	}
 
 	trigger := make(chan struct{}, 1)
 	go func() {
-		log.Printf("[OK] es-sync для %s: старт (сервер БД ЭС=%s, база=%s)\n", deviceID, cfg.SQLServer, cfg.SQLDatabase)
+		log.Printf("[OK] es-sync для %s (%s): старт (сервер БД ЭС=%s, база=%s)\n", deviceID, kind, cfg.SQLServer, cfg.SQLDatabase)
 		if err := integration.RunEnergosphereSync(ctx, dbPath, cfg, trigger); err != nil {
 			log.Printf("[ERROR] es-sync %s: %v\n", deviceID, err)
 		}

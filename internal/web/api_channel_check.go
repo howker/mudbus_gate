@@ -47,7 +47,7 @@ func (s *Server) handleCheckChannelHistory(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	writer, err := integration.OpenMainsWriter(integration.SQLServerConfig{
+	writer, err := integration.OpenPointMainsWriter(integration.SQLServerConfig{
 		Server: conn.SQLServer, Database: conn.SQLDatabase,
 		User: conn.SQLUser, Password: conn.SQLPassword, Port: conn.SQLPort,
 	})
@@ -71,7 +71,7 @@ func (s *Server) handleCheckChannelHistory(w http.ResponseWriter, r *http.Reques
 		if ch == 0 {
 			continue
 		}
-		rowCount, oldest, newest, has, err := writer.CheckChannelHistory(ctx, ch)
+		rowCount, oldest, newest, has, err := writer.CheckPointHistory(ctx, ch)
 		if err != nil {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"checked": false,

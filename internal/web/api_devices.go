@@ -423,7 +423,7 @@ func (s *Server) handleESConnectionTest(w http.ResponseWriter, r *http.Request) 
 		port = 1433
 	}
 
-	writer, err := integration.OpenMainsWriter(integration.SQLServerConfig{
+	writer, err := integration.OpenPointMainsWriter(integration.SQLServerConfig{
 		Server: body.SQLServer, Database: body.SQLDatabase,
 		User: body.SQLUser, Password: body.SQLPassword, Port: port,
 	})
