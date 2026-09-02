@@ -19,8 +19,10 @@ import "net/http"
 // блоков (без отдельного роутера, без перезагрузки страницы):
 //  0. Главная — сводная таблица статуса всех приборов (отставание
 //     архива, расхождение времени прибора), с сортировкой по клику на
-//     заголовок столбца; кнопка «Синхронизировать сейчас» для ВКМ прямо
-//     в строке прибора (добавлено 2026-08-29). Активна по умолчанию.
+//     заголовок столбца; кнопка «Принудительная пересинхронизация с ЭС»
+//     прямо в строке прибора (добавлено 2026-08-29, заменила собой
+//     «Синхронизировать сейчас» и перенесённый со вкладки «Подключение
+//     к ЭС» диапазон дат — 2026-09-02). Активна по умолчанию.
 //  1. Приборы — список + форма добавления/редактирования (включая
 //     «Проверить прибор» -> POST /api/devices/probe) + удаление.
 //  2. Точки ЭС — таблица тег->точка(ID_PP)+множитель для одного прибора;
@@ -129,7 +131,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <h3>Статус приборов</h3>
       <p class="small-note">Отставание архива — сколько последних периодов ещё не собрано, в часах (получасовки ВКМ и часовки Акрона — на одной шкале). 0 = данные свежие. Проверка учитывает плановую задержку опроса (обычно 5 минут после границы периода + небольшой запас), чтобы не показывать ложное отставание сразу после границы часа/получаса.</p>
       <p class="small-note">Расхождение времени — на сколько часы ПРИБОРА (не сервера) отличаются от ожидаемого, по данным последнего собранного архива ВКМ. Положительное = часы прибора спешат, отрицательное = отстают. Коррекция времени прибора через mbgw не реализована — это только наблюдение.</p>
-      <p class="small-note">«Синхронизировать сейчас» — просит уже работающий цикл отправки в ЭС сделать внеплановый проход немедленно, не дожидаясь обычного часового цикла. Полезно, если вы только что запустили принудительный переопрос или вручную дозагрузили данные и хотите увидеть их в ЭС сразу, не ожидая часа. Саму архивную запись у прибора эта кнопка НЕ переопрашивает — она лишь отправляет то, что уже собрано в нашей базе. <b>Важно:</b> эта кнопка добавляет только НОВЫЕ точки — если за какой-то момент времени в ЭС уже что-то есть (пусть даже неверное), она это не тронет. Если нужно ИСПРАВИТЬ уже отправленные в ЭС данные (например, поменяли множитель точки, или в ЭС успели уйти искажённые значения, которые вы потом переопросили) — используйте «Принудительную пересинхронизацию с ЭС» на вкладке «Подключение к ЭС»: та явно перезаписывает уже существующие точки за выбранный период.</p>
+      <p class="small-note">В фоне постоянно работает автоматическая синхронизация с ЭС — раз в минуту добавляет то, что успело собраться локально и ещё не отправлено; трогать её вручную не нужно, она просто работает всегда. Кнопка «Принудительная пересинхронизация с ЭС» — для другого, редкого случая: когда нужно ИСПРАВИТЬ уже отправленные данные (например, с прибора один раз пришли искажённые значения, вы их переопросили и получили верные — но в ЭС уже успело уйти старое; либо поменяли множитель точки на вкладке «Точки ЭС» — новые точки и так пойдут в правильных единицах, а вот уже отправленная история сама не пересчитается). В отличие от фоновой синхронизации, которая только ДОБАВЛЯЕТ новое и никогда не трогает уже существующее в ЭС, эта кнопка ЯВНО перезаписывает уже отправленные точки за указанный вами период — потому и требует диапазон дат и подтверждения.</p>
       <table>
         <thead><tr>
           <th style="cursor:pointer;" onclick="sortDashboard('name')">Прибор ⇅</th>
@@ -143,7 +145,32 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         </tr></thead>
         <tbody id="dashboardTable"><tr><td colspan="8">Загрузка...</td></tr></tbody>
       </table>
-      <div id="dashboardSyncMsg" class="msg"></div>
+
+      <!-- Всплывающий блок «Принудительная пересинхронизация с ЭС» —
+           переехал сюда с вкладки «Подключение к ЭС» (2026-09-02,
+           прямой запрос оператора) вместе с кнопкой «Синхронизировать
+           сейчас», которую заменил в таблице выше: раз есть более
+           мощный механизм (явно перезаписывает уже отправленное), не
+           нужно два разных действия рядом — один явный путь понятнее.
+           Скрыт по умолчанию, появляется при нажатии кнопки в строке
+           конкретного прибора (см. openDashboardResyncBox). -->
+      <div id="dashboardResyncBox" style="display:none;margin-top:20px;padding:15px;border:1px solid #3e3e42;border-radius:4px;background:#252526;">
+        <h3 style="margin-top:0;">Принудительная пересинхронизация с ЭС — <span id="dashboardResyncDeviceName"></span></h3>
+        <p class="small-note">Перезаписывает уже отправленные в ЭС точки за указанный период свежими значениями (по ТЕКУЩИМ настройкам множителя точки) — обычная фоновая синхронизация только добавляет новое и никогда не трогает то, что уже есть в ЭС. Нужно, например: с прибора один раз пришли искажённые данные, вы их переопросили и получили верные — но в ЭС уже успело уйти старое; либо поменяли множитель точки (вкладка «Точки ЭС») — новые точки и так пойдут в правильных единицах, а вот уже отправленная история сама не пересчитается, пока её явно не переписать.</p>
+        <div class="form-row"><label>С какой даты</label>
+          <input id="dr_from" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
+          <select id="dr_from_h" style="width:55px;"></select>:<select id="dr_from_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
+        </div>
+        <div class="form-row"><label>По какую дату</label>
+          <input id="dr_to" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД (пусто = сейчас)">
+          <select id="dr_to_h" style="width:55px;"></select>:<select id="dr_to_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
+        </div>
+        <p>
+          <button class="btn secondary" onclick="doDashboardResync()">Пересчитать и переписать в ЭС</button>
+          <button class="btn secondary" onclick="closeDashboardResyncBox()">Отмена</button>
+        </p>
+        <div id="dashboardResyncMsg" class="msg"></div>
+      </div>
     </div>
   </div>
 
@@ -255,8 +282,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <div class="form-row"><label>Логин</label><input id="es_user" type="text"></div>
       <div class="form-row"><label>Пароль</label><input id="es_password" type="password"></div>
       <div class="form-row"><label>Порт</label><input id="es_port" type="text" value="1433"></div>
-      <div class="form-row"><label>Сдвиг времени (минут)</label><input id="es_time_shift" type="text" value="0"></div>
-      <p class="small-note" style="margin-left:220px;margin-top:-8px;color:#ffd479;">Применяется ко всем приборам с прямой записью в эту базу (сейчас — оба типа, ВКМ и Akron, см. вкладку «Точки ЭС»).</p>
+      <div class="form-row"><label>Сдвиг времени для ВКМ (минут)</label><input id="es_time_shift" type="text" value="0"></div>
+      <p class="small-note" style="margin-left:220px;margin-top:-8px;color:#ffd479;">⚠ Применяется ТОЛЬКО к приборам ВКМ — значение подобрано эмпирически именно для них (сравнением часа в ЭС с часом в родной программе прибора). Для Akron сдвиг НЕ применяется — нет оснований считать то же самое значение верным для него, у него совсем другой источник данных (уже посчитанный архив, а не сырая строка прибора). Если для Akron когда-нибудь тоже понадобится сдвиг — потребуется отдельно подобрать и проверить значение тем же способом, не переиспользовать это.</p>
       <p class="small-note" style="margin-left:220px;margin-top:4px;">Сдвигает метку времени при записи данных ВКМ в базу ЭС. Нужен, потому что ЭС раскладывает такие прямые записи по своим строкам со смещением (наблюдалось смещение на 1,5 часа = -90). 0 — без сдвига. Подбирается опытным путём: сравните час в ЭС с часом в родной программе прибора.</p>
       <p class="small-note" id="es_password_note"></p>
       <p>
@@ -268,23 +295,13 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <!-- Кнопка «Синхронизировать сейчас» переехала на вкладку «Главная»
            (2026-08-29, прямой запрос оператора) — там она стоит рядом с
            каждым прибором в общей таблице статуса, а не отдельно здесь,
-           вдалеке от общего обзора приборов. -->
+           вдалеке от общего обзора приборов.
 
-      <h3 style="margin-top:30px;">Принудительная пересинхронизация с ЭС</h3>
-      <p class="small-note">Обычная синхронизация (в том числе кнопка «Синхронизировать сейчас» на «Главной») только ДОБАВЛЯЕТ новые точки — если точка за какой-то момент времени уже есть в базе ЭС, она НЕ трогается, даже если у нас данные с тех пор изменились. Это действие — наоборот: перезаписывает уже отправленные точки заново посчитанными значениями (по ТЕКУЩЕМУ множителю точки). Нужно, например: с прибора один раз пришли искажённые данные, вы их переопросили и получили верные — но в ЭС уже успело уйти старое; либо вы поменяли множитель точки (см. вкладку «Точки ЭС») — новые точки и так пойдут в правильных единицах, а вот уже отправленная история сама не пересчитается, пока её явно не переписать этой кнопкой.</p>
-      <div class="form-row"><label>Прибор</label>
-        <select id="rs_device"></select>
-      </div>
-      <div class="form-row"><label>С какой даты</label>
-        <input id="rs_from" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
-        <select id="rs_from_h" style="width:55px;"></select>:<select id="rs_from_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
-      </div>
-      <div class="form-row"><label>По какую дату</label>
-        <input id="rs_to" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД (пусто = сейчас)">
-        <select id="rs_to_h" style="width:55px;"></select>:<select id="rs_to_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
-      </div>
-      <p><button class="btn secondary" onclick="forceResyncES()">Пересчитать и переписать в ЭС</button></p>
-      <div id="resyncMsg" class="msg"></div>
+           «Принудительная пересинхронизация с ЭС» тоже переехала на
+           «Главную» (2026-09-02, прямой запрос оператора) — тем более
+           логично, что и «Синхронизировать сейчас» уехала туда же раньше:
+           оба действия относятся к конкретному прибору из общей таблицы
+           статуса, здесь им было не место. -->
     </div>
   </div>
 
@@ -309,7 +326,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <div id="panel-log" class="panel">
     <div class="section">
       <h3>Лог сервера</h3>
-      <p class="small-note">Обновляется автоматически каждые 2 секунды. Новые записи появляются СВЕРХУ (самая свежая — первой строкой), чтобы не приходилось прокручивать полосой вниз каждый раз. «Пауза» останавливает подгрузку новых строк на экране (уже показанное остаётся на месте, удобно спокойно прочитать/скопировать) — на сервере запись в лог при этом не останавливается, пропущенное просто появится всё сразу сверху при нажатии «Продолжить». Цвет: зелёный — успешные операции ([OK]), красный — ошибки ([ERROR]/[FATAL]), жёлтый — предупреждения ([WARN]). Жирным — метки прибора и периода архива, для быстрого поиска глазами. Некоторые технические формулировки на этом экране переведены на понятный язык (например, «часовой архив» вместо «архив hourly») — файл mbgw_server.log на диске при этом остаётся техническим, как есть, для более глубокой диагностики.</p>
+      <p class="small-note">Обновляется автоматически каждые 2 секунды. Новые записи появляются СВЕРХУ (самая свежая — первой строкой), чтобы не приходилось прокручивать полосой вниз каждый раз. «Пауза» останавливает подгрузку новых строк на экране (уже показанное остаётся на месте, удобно спокойно прочитать/скопировать) — на сервере запись в лог при этом не останавливается, пропущенное просто появится всё сразу сверху при нажатии «Продолжить». Цвет: зелёный — успешные операции ([OK]), красный — ошибки ([ERROR]/[FATAL]), жёлтый — предупреждения ([WARN]). Жирным — метки прибора и периода архива, для быстрого поиска глазами. Некоторые технические формулировки на этом экране переведены на понятный язык (например, «часовой архив» вместо «архив hourly») — файл mbgw_server.log на диске при этом остаётся техническим, как есть, для более глубокой диагностики. Каждому прибору — свой устойчивый цвет (одинаковый и в полоске активности ниже, и в самих строках лога) — полоска вспыхивает при каждой новой строке лога об этом приборе, погасает плавно: несколько одновременных вспышек наглядно показывают, что приборы опрашиваются параллельно, а не по очереди.</p>
+      <div id="deviceActivityStrip" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;"></div>
       <p>
         <button class="btn secondary" id="logPauseBtn" onclick="toggleLogPause()">Пауза</button>
         <button class="btn secondary" onclick="copyLog()">Скопировать всё</button>
@@ -452,11 +470,12 @@ function showTab(name) {
 
   if (name === 'current') { populateDeviceSelect('cur_device', null); loadCurrentData(); }
   if (name === 'channels') { populateDeviceSelect('ch_device', null); }
-  if (name === 'esconn') { loadESConnection(); populateDeviceSelect('rs_device', 'vkm360'); }
+  if (name === 'esconn') { loadESConnection(); }
   if (name === 'settings') { loadSettings(); }
   if (name === 'archive') { populateDeviceSelect('ar_device', null); setArchivePreset('week'); }
   if (name === 'dashboard') { loadDashboard(); }
   if (name === 'service') { loadServiceStatus(); }
+  if (name === 'log') { renderDeviceActivityStrip(); }
 }
 
 function showMsg(elId, ok, text) {
@@ -728,74 +747,74 @@ function cancelReload() {
 // (обработано X из Y периодов) вместо полной тишины на много минут
 // (добавлено 2026-08-27 по прямому запросу — раньше было непонятно,
 // работает ли вообще что-то, или процесс завис).
-// syncNow — кнопка «Синхронизировать сейчас» напротив прибора на вкладке
-// «Главная» (переехала сюда со вкладки «Подключение к ЭС», 2026-08-29 по
-// прямому запросу оператора — раньше стояла отдельно от общего обзора
-// приборов, с собственным выпадающим списком; теперь просто передаётся
-// id конкретной строки таблицы) — просит уже работающий цикл es-sync
-// конкретного прибора сделать внеплановый проход немедленно (сама
-// логика на сервере не менялась, добавлена 2026-08-27).
-function syncNow(deviceId) {
-  document.getElementById('dashboardSyncMsg').className = 'msg';
-  var xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/es-sync/trigger', true);
-  xhr.setRequestHeader('Content-Type', 'application/json');
-  xhr.onreadystatechange = function() {
-    if (xhr.readyState !== 4) { return; }
-    var data;
-    try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('dashboardSyncMsg', false, 'Ошибка ответа сервера'); return; }
-    if (data.ok) {
-      showMsg('dashboardSyncMsg', true, deviceId + ': синхронизация запрошена — проверьте ЭС через несколько секунд.');
-    } else {
-      showMsg('dashboardSyncMsg', false, deviceId + ': ошибка — ' + (data.error || 'неизвестная'));
-    }
-  };
-  xhr.send(JSON.stringify({ device_id: deviceId }));
+// openDashboardResyncBox/closeDashboardResyncBox/doDashboardResync —
+// «Принудительная пересинхронизация с ЭС», кнопка напротив прибора на
+// вкладке «Главная» (2026-09-02, прямой запрос оператора: заменила
+// собой прежнюю кнопку «Синхронизировать сейчас» и перенесённый сюда же
+// со вкладки «Подключение к ЭС» механизм с диапазоном дат — раз есть
+// более мощное действие (явно перезаписывает уже отправленное), два
+// разных рядом только путали).
+//
+// Всплывающий блок #dashboardResyncBox скрыт по умолчанию — появляется
+// при нажатии кнопки конкретного прибора и заполняется его именем;
+// один общий блок на всю страницу, а не по одному на строку таблицы,
+// проще и не раздувает разметку.
+function openDashboardResyncBox(deviceId) {
+  var deviceName = deviceId;
+  for (var i = 0; i < allDevices.length; i++) {
+    if (allDevices[i].id === deviceId) { deviceName = allDevices[i].name || deviceId; break; }
+  }
+  dashboardResyncDeviceId = deviceId;
+  document.getElementById('dashboardResyncDeviceName').innerText = deviceName + ' (' + deviceId + ')';
+  document.getElementById('dashboardResyncBox').style.display = 'block';
+  document.getElementById('dashboardResyncMsg').className = 'msg';
+  document.getElementById('dashboardResyncBox').scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
-// forceResyncES — «Принудительная пересинхронизация с ЭС» на вкладке
-// «Подключение к ЭС» (добавлено 2026-08-30, прямой запрос оператора:
-// "бывает что с прибора попали искажённые данные и нужно переопросить
-// прибор и чтобы новые данные попали в эс"). В отличие от syncNow
-// выше (просит обычный цикл сделать внеплановый проход «только новое»
-// пораньше), это ЯВНО перезаписывает уже отправленные в ЭС точки за
-// указанный диапазон свежепосчитанными значениями — редкое,
-// осознанное действие, поэтому подтверждение обязательно.
-function forceResyncES() {
-  var deviceId = document.getElementById('rs_device').value;
-  var fromDate = document.getElementById('rs_from').value;
-  var toDate = document.getElementById('rs_to').value;
-  if (!deviceId) { showMsg('resyncMsg', false, 'Выберите прибор'); return; }
-  if (!fromDate) { showMsg('resyncMsg', false, 'Выберите дату начала в календаре'); return; }
+function closeDashboardResyncBox() {
+  document.getElementById('dashboardResyncBox').style.display = 'none';
+  dashboardResyncDeviceId = null;
+}
+
+// dashboardResyncDeviceId — какой прибор сейчас открыт во всплывающем
+// блоке; общая переменная модуля, а не аргумент doDashboardResync,
+// потому что блок один на страницу и заполняется при открытии.
+var dashboardResyncDeviceId = null;
+
+function doDashboardResync() {
+  if (!dashboardResyncDeviceId) { return; }
+  var fromDate = document.getElementById('dr_from').value;
+  var toDate = document.getElementById('dr_to').value;
+  if (!fromDate) { showMsg('dashboardResyncMsg', false, 'Выберите дату начала в календаре'); return; }
   if (!confirm('Это ПЕРЕЗАПИШЕТ уже отправленные в ЭС точки за указанный период свежими значениями. Продолжить?')) { return; }
 
-  var fromH = document.getElementById('rs_from_h').value;
-  var fromM = document.getElementById('rs_from_m').value;
+  var fromH = document.getElementById('dr_from_h').value;
+  var fromM = document.getElementById('dr_from_m').value;
   var fromVal = fromDate + 'T' + fromH + ':' + fromM;
 
   var toVal = '';
   if (toDate) {
-    var toH = document.getElementById('rs_to_h').value;
-    var toM = document.getElementById('rs_to_m').value;
+    var toH = document.getElementById('dr_to_h').value;
+    var toM = document.getElementById('dr_to_m').value;
     toVal = toDate + 'T' + toH + ':' + toM;
   }
 
-  document.getElementById('resyncMsg').className = 'msg';
-  showMsg('resyncMsg', true, 'Идёт пересинхронизация, подождите...');
+  document.getElementById('dashboardResyncMsg').className = 'msg';
+  showMsg('dashboardResyncMsg', true, 'Идёт пересинхронизация, подождите...');
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/es-sync/force-resync', true);
   xhr.setRequestHeader('Content-Type', 'application/json');
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
     var data;
-    try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('resyncMsg', false, 'Ошибка ответа сервера'); return; }
+    try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('dashboardResyncMsg', false, 'Ошибка ответа сервера'); return; }
     if (data.ok) {
-      showMsg('resyncMsg', true, 'Готово: переписано ' + data.updated + ', вставлено новых ' + data.inserted + ', ошибок ' + data.failed + '.');
+      showMsg('dashboardResyncMsg', true, 'Готово: переписано ' + data.updated + ', вставлено новых ' + data.inserted + ', ошибок ' + data.failed + '.');
     } else {
-      showMsg('resyncMsg', false, 'Ошибка: ' + (data.error || 'неизвестная'));
+      showMsg('dashboardResyncMsg', false, 'Ошибка: ' + (data.error || 'неизвестная'));
     }
   };
-  xhr.send(JSON.stringify({ device_id: deviceId, from: fromVal, to: toVal }));
+  xhr.send(JSON.stringify({ device_id: dashboardResyncDeviceId, from: fromVal, to: toVal }));
 }
 
 // pollReloadProgress(deviceId, generation) — generation фиксируется
@@ -1007,6 +1026,57 @@ function humanizeLogLine(html) {
   return s;
 }
 
+// ===================== ПОЛОСКА ЖИВОЙ АКТИВНОСТИ ПРИБОРОВ =====================
+// Добавлено 2026-09-02 по прямому запросу оператора: "нужно чтобы было
+// понятно что опрос идёт в несколько потоков" (после того как поллер
+// стал параллельным, см. internal/poller/poller.go). Явного процента
+// прогресса на отдельный опрос у нас нет и не будет (опрос — это одно
+// быстрое чтение, не скачивание файла), поэтому вместо шкал прогресса —
+// вспышка активности: индикатор прибора ярко загорается при каждой
+// новой строке лога об этом приборе и плавно гаснет. Несколько
+// индикаторов, вспыхивающих почти одновременно, наглядно показывают
+// параллельную работу — тот же дух, что и цветные полосы в консольных
+// менеджерах пакетов, просто по событиям лога, а не по байтам.
+
+// colorForDevice — детерминированный цвет по ID прибора (простой хеш
+// строки в оттенок HSL) — один и тот же прибор ВСЕГДА получает один и
+// тот же цвет и в полоске активности, и в самих строках лога, так что
+// визуальный язык между ними общий.
+function colorForDevice(id) {
+  var hash = 0;
+  for (var i = 0; i < id.length; i++) { hash = (hash * 31 + id.charCodeAt(i)) >>> 0; }
+  var hue = hash % 360;
+  return 'hsl(' + hue + ', 65%, 55%)';
+}
+
+// renderDeviceActivityStrip перестраивает полоску — вызывается при
+// открытии вкладки «Лог» и после каждой загрузки списка приборов
+// (loadDevices), чтобы новые/удалённые приборы сразу отражались.
+function renderDeviceActivityStrip() {
+  var strip = document.getElementById('deviceActivityStrip');
+  if (!strip) { return; }
+  var html = '';
+  for (var i = 0; i < allDevices.length; i++) {
+    var d = allDevices[i];
+    var color = colorForDevice(d.id);
+    html += '<span id="activity_' + d.id + '" style="display:inline-block;padding:4px 10px;border-radius:12px;background:' + color +
+      ';opacity:0.3;transition:opacity 0.2s ease-out;font-size:12px;color:#111;font-weight:bold;white-space:nowrap;">' +
+      (d.name || d.id) + '</span>';
+  }
+  strip.innerHTML = html;
+}
+
+// flashDeviceActivity — вызывается для каждой новой строки лога,
+// упомянувшей конкретный прибор: ярко "зажигает" его индикатор и через
+// секунду плавно гасит обратно.
+function flashDeviceActivity(deviceId) {
+  var el = document.getElementById('activity_' + deviceId);
+  if (!el) { return; }
+  el.style.opacity = '1';
+  clearTimeout(el._flashTimer);
+  el._flashTimer = setTimeout(function () { el.style.opacity = '0.3'; }, 900);
+}
+
 function formatLogLine(line) {
   var html = escapeHtmlForLog(line);
   var cls = '';
@@ -1017,8 +1087,15 @@ function formatLogLine(line) {
   // Метка периода архива ("период 29.08.2026 22:30") — жирным, чтобы
   // легко находить глазами момент, о котором идёт речь в строке.
   html = html.replace(/(период \d{2}\.\d{2}\.\d{4} \d{2}:\d{2})/g, '<b>$1</b>');
-  // Префикс прибора в квадратных скобках в начале строки — тоже жирным.
-  html = html.replace(/^(\[[^\]]+\])/, '<b>$1</b>');
+  // Префикс прибора в квадратных скобках в начале строки — жирным и
+  // ЦВЕТОМ ЭТОГО ПРИБОРА (см. colorForDevice выше, добавлено
+  // 2026-09-02) — тот же цвет, что и в полоске активности, чтобы
+  // визуально сразу было видно, какая строка от какого прибора, даже
+  // когда строки от разных приборов идут вперемешку (параллельный опрос).
+  html = html.replace(/^(\[[^\]]+\])/, function (match, bracketed) {
+    var devId = bracketed.slice(1, -1);
+    return '<b style="color:' + colorForDevice(devId) + '">' + bracketed + '</b>';
+  });
   if (cls) { return '<span class="' + cls + '">' + html + '</span>'; }
   return html;
 }
@@ -1049,6 +1126,11 @@ function loadLog() {
     // ЭКРАНЕ и порядок в СОХРАНЁННОМ файле — разные, независимые вещи.
     for (var i = 0; i < data.entries.length; i++) {
       logRawLines.push(data.entries[i].text);
+      // Вспышка индикатора прибора, упомянутого в строке (см.
+      // flashDeviceActivity выше) — не влияет на сам текст лога,
+      // только на полоску активности над ним.
+      var m = /^\[([^\]]+)\]/.exec(data.entries[i].text);
+      if (m) { flashDeviceActivity(m[1]); }
     }
     var html = '';
     for (var j = data.entries.length - 1; j >= 0; j--) {
@@ -1267,7 +1349,7 @@ function renderDashboardTable() {
 
     var actionCell = '';
     if (d.sync_supported) {
-      actionCell = '<button class="btn secondary" onclick="syncNow(\'' + d.id + '\')">Синхронизировать сейчас</button>';
+      actionCell = '<button class="btn secondary" onclick="openDashboardResyncBox(\'' + d.id + '\')">Принудительная пересинхронизация с ЭС</button>';
     }
 
     html += '<tr><td>' + (d.name || d.id) + ' (' + d.id + ')</td><td>' + d.kind + '</td><td>' +
@@ -1287,6 +1369,7 @@ function loadDevices() {
     if (xhr.status !== 200) { return; }
     allDevices = JSON.parse(xhr.responseText) || [];
     renderDevicesTable();
+    renderDeviceActivityStrip();
   };
   xhr.send();
 }
@@ -2048,10 +2131,10 @@ populateHourSelect('rl_to_h');
 attachCalendar('rl_from');
 attachCalendar('rl_to');
 
-populateHourSelect('rs_from_h');
-populateHourSelect('rs_to_h');
-attachCalendar('rs_from');
-attachCalendar('rs_to');
+populateHourSelect('dr_from_h');
+populateHourSelect('dr_to_h');
+attachCalendar('dr_from');
+attachCalendar('dr_to');
 
 loadDevices();
 loadProfiles();
