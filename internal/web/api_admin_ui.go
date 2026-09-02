@@ -23,12 +23,15 @@ import "net/http"
 //     в строке прибора (добавлено 2026-08-29). Активна по умолчанию.
 //  1. Приборы — список + форма добавления/редактирования (включая
 //     «Проверить прибор» -> POST /api/devices/probe) + удаление.
-//  2. Каналы ЭС — таблица тег->канал+множитель для одного прибора,
-//     имеет смысл только для приборов типа vkm360.
+//  2. Точки ЭС — таблица тег->точка(ID_PP)+множитель для одного прибора;
+//     ОБЪЕДИНЕНО (2026-08-31): раньше было отдельно для ВКМ («Каналы ЭС»,
+//     4 тега) и отдельно для Akron (вкладка «Приём Акрона (ЭС)», просто
+//     адрес для эмуляции прибора, без сопоставления точек вообще) —
+//     теперь один общий механизм и одна вкладка для обоих типов
+//     приборов, различие только в числе строк таблицы (4 у ВКМ, 1 у
+//     Akron).
 //  3. Подключение к ЭС — форма подключения к SQL Server + «Проверить
 //     подключение» (POST /api/es-connection/test, ничего не сохраняет).
-//  4. Приём Акрона (ЭС) — адрес прослушивания для конкретного прибора,
-//     имеет смысл только для приборов типа akron.
 //  5. Последний опрос (раньше называлась «Текущие данные» — переименовано
 //     2026-08-29, оператор указал, что старое название вводило в
 //     заблуждение, будто это живой поток с прибора) — та же таблица
@@ -108,9 +111,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 <div class="tabs">
   <button class="tab-btn active" onclick="showTab('dashboard')">Главная</button>
   <button class="tab-btn" onclick="showTab('devices')">Приборы</button>
-  <button class="tab-btn" onclick="showTab('channels')">Каналы ЭС</button>
+  <button class="tab-btn" onclick="showTab('channels')">Точки ЭС</button>
   <button class="tab-btn" onclick="showTab('esconn')">Подключение к ЭС</button>
-  <button class="tab-btn" onclick="showTab('akron')">Приём Акрона (ЭС)</button>
   <button class="tab-btn" onclick="showTab('settings')">Настройки</button>
   <button class="tab-btn" onclick="showTab('archive')">Архив</button>
   <button class="tab-btn" onclick="showTab('current')">Последний опрос</button>
@@ -127,7 +129,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <h3>Статус приборов</h3>
       <p class="small-note">Отставание архива — сколько последних периодов ещё не собрано, в часах (получасовки ВКМ и часовки Акрона — на одной шкале). 0 = данные свежие. Проверка учитывает плановую задержку опроса (обычно 5 минут после границы периода + небольшой запас), чтобы не показывать ложное отставание сразу после границы часа/получаса.</p>
       <p class="small-note">Расхождение времени — на сколько часы ПРИБОРА (не сервера) отличаются от ожидаемого, по данным последнего собранного архива ВКМ. Положительное = часы прибора спешат, отрицательное = отстают. Коррекция времени прибора через mbgw не реализована — это только наблюдение.</p>
-      <p class="small-note">«Синхронизировать сейчас» (только для ВКМ) — просит уже работающий цикл отправки в ЭС сделать внеплановый проход немедленно, не дожидаясь обычного часового цикла. Полезно, если вы только что запустили принудительный переопрос или вручную дозагрузили данные и хотите увидеть их в ЭС сразу, не ожидая часа. Саму архивную запись у прибора эта кнопка НЕ переопрашивает — она лишь отправляет то, что уже собрано в нашей базе. <b>Важно:</b> эта кнопка добавляет только НОВЫЕ точки — если за какой-то момент времени в ЭС уже что-то есть (пусть даже неверное), она это не тронет. Если нужно ИСПРАВИТЬ уже отправленные в ЭС данные (например, поменяли множитель канала, или в ЭС успели уйти искажённые значения, которые вы потом переопросили) — используйте «Принудительную пересинхронизацию с ЭС» на вкладке «Подключение к ЭС»: та явно перезаписывает уже существующие точки за выбранный период.</p>
+      <p class="small-note">«Синхронизировать сейчас» — просит уже работающий цикл отправки в ЭС сделать внеплановый проход немедленно, не дожидаясь обычного часового цикла. Полезно, если вы только что запустили принудительный переопрос или вручную дозагрузили данные и хотите увидеть их в ЭС сразу, не ожидая часа. Саму архивную запись у прибора эта кнопка НЕ переопрашивает — она лишь отправляет то, что уже собрано в нашей базе. <b>Важно:</b> эта кнопка добавляет только НОВЫЕ точки — если за какой-то момент времени в ЭС уже что-то есть (пусть даже неверное), она это не тронет. Если нужно ИСПРАВИТЬ уже отправленные в ЭС данные (например, поменяли множитель точки, или в ЭС успели уйти искажённые значения, которые вы потом переопросили) — используйте «Принудительную пересинхронизацию с ЭС» на вкладке «Подключение к ЭС»: та явно перезаписывает уже существующие точки за выбранный период.</p>
       <table>
         <thead><tr>
           <th style="cursor:pointer;" onclick="sortDashboard('name')">Прибор ⇅</th>
@@ -217,23 +219,19 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
     </div>
   </div>
 
-  <!-- ===================== КАНАЛЫ ЭС ===================== -->
+  <!-- ===================== ТОЧКИ ЭС ===================== -->
   <div id="panel-channels" class="panel">
     <div class="section">
-      <h3>Каналы ЭС для ВКМ-прибора</h3>
+      <h3>Точки ЭС</h3>
+      <p class="small-note">Каждая величина прибора сопоставляется с конкретной точкой ЭС (полем ID_PP в таблице PointMains) — без этого сопоставления прибор не сможет отправлять данные в ЭС вообще. У приборов ВКМ таких величин четыре (масса, тепло, температура, давление), у Akron — одна (объём).</p>
       <div class="form-row"><label>Прибор</label>
         <select id="ch_device" onchange="loadChannels()"></select>
       </div>
       <table>
-        <thead><tr><th>Величина</th><th>Номер канала ЭС (ID_Channel)</th><th>Множитель</th></tr></thead>
-        <tbody>
-          <tr><td>Тепловая энергия (ST)</td><td><input id="ch_ST_id" type="text"></td><td><input id="ch_ST_factor" type="text" value="1"><div class="small-note">Сырое значение с прибора — Джоули. Множитель 1 = в ЭС уйдут джоули «как есть» (большие числа). Чтобы в ЭС сразу приходили готовые Гкал — поставьте <b>0.000000000238846</b> (это 1&nbsp;/&nbsp;4.1868e9 — точное определение Гкал в Дж).</div></td></tr>
-          <tr><td>Масса (S)</td><td><input id="ch_S_id" type="text"></td><td><input id="ch_S_factor" type="text" value="1"><div class="small-note">Сырое значение с прибора — килограммы. Множитель 1 = в ЭС уйдут кг. Чтобы в ЭС приходили тонны (как в архиве МШ и в родном ПО прибора) — поставьте <b>0.001</b>.</div></td></tr>
-          <tr><td>Температура (T)</td><td><input id="ch_T_id" type="text"></td><td><input id="ch_T_factor" type="text" value="1"><div class="small-note">Сырое значение уже в °C — множитель 1 (без пересчёта), как правило, верен, менять обычно не нужно.</div></td></tr>
-          <tr><td>Давление (Pi)</td><td><input id="ch_Pi_id" type="text"></td><td><input id="ch_Pi_factor" type="text" value="1"><div class="small-note">Сырое значение с прибора — Паскали (Па). Множитель 1 = в ЭС уйдут Па. Для МПа поставьте <b>0.000001</b>; для кгс/см² — <b>0.0000101972</b>.</div></td></tr>
-        </tbody>
+        <thead><tr><th>Величина</th><th>ID_PP</th><th>Множитель</th></tr></thead>
+        <tbody id="channelsTableBody"><tr><td colspan="3">Выберите прибор</td></tr></tbody>
       </table>
-      <p><button class="btn" onclick="saveChannels()">Сохранить каналы</button></p>
+      <p><button class="btn" onclick="saveChannels()">Сохранить точки</button></p>
       <div id="channelsMsg" class="msg"></div>
     </div>
   </div>
@@ -257,8 +255,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <div class="form-row"><label>Логин</label><input id="es_user" type="text"></div>
       <div class="form-row"><label>Пароль</label><input id="es_password" type="password"></div>
       <div class="form-row"><label>Порт</label><input id="es_port" type="text" value="1433"></div>
-      <div class="form-row"><label>Сдвиг времени для ВКМ (минут)</label><input id="es_time_shift" type="text" value="0"></div>
-      <p class="small-note" style="margin-left:220px;margin-top:-8px;color:#ffd479;">⚠ Касается ТОЛЬКО приборов, данные которых мы пишем НАПРЯМУЮ в эту базу (сейчас это ВКМ). Приборов, чьи данные ЭС забирает сама через эмуляцию (сейчас это Akron), это не касается вообще — у них нет нашей прямой записи, значит и сдвигать нечего. Если в будущем появится новый тип прибора — смотрите, каким способом он подключён: прямая запись в базу — сдвиг актуален; эмуляция прибора для ЭС — не актуален.</p>
+      <div class="form-row"><label>Сдвиг времени (минут)</label><input id="es_time_shift" type="text" value="0"></div>
+      <p class="small-note" style="margin-left:220px;margin-top:-8px;color:#ffd479;">Применяется ко всем приборам с прямой записью в эту базу (сейчас — оба типа, ВКМ и Akron, см. вкладку «Точки ЭС»).</p>
       <p class="small-note" style="margin-left:220px;margin-top:4px;">Сдвигает метку времени при записи данных ВКМ в базу ЭС. Нужен, потому что ЭС раскладывает такие прямые записи по своим строкам со смещением (наблюдалось смещение на 1,5 часа = -90). 0 — без сдвига. Подбирается опытным путём: сравните час в ЭС с часом в родной программе прибора.</p>
       <p class="small-note" id="es_password_note"></p>
       <p>
@@ -273,7 +271,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
            вдалеке от общего обзора приборов. -->
 
       <h3 style="margin-top:30px;">Принудительная пересинхронизация с ЭС</h3>
-      <p class="small-note">Обычная синхронизация (в том числе кнопка «Синхронизировать сейчас» на «Главной») только ДОБАВЛЯЕТ новые точки — если точка за какой-то момент времени уже есть в базе ЭС, она НЕ трогается, даже если у нас данные с тех пор изменились. Это действие — наоборот: перезаписывает уже отправленные точки заново посчитанными значениями (по ТЕКУЩЕМУ множителю канала). Нужно, например: с прибора один раз пришли искажённые данные, вы их переопросили и получили верные — но в ЭС уже успело уйти старое; либо вы поменяли множитель канала (см. вкладку «Каналы ЭС») — новые точки и так пойдут в правильных единицах, а вот уже отправленная история сама не пересчитается, пока её явно не переписать этой кнопкой. Работает только для приборов ВКМ (только у них есть прямая запись в базу ЭС).</p>
+      <p class="small-note">Обычная синхронизация (в том числе кнопка «Синхронизировать сейчас» на «Главной») только ДОБАВЛЯЕТ новые точки — если точка за какой-то момент времени уже есть в базе ЭС, она НЕ трогается, даже если у нас данные с тех пор изменились. Это действие — наоборот: перезаписывает уже отправленные точки заново посчитанными значениями (по ТЕКУЩЕМУ множителю точки). Нужно, например: с прибора один раз пришли искажённые данные, вы их переопросили и получили верные — но в ЭС уже успело уйти старое; либо вы поменяли множитель точки (см. вкладку «Точки ЭС») — новые точки и так пойдут в правильных единицах, а вот уже отправленная история сама не пересчитается, пока её явно не переписать этой кнопкой.</p>
       <div class="form-row"><label>Прибор</label>
         <select id="rs_device"></select>
       </div>
@@ -287,27 +285,6 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       </div>
       <p><button class="btn secondary" onclick="forceResyncES()">Пересчитать и переписать в ЭС</button></p>
       <div id="resyncMsg" class="msg"></div>
-    </div>
-  </div>
-
-  <!-- ===================== AKRON NORTHBOUND ===================== -->
-  <div id="panel-akron" class="panel">
-    <div class="section">
-      <h3>Адрес приёма данных Акрона для Энергосферы</h3>
-      <p class="small-note">ЭС сама подключается по этому адресу через свой драйвер АКРОН-01-1 (тип связи Raw TCP).</p>
-      <div class="form-row"><label>Прибор</label>
-        <select id="ak_device" onchange="loadAkronAddr()"></select>
-      </div>
-      <div id="ak_status_configured" style="display:none;background:#1e3d1e;border:1px solid #2d5a2d;color:#4caf50;padding:10px;border-radius:4px;margin-bottom:15px;">
-        Адрес настроен: <span id="ak_status_addr"></span>
-      </div>
-      <div id="ak_status_not_configured" style="display:none;background:#3d1e1e;border:1px solid #5a2d2d;color:#f44336;padding:10px;border-radius:4px;margin-bottom:15px;">
-        Адрес ещё НЕ настроен — заполните поле ниже и нажмите «Сохранить».
-      </div>
-      <div class="form-row"><label>Адрес (IP:порт)</label><input id="ak_addr" type="text"></div>
-      <p class="small-note" style="margin-left:220px;margin-top:-8px;">например: 127.0.0.1:15021</p>
-      <p><button class="btn" onclick="saveAkronAddr()">Сохранить</button></p>
-      <div id="akronMsg" class="msg"></div>
     </div>
   </div>
 
@@ -474,8 +451,7 @@ function showTab(name) {
   for (var m = 0; m < allMsgs.length; m++) { allMsgs[m].className = 'msg'; }
 
   if (name === 'current') { populateDeviceSelect('cur_device', null); loadCurrentData(); }
-  if (name === 'channels') { populateDeviceSelect('ch_device', 'vkm360'); }
-  if (name === 'akron') { populateDeviceSelect('ak_device', 'akron'); }
+  if (name === 'channels') { populateDeviceSelect('ch_device', null); }
   if (name === 'esconn') { loadESConnection(); populateDeviceSelect('rs_device', 'vkm360'); }
   if (name === 'settings') { loadSettings(); }
   if (name === 'archive') { populateDeviceSelect('ar_device', null); setArchivePreset('week'); }
@@ -1537,6 +1513,51 @@ function probeDevice() {
   xhr.send(JSON.stringify(body));
 }
 
+// POINT_TAG_DEFS — какие величины и с какими подсказками показывать на
+// вкладке «Точки ЭС», по типу прибора. ОБЪЕДИНЕНО (2026-08-31, прямой
+// запрос оператора: "переделать опрос акрона... сделать также как вкм"):
+// раньше у ВКМ и Akron были СОВСЕМ разные вкладки/механизмы доставки
+// данных в ЭС — теперь один и тот же механизм для обоих, различие
+// только в том, сколько у прибора величин и как они называются.
+var POINT_TAG_DEFS = {
+  vkm360: [
+    { tag: 'ST', label: 'Тепловая энергия (ST)', hint: 'Сырое значение с прибора — Джоули. Множитель 1 = в ЭС уйдут джоули «как есть» (большие числа). Чтобы в ЭС сразу приходили готовые Гкал — поставьте <b>0.000000000238846</b> (это 1&nbsp;/&nbsp;4.1868e9 — точное определение Гкал в Дж).' },
+    { tag: 'S', label: 'Масса (S)', hint: 'Сырое значение с прибора — килограммы. Множитель 1 = в ЭС уйдут кг. Чтобы в ЭС приходили тонны (как в архиве МШ и в родном ПО прибора) — поставьте <b>0.001</b>.' },
+    { tag: 'T', label: 'Температура (T)', hint: 'Сырое значение уже в °C — множитель 1 (без пересчёта), как правило, верен, менять обычно не нужно.' },
+    { tag: 'Pi', label: 'Давление (Pi)', hint: 'Сырое значение с прибора — Паскали (Па). Множитель 1 = в ЭС уйдут Па. Для МПа поставьте <b>0.000001</b>; для кгс/см² — <b>0.0000101972</b>.' }
+  ],
+  akron: [
+    { tag: 'V', label: 'Объём (V)', hint: 'Сырое значение с прибора — м³. Множитель 1 = в ЭС уйдут м³ «как есть».' }
+  ]
+};
+
+// currentChannelsKind находит тип выбранного на вкладке «Точки ЭС»
+// прибора — по нему решается, сколько строк и с какими подсказками
+// рисовать (см. POINT_TAG_DEFS).
+function currentChannelsKind() {
+  var deviceId = document.getElementById('ch_device').value;
+  for (var i = 0; i < allDevices.length; i++) {
+    if (allDevices[i].id === deviceId) { return allDevices[i].kind; }
+  }
+  return null;
+}
+
+// renderChannelsTable перестраивает строки таблицы под тип прибора —
+// у ВКМ четыре величины, у Akron одна. Вызывается ДО заполнения
+// значений (loadChannels), чтобы поля #ch_<тег>_id/#ch_<тег>_factor
+// уже существовали в DOM к моменту, когда придёт ответ сервера.
+function renderChannelsTable(kind) {
+  var defs = POINT_TAG_DEFS[kind] || [];
+  var html = '';
+  for (var i = 0; i < defs.length; i++) {
+    var d = defs[i];
+    html += '<tr><td>' + d.label + '</td><td><input id="ch_' + d.tag + '_id" type="text"></td>' +
+      '<td><input id="ch_' + d.tag + '_factor" type="text" value="1"><div class="small-note">' + d.hint + '</div></td></tr>';
+  }
+  if (html === '') { html = '<tr><td colspan="3">Выберите прибор</td></tr>'; }
+  document.getElementById('channelsTableBody').innerHTML = html;
+}
+
 function populateDeviceSelect(selectId, kindFilter) {
   var sel = document.getElementById(selectId);
   var html = '';
@@ -1548,13 +1569,16 @@ function populateDeviceSelect(selectId, kindFilter) {
   if (html === '') { html = '<option value="">— нет подходящих приборов —</option>'; }
   sel.innerHTML = html;
   if (selectId === 'ch_device') { loadChannels(); }
-  if (selectId === 'ak_device') { loadAkronAddr(); }
   if (selectId === 'ar_device') { onArchiveDeviceChange(); }
 }
 
 function loadChannels() {
   var deviceId = document.getElementById('ch_device').value;
+  var kind = currentChannelsKind();
+  renderChannelsTable(kind);
   if (!deviceId) { return; }
+  var tags = (POINT_TAG_DEFS[kind] || []).map(function(d) { return d.tag; });
+
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/api/vkm-channels?device_id=' + encodeURIComponent(deviceId), true);
   xhr.onreadystatechange = function() {
@@ -1562,11 +1586,13 @@ function loadChannels() {
     var rows = JSON.parse(xhr.responseText) || [];
     var byTag = {};
     for (var i = 0; i < rows.length; i++) { byTag[rows[i].tag] = rows[i]; }
-    var tags = ['ST', 'S', 'T', 'Pi'];
     for (var j = 0; j < tags.length; j++) {
       var t = tags[j];
-      document.getElementById('ch_' + t + '_id').value = byTag[t] ? byTag[t].es_channel_id : '';
-      document.getElementById('ch_' + t + '_factor').value = byTag[t] ? byTag[t].factor : '1';
+      var idEl = document.getElementById('ch_' + t + '_id');
+      var factorEl = document.getElementById('ch_' + t + '_factor');
+      if (!idEl) { continue; }
+      idEl.value = byTag[t] ? byTag[t].es_channel_id : '';
+      factorEl.value = byTag[t] ? byTag[t].factor : '1';
     }
   };
   xhr.send();
@@ -1575,7 +1601,7 @@ function loadChannels() {
 function saveChannels(force) {
   var deviceId = document.getElementById('ch_device').value;
   if (!deviceId) { showMsg('channelsMsg', false, 'Выберите прибор'); return; }
-  var tags = ['ST', 'S', 'T', 'Pi'];
+  var tags = (POINT_TAG_DEFS[currentChannelsKind()] || []).map(function(d) { return d.tag; });
   var channels = [];
   var channelIds = [];
   for (var i = 0; i < tags.length; i++) {
@@ -1594,7 +1620,7 @@ function saveChannels(force) {
     return;
   }
 
-  // Сначала спрашиваем САМУ ЭС, нет ли в этих каналах уже чужой истории
+  // Сначала спрашиваем САМУ ЭС, нет ли в этих точках уже чужой истории
   // (см. api_channel_check.go) — это ловит конфликт даже с точками,
   // которые вообще не настроены у нас самих, в отличие от проверки
   // внутри doSaveChannels (та знает только про наши собственные приборы).
@@ -1610,7 +1636,7 @@ function saveChannels(force) {
     if (checkXhr.status === 200 && data.checked === false) {
       // проверка не смогла выполниться (например, подключение к ЭС не
       // настроено) — не блокируем сохранение, просто предупреждаем
-      if (!confirm('Не удалось проверить каналы напрямую в ЭС (' + (data.reason || 'причина неизвестна') +
+      if (!confirm('Не удалось проверить точки напрямую в ЭС (' + (data.reason || 'причина неизвестна') +
         '). Продолжить сохранение без этой проверки?')) {
         showMsg('channelsMsg', false, 'Сохранение отменено.');
         return;
@@ -1620,14 +1646,14 @@ function saveChannels(force) {
     }
 
     if (checkXhr.status === 200 && data.occupied && data.occupied.length > 0) {
-      var msg = 'ВНИМАНИЕ: в ЭС уже есть данные в этих каналах — похоже, они заняты другим прибором:\n';
+      var msg = 'ВНИМАНИЕ: в ЭС уже есть данные в этих точках — похоже, они заняты другим прибором:\n';
       for (var j = 0; j < data.occupied.length; j++) {
         var o = data.occupied[j];
-        msg += '  канал ' + o.channel_id + ': ' + o.row_count + ' записей, с ' + o.oldest + ' по ' + o.newest + '\n';
+        msg += '  точка ' + o.channel_id + ': ' + o.row_count + ' записей, с ' + o.oldest + ' по ' + o.newest + '\n';
       }
       msg += '\nСохранить всё равно? Это может испортить данные другого прибора в ЭС!';
       if (!confirm(msg)) {
-        showMsg('channelsMsg', false, 'Сохранение отменено — номер канала совпадает с уже используемым в ЭС.');
+        showMsg('channelsMsg', false, 'Сохранение отменено — номер точки совпадает с уже используемым в ЭС.');
         return;
       }
     }
@@ -1644,17 +1670,17 @@ function doSaveChannels(deviceId, channels, force) {
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
     if (xhr.status === 200) {
-      showMsg('channelsMsg', true, 'Каналы сохранены.');
+      showMsg('channelsMsg', true, 'Точки сохранены.');
     } else if (xhr.status === 409) {
-      // конфликт номеров каналов с ДРУГИМ НАШИМ прибором — показываем
+      // конфликт номеров точек с ДРУГИМ НАШИМ прибором — показываем
       // предупреждение и даём явно подтвердить сохранение всё равно
       var data = {};
       try { data = JSON.parse(xhr.responseText); } catch (e) {}
-      var msg = (data.error || 'Обнаружен конфликт каналов.') + ' Сохранить всё равно?';
+      var msg = (data.error || 'Обнаружен конфликт точек.') + ' Сохранить всё равно?';
       if (confirm(msg)) {
         doSaveChannels(deviceId, channels, true);
       } else {
-        showMsg('channelsMsg', false, 'Сохранение отменено — исправьте номер канала.');
+        showMsg('channelsMsg', false, 'Сохранение отменено — исправьте номер точки.');
       }
     } else {
       showMsg('channelsMsg', false, 'Ошибка: HTTP ' + xhr.status);
@@ -1743,39 +1769,6 @@ function saveESConnection() {
     else { showMsg('esSaveMsg', false, 'Ошибка: HTTP ' + xhr.status); }
   };
   xhr.send(JSON.stringify(body));
-}
-
-function loadAkronAddr() {
-  var deviceId = document.getElementById('ak_device').value;
-  if (!deviceId) { return; }
-  var xhr = new XMLHttpRequest();
-  xhr.open('GET', '/api/akron-northbound?device_id=' + encodeURIComponent(deviceId), true);
-  xhr.onreadystatechange = function() {
-    if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
-    var data = JSON.parse(xhr.responseText);
-    var addr = data.listen_addr || '';
-    document.getElementById('ak_addr').value = addr;
-    var configured = !!addr;
-    document.getElementById('ak_status_configured').style.display = configured ? 'block' : 'none';
-    document.getElementById('ak_status_not_configured').style.display = configured ? 'none' : 'block';
-    if (configured) { document.getElementById('ak_status_addr').innerText = addr; }
-  };
-  xhr.send();
-}
-
-function saveAkronAddr() {
-  var deviceId = document.getElementById('ak_device').value;
-  var addr = document.getElementById('ak_addr').value;
-  if (!deviceId || !addr) { showMsg('akronMsg', false, 'Выберите прибор и укажите адрес'); return; }
-  var xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/akron-northbound', true);
-  xhr.setRequestHeader('Content-Type', 'application/json');
-  xhr.onreadystatechange = function() {
-    if (xhr.readyState !== 4) { return; }
-    if (xhr.status === 200) { showMsg('akronMsg', true, 'Сохранено.'); }
-    else { showMsg('akronMsg', false, 'Ошибка: HTTP ' + xhr.status); }
-  };
-  xhr.send(JSON.stringify({ device_id: deviceId, listen_addr: addr }));
 }
 
 var pointLabels = {

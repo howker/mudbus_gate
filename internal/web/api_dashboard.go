@@ -25,10 +25,12 @@ import (
 //     Akron источника пока нет — Akron архив (User-Defined команда 104,
 //     см. profiles/akron01.yaml) отдаёт только BCD, отдельного текстового
 //     диапазона времени с обеих границ периода, как у ВКМ, там нет).
-//  3. SyncSupported — только у ВКМ есть прямая запись в БД ЭС
-//     (internal/integration/energosphere_sync.go), соответственно только
-//     для него имеет смысл кнопка «Синхронизировать сейчас» (перенесена
-//     сюда со вкладки «Подключение к ЭС», 2026-08-29 — было неочевидно,
+//  3. SyncSupported — ОБНОВЛЕНО (2026-08-31): раньше только у ВКМ была
+//     прямая запись в БД ЭС, теперь у обоих типов приборов (Akron
+//     переведён на тот же механизм, см. package doc в
+//     internal/integration/energosphere_sync.go) — соответственно кнопка
+//     «Синхронизировать сейчас» (перенесена сюда со вкладки «Подключение
+//     к ЭС», 2026-08-29 — было неочевидно,
 //     что кнопка вообще есть, раз она физически далеко от общего
 //     обзора приборов).
 type dashboardDeviceStatus struct {
@@ -56,7 +58,7 @@ type dashboardDeviceStatus struct {
 	LastPeriod string `json:"last_period,omitempty"`
 	NextPollAt string `json:"next_poll_at,omitempty"`
 
-	TimeDriftSeconds   float64 `json:"time_drift_seconds,omitempty"`
+	TimeDriftSeconds   float64 `json:"time_drift_seconds"`
 	TimeDriftKnown     bool    `json:"time_drift_known"`
 	TimeDriftReliable  bool    `json:"time_drift_reliable"`
 	TimeDriftNote      string  `json:"time_drift_note,omitempty"`
@@ -86,7 +88,7 @@ func (s *Server) handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 			Name:          dev.Name,
 			Kind:          dev.Kind,
 			Enabled:       dev.Enabled,
-			SyncSupported: dev.Kind == "vkm360",
+			SyncSupported: dev.Kind == "vkm360" || dev.Kind == "akron",
 		}
 
 		period, param := archivePeriodAndParamForKind(dev.Kind)

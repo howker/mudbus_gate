@@ -239,7 +239,7 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 		}
 		rows, err := s.repo.GetVKMChannels(r.Context(), deviceID)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "не удалось прочитать каналы: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "не удалось прочитать точки: "+err.Error())
 			return
 		}
 		out := make([]vkmChannelJSON, 0, len(rows))
@@ -277,26 +277,26 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Защита от случайного ввода номера канала, который уже занят
-		// ДРУГИМ прибором — если оба прибора начнут писать в один канал
+		// Защита от случайного ввода номера точки, который уже занят
+		// ДРУГИМ прибором — если оба прибора начнут писать в одну точку
 		// ЭС, данные одного будут затирать данные другого, и заметить
 		// это по внешним признакам не всегда просто. Force=true
 		// позволяет явно подтвердить и сохранить всё равно (например,
-		// если оператор осознанно переносит канал с одного прибора на
+		// если оператор осознанно переносит точку с одного прибора на
 		// другой).
 		if !body.Force {
 			conflicts, err := s.repo.FindChannelConflicts(r.Context(), body.DeviceID, channelIDs)
 			if err != nil {
-				writeError(w, http.StatusInternalServerError, "не удалось проверить занятость каналов: "+err.Error())
+				writeError(w, http.StatusInternalServerError, "не удалось проверить занятость точек: "+err.Error())
 				return
 			}
 			if len(conflicts) > 0 {
 				parts := make([]string, 0, len(conflicts))
 				for ch, owner := range conflicts {
-					parts = append(parts, fmt.Sprintf("канал %d уже занят прибором %q", ch, owner))
+					parts = append(parts, fmt.Sprintf("точка %d уже занята прибором %q", ch, owner))
 				}
 				writeJSON(w, http.StatusConflict, map[string]any{
-					"error":     "Обнаружено совпадение номеров каналов с другим прибором: " + strings.Join(parts, "; "),
+					"error":     "Обнаружено совпадение номеров точек с другим прибором: " + strings.Join(parts, "; "),
 					"conflicts": conflicts,
 				})
 				return
@@ -304,7 +304,7 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err := s.repo.SetVKMChannels(r.Context(), body.DeviceID, rows); err != nil {
-			writeError(w, http.StatusInternalServerError, "не удалось сохранить каналы: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "не удалось сохранить точки: "+err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

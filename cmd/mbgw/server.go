@@ -544,7 +544,7 @@ func runServer() {
 		trigger, ok := esSyncTriggers[deviceID]
 		devicesMu.Unlock()
 		if !ok {
-			return fmt.Errorf("для прибора %s es-sync не запущен (проверьте подключение к ЭС и каналы, либо дождитесь окончания стартовой регистрации приборов)", deviceID)
+			return fmt.Errorf("для прибора %s es-sync не запущен (проверьте подключение к ЭС и точки, либо дождитесь окончания стартовой регистрации приборов)", deviceID)
 		}
 		select {
 		case trigger <- struct{}{}:
