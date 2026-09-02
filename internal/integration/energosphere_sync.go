@@ -400,35 +400,87 @@ func collectVKMReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, 
 	return out, nil
 }
 
-// collectAkronReadings читает диапазон УЖЕ ПОСЧИТАННЫХ часовок Akron
-// (archive_hourly, параметр "V" — расход, см. persistAkronHourly в
-// internal/device/backfill.go) — в отличие от ВКМ, здесь не нужно
-// заново разбирать сырую строку прибора: обычный опрос Akron уже кладёт
-// готовое число в archive_hourly, синхронизация с ЭС просто берёт его
-// оттуда. cfg.Points у Akron обычно содержит ровно одну запись (тег
-// "V"), но функция не завязана на это число жёстко — если в Points
-// окажется тег, отсутствующий у Akron, он просто не найдёт совпадения
-// ни разу и тихо ничего не даст, как и для ВКМ.
+// collectAkronReadings reads hourly Akron snapshots from archive_hourly.
+// For tag V, archive_hourly stores a cumulative totalizer value, not an
+// already calculated hourly volume. Energosphere therefore receives the
+// delta between two adjacent hourly snapshots:
 //
-// ВАЖНО: cfg.TimeShiftMinutes НЕ применяется здесь — найдено оператором
-// живьём (2026-09-02) при обобщении кода для Akron: смещение было
-// эмпирически подобрано ИСКЛЮЧИТЕЛЬНО для ВКМ (сравнением часа в ЭС с
-// часом в родной программе прибора, см. Config.TimeShiftMinutes) —
-// нет никаких оснований считать то же самое смещение верным и для
-// Akron, у которого совсем другой источник данных (уже посчитанный
-// archive_hourly, а не сырая строка прибора). Применять непроверенное
-// предположение к финансово значимым данным неправильно — пока это не
-// подтверждено отдельно тем же способом (сравнение с родным ПО
-// Akron), метки времени Akron пишутся БЕЗ сдвига.
+//	V(17:00) - V(16:00) = volume for the 16:00..17:00 interval.
+//
+// One hour before the requested range is loaded as the baseline needed to
+// calculate the first requested delta. If two snapshots are not exactly one
+// hour apart, or the cumulative counter decreases, that point is skipped.
+// This prevents assigning several hours of consumption to a single hour and
+// prevents sending a negative value.
+//
+// cfg.TimeShiftMinutes is intentionally NOT applied to Akron. That shift was
+// verified for VKM only and must not be transferred to Akron without a
+// separate verification.
 func collectAkronReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, from, now time.Time) ([]pointReading, error) {
 	var out []pointReading
 	for _, m := range cfg.Points {
-		rows, err := repo.GetHourlyArchiveRange(ctx, cfg.DeviceID, "", m.Tag, from, now)
+		queryFrom := from
+		if m.Tag == "V" {
+			queryFrom = from.Add(-time.Hour)
+		}
+
+		rows, err := repo.GetHourlyArchiveRange(ctx, cfg.DeviceID, "", m.Tag, queryFrom, now)
 		if err != nil {
 			return nil, err
 		}
+
+		if m.Tag != "V" {
+			// ащитная ветка на случай будущих некумулятивных параметров
+			// Akron: для них значение можно передавать напрямую.
+			for _, row := range rows {
+				if row.TsHour.Before(from) {
+					continue
+				}
+				out = append(out, pointReading{
+					mapping: m,
+					ts:      row.TsHour,
+					value:   row.Value * m.Factor,
+				})
+			}
+			continue
+		}
+
+		var prevValue float64
+		var prevTS time.Time
+		havePrev := false
+
 		for _, row := range rows {
-			out = append(out, pointReading{mapping: m, ts: row.TsHour, value: row.Value * m.Factor})
+			if havePrev && !row.TsHour.Before(from) {
+				if row.TsHour.Sub(prevTS) == time.Hour {
+					delta := row.Value - prevValue
+					if delta >= 0 {
+						out = append(out, pointReading{
+							mapping: m,
+							ts:      row.TsHour,
+							value:   delta * m.Factor,
+						})
+					} else {
+						log.Printf(
+							"[es-sync] Akron %s: пропуск %s — накопительный V уменьшился: %g -> %g\n",
+							cfg.DeviceID,
+							row.TsHour.Format("02.01.2006 15:04"),
+							prevValue,
+							row.Value,
+						)
+					}
+				} else {
+					log.Printf(
+						"[es-sync] Akron %s: пропуск %s — нет соседнего часового снимка перед ним (предыдущий %s)\n",
+						cfg.DeviceID,
+						row.TsHour.Format("02.01.2006 15:04"),
+						prevTS.Format("02.01.2006 15:04"),
+					)
+				}
+			}
+
+			prevValue = row.Value
+			prevTS = row.TsHour
+			havePrev = true
 		}
 	}
 	return out, nil
