@@ -175,7 +175,16 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/vkm-channels/check-history", s.handleCheckChannelHistory)
 	mux.HandleFunc("/api/es-connection", s.handleESConnection)
 	mux.HandleFunc("/api/es-connection/test", s.handleESConnectionTest)
-	mux.HandleFunc("/api/akron-northbound", s.handleAkronNorthbound)
+	// /api/akron-northbound — ОТКЛЮЧЕНО (2026-08-31): обслуживал вкладку
+	// «Приём Акрона (ЭС)», которая удалена (Akron переведён на прямую
+	// запись в PointMains, тем же путём, что и ВКМ — см. package doc в
+	// internal/integration/energosphere_sync.go). Маршрут закомментирован,
+	// а не удалён, заодно с самой Akron-northbound логикой (см.
+	// startAkronNorthboundForDevice в cmd/mbgw/server.go) — на случай,
+	// если понадобится вернуться к эмуляции прибора для драйвера ЭС.
+	// Сам обработчик handleAkronNorthbound в api_devices.go оставлен как
+	// есть (неиспользуемый метод — не ошибка компиляции в Go).
+	// mux.HandleFunc("/api/akron-northbound", s.handleAkronNorthbound)
 	mux.HandleFunc("/api/settings", s.handleSettings)
 	mux.HandleFunc("/api/profiles", s.handleProfiles)
 	mux.HandleFunc("/api/archive", s.handleArchive)
