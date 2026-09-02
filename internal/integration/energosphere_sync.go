@@ -114,6 +114,11 @@ type Config struct {
 	// ESConnection.TimeShiftMinutes в internal/storage/sqlite/
 	// repo_device_config.go. 0 = без сдвига (поведение по умолчанию, как
 	// было до появления этой настройки).
+	//
+	// ТОЛЬКО ДЛЯ ВКМ (найдено оператором живьём, 2026-09-02): применяется
+	// в collectVKMReadings, но НЕ в collectAkronReadings — значение
+	// подобрано эмпирически специально для ВКМ, нет оснований считать
+	// его верным для Akron с его совсем другим источником данных.
 	TimeShiftMinutes int
 }
 
@@ -404,6 +409,17 @@ func collectVKMReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, 
 // "V"), но функция не завязана на это число жёстко — если в Points
 // окажется тег, отсутствующий у Akron, он просто не найдёт совпадения
 // ни разу и тихо ничего не даст, как и для ВКМ.
+//
+// ВАЖНО: cfg.TimeShiftMinutes НЕ применяется здесь — найдено оператором
+// живьём (2026-09-02) при обобщении кода для Akron: смещение было
+// эмпирически подобрано ИСКЛЮЧИТЕЛЬНО для ВКМ (сравнением часа в ЭС с
+// часом в родной программе прибора, см. Config.TimeShiftMinutes) —
+// нет никаких оснований считать то же самое смещение верным и для
+// Akron, у которого совсем другой источник данных (уже посчитанный
+// archive_hourly, а не сырая строка прибора). Применять непроверенное
+// предположение к финансово значимым данным неправильно — пока это не
+// подтверждено отдельно тем же способом (сравнение с родным ПО
+// Akron), метки времени Akron пишутся БЕЗ сдвига.
 func collectAkronReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, from, now time.Time) ([]pointReading, error) {
 	var out []pointReading
 	for _, m := range cfg.Points {
@@ -412,8 +428,7 @@ func collectAkronReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config
 			return nil, err
 		}
 		for _, row := range rows {
-			esTime := row.TsHour.Add(time.Duration(cfg.TimeShiftMinutes) * time.Minute)
-			out = append(out, pointReading{mapping: m, ts: esTime, value: row.Value * m.Factor})
+			out = append(out, pointReading{mapping: m, ts: row.TsHour, value: row.Value * m.Factor})
 		}
 	}
 	return out, nil

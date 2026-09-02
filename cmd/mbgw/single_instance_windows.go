@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -31,6 +32,21 @@ import (
 // ручной запуск одновременно).
 const mbgwSingleInstanceMutexName = `Global\mbgw_single_instance`
 
+// mbgwMutexSDDL — дескриптор безопасности для мьютекса, в виде строки
+// SDDL: "разрешить полный доступ (GA) всем (WD — well-known SID
+// 'Everyone')". ИСПРАВЛЕНО (2026-08-30, найдено оператором живьём):
+// без явного дескриптора CreateMutex использует дескриптор ПО
+// УМОЛЧАНИЮ, который для мьютекса, созданного службой (работает от
+// имени LocalSystem, в изолированной Session 0), НЕ даёт доступа
+// процессу, запущенному вручную от имени обычного администратора (уже
+// другая сессия/учётная запись) — CreateMutex падал с "Access is
+// denied", защита молча не срабатывала, и оба процесса благополучно
+// стартовали параллельно, ровно то, чего эта защита должна была не
+// допустить. "Global\" в имени решает только видимость ЧЕРЕЗ сессии,
+// но не права доступа МЕЖДУ разными учётными записями — это два
+// разных, независимых требования Windows, оба нужны одновременно.
+const mbgwMutexSDDL = "D:(A;;GA;;;WD)"
+
 // acquireSingleInstanceLock пытается захватить именованный
 // Windows-мьютекс. Если он уже удерживается ДРУГИМ процессом (то есть
 // mbgw.exe уже где-то работает — неважно, запущен ли он службой или
@@ -48,7 +64,18 @@ func acquireSingleInstanceLock() (ok bool, err error) {
 	if err != nil {
 		return false, fmt.Errorf("не удалось подготовить имя мьютекса: %w", err)
 	}
-	_, err = windows.CreateMutex(nil, false, namePtr)
+
+	sd, err := windows.SecurityDescriptorFromString(mbgwMutexSDDL)
+	if err != nil {
+		return false, fmt.Errorf("не удалось построить дескриптор безопасности мьютекса: %w", err)
+	}
+	sa := &windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: sd,
+		InheritHandle:      0,
+	}
+
+	_, err = windows.CreateMutex(sa, false, namePtr)
 	if err == windows.ERROR_ALREADY_EXISTS {
 		return false, nil
 	}
