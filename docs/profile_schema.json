@@ -1,0 +1,235 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://mbgw/profiles/profile.schema.json",
+  "title": "Модбас-Шлюз: профиль прибора",
+  "description": "Декларативное описание прибора. Поведение прибора задаётся этим файлом, а не кодом ядра.",
+  "type": "object",
+  "required": ["meta", "points"],
+  "additionalProperties": false,
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": ["vendor", "model", "profile_version", "protocol"],
+      "additionalProperties": false,
+      "properties": {
+        "vendor": { "type": "string" },
+        "model": { "type": "string" },
+        "profile_version": { "type": "string" },
+        "protocol": { "type": "string", "enum": ["modbus", "merkuriy"] },
+        "firmware_compat": { "type": "array", "items": { "type": "string" } },
+        "description": { "type": "string" }
+      }
+    },
+
+    "transport": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "supported": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["tcp", "rtu", "tcp-serial", "optical", "gsm", "vpn"] }
+        },
+        "defaults": { "type": "object", "additionalProperties": true }
+      }
+    },
+
+    "codec": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "word_order_32": { "type": "string" },
+        "word_order_64": { "type": "string" },
+        "string_encoding": { "type": "string", "enum": ["ansi", "utf8", "ascii"] }
+      }
+    },
+
+    "session": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["none", "modbus_byteorder_auth", "modbus_access_level", "merkuriy_channel"]
+        },
+        "byte_order": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "mode": { "type": "string", "enum": ["detect", "write", "none"] },
+            "detect_via": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["space", "addr", "type", "expect"],
+                "additionalProperties": false,
+                "properties": {
+                  "space": { "type": "string", "enum": ["HR", "IR"] },
+                  "addr": { "type": "integer" },
+                  "type": { "type": "string" },
+                  "expect": {}
+                }
+              }
+            },
+            "write": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["space", "addr", "type", "value"],
+                "additionalProperties": false,
+                "properties": {
+                  "space": { "type": "string", "enum": ["HR", "IR"] },
+                  "addr": { "type": "integer" },
+                  "type": { "type": "string" },
+                  "value": { "type": ["integer", "string"] }
+                }
+              }
+            }
+          }
+        },
+        "auth": { "type": "object", "additionalProperties": true },
+        "keepalive": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "interval_s": { "type": "integer" } }
+        },
+        "preamble": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+      }
+    },
+
+    "instances": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "enumerate": { "type": "string", "enum": ["fixed_count", "bitmask_register", "config"] },
+          "count": { "type": "integer" },
+          "register": { "type": "integer" },
+          "space": { "type": "string", "enum": ["HR", "IR"] },
+          "max_count": { "type": "integer" },
+          "base": { "type": "integer" },
+          "step": { "type": "integer" }
+        }
+      }
+    },
+
+    "points": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/point" }
+    },
+
+    "archives": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/archive" }
+    },
+
+    "quality_map": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/quality_rule" }
+    }
+  },
+
+  "definitions": {
+    "datatype": {
+      "type": "string",
+      "enum": [
+        "int16", "uint16", "int32", "uint32",
+        "float", "double",
+        "string", "asciiz",
+        "u32+float", "long+float",
+        "scaled_int", "bitfield", "stInfoEvent",
+        "coil"
+      ]
+    },
+
+    "point": {
+      "type": "object",
+      "required": ["name", "type"],
+      "additionalProperties": false,
+      "anyOf": [
+        { "required": ["addr"] },
+        { "required": ["addr_formula"] }
+      ],
+      "properties": {
+        "name": { "type": "string" },
+        "space": { "type": "string", "enum": ["HR", "IR", "coil", "discrete"] },
+        "addr": { "type": "integer" },
+        "addr_formula": { "type": "string" },
+        "instance": { "type": "string" },
+        "type": { "$ref": "#/definitions/datatype" },
+        "length": { "type": "integer" },
+        "unit": { "type": "string" },
+        "scale": { "type": "number" },
+        "access": { "type": "string", "enum": ["read", "write", "readwrite"] },
+        "group": { "type": "string" },
+        "bits": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "note": { "type": "string" }
+      }
+    },
+
+    "archive": {
+      "type": "object",
+      "required": ["id", "strategy"],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "strategy": {
+          "type": "string",
+          "enum": [
+            "mb_request_poll_string",
+            "mb_indexed_binary",
+            "mb_func65",
+            "merkuriy_long_response"
+          ]
+        },
+        "params": { "type": "object", "additionalProperties": true },
+        "record_layout": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/record_field" }
+        },
+        "ring_buffer": { "type": "boolean" },
+        "time_access": { "type": "boolean" },
+        "index_access": { "type": "boolean" },
+        "dst_aware": { "type": "boolean" },
+        "firmware_variant": { "type": "string" },
+        "note": { "type": "string" }
+      }
+    },
+
+    "record_field": {
+      "type": "object",
+      "required": ["offset", "name", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "offset": { "type": "integer" },
+        "name": { "type": "string" },
+        "type": { "$ref": "#/definitions/datatype" },
+        "unit": { "type": "string" },
+        "scale": { "type": "number" },
+        "crc": { "type": "boolean" },
+        "epoch": { "type": "string" },
+        "decode": { "type": "string" },
+        "bits": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+
+    "quality_rule": {
+      "type": "object",
+      "required": ["meaning", "quality"],
+      "additionalProperties": false,
+      "properties": {
+        "source": { "type": "string" },
+        "bit": { "type": "integer" },
+        "code": { "type": "integer" },
+        "meaning": { "type": "string" },
+        "quality": {
+          "type": "string",
+          "enum": ["VALID", "VERIFIED", "ESTIMATED", "INTERPOLATED", "STALE", "INVALID", "NO_DATA"]
+        }
+      }
+    }
+  }
+}
