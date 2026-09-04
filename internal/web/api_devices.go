@@ -220,9 +220,11 @@ func (s *Server) handleDeviceDelete(w http.ResponseWriter, r *http.Request) {
 
 // vkmChannelJSON is the wire shape for one tag->ЭС-channel mapping row.
 type vkmChannelJSON struct {
-	Tag         string  `json:"tag"` // "ST" | "S" | "T" | "Pi"
-	ESChannelID int     `json:"es_channel_id"`
-	Factor      float64 `json:"factor"`
+	Tag         string   `json:"tag"` // "ST" | "S" | "T" | "Pi" | "V"
+	ESChannelID int      `json:"es_channel_id"`
+	Factor      float64  `json:"factor"`
+	MinValue    *float64 `json:"min_value"` // null = lower safety limit disabled
+	MaxValue    *float64 `json:"max_value"` // null = upper safety limit disabled
 }
 
 // handleVKMChannels: GET ?device_id=xxx lists channel mappings; POST
@@ -244,7 +246,10 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 		}
 		out := make([]vkmChannelJSON, 0, len(rows))
 		for _, c := range rows {
-			out = append(out, vkmChannelJSON{Tag: c.Tag, ESChannelID: c.ESChannelID, Factor: c.Factor})
+			out = append(out, vkmChannelJSON{
+				Tag: c.Tag, ESChannelID: c.ESChannelID, Factor: c.Factor,
+				MinValue: c.MinValue, MaxValue: c.MaxValue,
+			})
 		}
 		writeJSON(w, http.StatusOK, out)
 
@@ -269,8 +274,15 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 			if factor == 0 {
 				factor = 1.0
 			}
+			if c.MinValue != nil && c.MaxValue != nil && *c.MinValue > *c.MaxValue {
+				writeError(w, http.StatusBadRequest,
+					fmt.Sprintf("для точки %s минимальное значение %g больше максимального %g",
+						c.Tag, *c.MinValue, *c.MaxValue))
+				return
+			}
 			rows = append(rows, sqliterepo.VKMChannelRecord{
 				DeviceID: body.DeviceID, Tag: c.Tag, ESChannelID: c.ESChannelID, Factor: factor,
+				MinValue: c.MinValue, MaxValue: c.MaxValue,
 			})
 			if c.ESChannelID != 0 {
 				channelIDs = append(channelIDs, c.ESChannelID)

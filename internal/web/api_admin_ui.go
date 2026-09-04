@@ -129,9 +129,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <div id="panel-dashboard" class="panel active">
     <div class="section">
       <h3>Статус приборов</h3>
-      <p class="small-note">Отставание архива — сколько последних периодов ещё не собрано, в часах (получасовки ВКМ и часовки Акрона — на одной шкале). 0 = данные свежие. Проверка учитывает плановую задержку опроса (обычно 5 минут после границы периода + небольшой запас), чтобы не показывать ложное отставание сразу после границы часа/получаса.</p>
-      <p class="small-note">Расхождение времени — на сколько часы ПРИБОРА (не сервера) отличаются от ожидаемого, по данным последнего собранного архива ВКМ. Положительное = часы прибора спешат, отрицательное = отстают. Коррекция времени прибора через mbgw не реализована — это только наблюдение.</p>
-      <p class="small-note">В фоне постоянно работает автоматическая синхронизация с ЭС — раз в минуту добавляет то, что успело собраться локально и ещё не отправлено; трогать её вручную не нужно, она просто работает всегда. Кнопка «Принудительная пересинхронизация с ЭС» — для другого, редкого случая: когда нужно ИСПРАВИТЬ уже отправленные данные (например, с прибора один раз пришли искажённые значения, вы их переопросили и получили верные — но в ЭС уже успело уйти старое; либо поменяли множитель точки на вкладке «Точки ЭС» — новые точки и так пойдут в правильных единицах, а вот уже отправленная история сама не пересчитается). В отличие от фоновой синхронизации, которая только ДОБАВЛЯЕТ новое и никогда не трогает уже существующее в ЭС, эта кнопка ЯВНО перезаписывает уже отправленные точки за указанный вами период — потому и требует диапазон дат и подтверждения.</p>
+      <p class="small-note">Кнопка «Принудительная пересинхронизация с ЭС» — когда нужно обновить данные в БД ЭС.</p>
+      <div id="dashboardSystemHealth" class="small-note" style="margin:8px 0 12px 0;">Состояние процесса: загрузка...</div>
       <table>
         <thead><tr>
           <th style="cursor:pointer;" onclick="sortDashboard('name')">Прибор ⇅</th>
@@ -141,9 +140,10 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
           <th>Последний период</th>
           <th style="cursor:pointer;" onclick="sortDashboard('next')">Следующий опрос ⇅</th>
           <th style="cursor:pointer;" onclick="sortDashboard('drift')">Расхождение времени ⇅</th>
+          <th>Последняя успешная работа</th>
           <th>Действие</th>
         </tr></thead>
-        <tbody id="dashboardTable"><tr><td colspan="8">Загрузка...</td></tr></tbody>
+        <tbody id="dashboardTable"><tr><td colspan="9">Загрузка...</td></tr></tbody>
       </table>
 
       <!-- Всплывающий блок «Принудительная пересинхронизация с ЭС» —
@@ -166,7 +166,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
           <select id="dr_to_h" style="width:55px;"></select>:<select id="dr_to_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
         </div>
         <p>
-          <button class="btn secondary" onclick="doDashboardResync()">Пересчитать и переписать в ЭС</button>
+          <button class="btn secondary" onclick="doDashboardResync()">Проверить и переписать в ЭС</button>
           <button class="btn secondary" onclick="closeDashboardResyncBox()">Отмена</button>
         </p>
         <div id="dashboardResyncMsg" class="msg"></div>
@@ -255,9 +255,10 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <select id="ch_device" onchange="loadChannels()"></select>
       </div>
       <table>
-        <thead><tr><th>Величина</th><th>ID_PP</th><th>Множитель</th></tr></thead>
-        <tbody id="channelsTableBody"><tr><td colspan="3">Выберите прибор</td></tr></tbody>
+        <thead><tr><th>Величина</th><th>ID_PP</th><th>Множитель</th><th>Мин.</th><th>Макс.</th></tr></thead>
+        <tbody id="channelsTableBody"><tr><td colspan="5">Выберите прибор</td></tr></tbody>
       </table>
+      <p class="small-note">Мин./Макс. — необязательный защитный диапазон уже ПОСЛЕ применения множителя. Пустое поле = предел выключен.</p>
       <p><button class="btn" onclick="saveChannels()">Сохранить точки</button></p>
       <div id="channelsMsg" class="msg"></div>
     </div>
@@ -282,9 +283,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <div class="form-row"><label>Логин</label><input id="es_user" type="text"></div>
       <div class="form-row"><label>Пароль</label><input id="es_password" type="password"></div>
       <div class="form-row"><label>Порт</label><input id="es_port" type="text" value="1433"></div>
-      <div class="form-row"><label>Сдвиг времени для ВКМ (минут)</label><input id="es_time_shift" type="text" value="0"></div>
-      <p class="small-note" style="margin-left:220px;margin-top:-8px;color:#ffd479;">⚠ Применяется ТОЛЬКО к приборам ВКМ — значение подобрано эмпирически именно для них (сравнением часа в ЭС с часом в родной программе прибора). Для Akron сдвиг НЕ применяется — нет оснований считать то же самое значение верным для него, у него совсем другой источник данных (уже посчитанный архив, а не сырая строка прибора). Если для Akron когда-нибудь тоже понадобится сдвиг — потребуется отдельно подобрать и проверить значение тем же способом, не переиспользовать это.</p>
-      <p class="small-note" style="margin-left:220px;margin-top:4px;">Сдвигает метку времени при записи данных ВКМ в базу ЭС. Нужен, потому что ЭС раскладывает такие прямые записи по своим строкам со смещением (наблюдалось смещение на 1,5 часа = -90). 0 — без сдвига. Подбирается опытным путём: сравните час в ЭС с часом в родной программе прибора.</p>
+      <div class="form-row"><label>Сдвиг времени при записи в ЭС (минут)</label><input id="es_time_shift" type="text" value="0"></div>
+      <p class="small-note" style="margin-left:220px;margin-top:-8px;color:#ffd479;">Применяется к ВКМ и Akron при прямой записи в БД ЭС. Отрицательное значение сдвигает метку назад; например, -90 — на 90 минут назад. 0 — без сдвига.</p>
       <p class="small-note" id="es_password_note"></p>
       <p>
         <button class="btn secondary" onclick="testESConnection()">Проверить подключение</button>
@@ -326,7 +326,6 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <div id="panel-log" class="panel">
     <div class="section">
       <h3>Лог сервера</h3>
-      <p class="small-note">Обновляется автоматически каждые 2 секунды. Новые записи появляются СВЕРХУ (самая свежая — первой строкой), чтобы не приходилось прокручивать полосой вниз каждый раз. «Пауза» останавливает подгрузку новых строк на экране (уже показанное остаётся на месте, удобно спокойно прочитать/скопировать) — на сервере запись в лог при этом не останавливается, пропущенное просто появится всё сразу сверху при нажатии «Продолжить». Цвет: зелёный — успешные операции ([OK]), красный — ошибки ([ERROR]/[FATAL]), жёлтый — предупреждения ([WARN]). Жирным — метки прибора и периода архива, для быстрого поиска глазами. Некоторые технические формулировки на этом экране переведены на понятный язык (например, «часовой архив» вместо «архив hourly») — файл mbgw_server.log на диске при этом остаётся техническим, как есть, для более глубокой диагностики. Каждому прибору — свой устойчивый цвет (одинаковый и в полоске активности ниже, и в самих строках лога) — полоска вспыхивает при каждой новой строке лога об этом приборе, погасает плавно: несколько одновременных вспышек наглядно показывают, что приборы опрашиваются параллельно, а не по очереди.</p>
       <div id="deviceActivityStrip" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;"></div>
       <p>
         <button class="btn secondary" id="logPauseBtn" onclick="toggleLogPause()">Пауза</button>
@@ -386,7 +385,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 
     <div class="section" id="reloadSection" style="display:none;">
       <h3>Принудительный переопрос</h3>
-      <p class="small-note">Заново спрашивает прибор за указанный период и ПЕРЕЗАПИСЫВАЕТ уже сохранённые данные — используйте, если в архиве обнаружено заведомо неверное значение (например, из-за помехи на линии связи). Обычный дозабор такое не исправляет, поскольку строка для этого периода уже существует.</p>
+      <p class="small-note">Немедленно переопрашивает прибор за указанный период и перезаписывает данные в БД МодбасШлюза. В БД ЭС эта операция напрямую ничего не записывает. Чтобы затем обновить уже отправленные данные в ЭС, используйте кнопку «Принудительная пересинхронизация с ЭС» на вкладке «Главная».</p>
       <div class="form-row"><label>Переопросить с</label>
         <input id="rl_from" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
         <select id="rl_from_h" style="width:55px;"></select>:<select id="rl_from_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
@@ -783,10 +782,13 @@ var dashboardResyncDeviceId = null;
 
 function doDashboardResync() {
   if (!dashboardResyncDeviceId) { return; }
+
   var fromDate = document.getElementById('dr_from').value;
   var toDate = document.getElementById('dr_to').value;
-  if (!fromDate) { showMsg('dashboardResyncMsg', false, 'Выберите дату начала в календаре'); return; }
-  if (!confirm('Это ПЕРЕЗАПИШЕТ уже отправленные в ЭС точки за указанный период свежими значениями. Продолжить?')) { return; }
+  if (!fromDate) {
+    showMsg('dashboardResyncMsg', false, 'Выберите дату начала в календаре');
+    return;
+  }
 
   var fromH = document.getElementById('dr_from_h').value;
   var fromM = document.getElementById('dr_from_m').value;
@@ -800,21 +802,73 @@ function doDashboardResync() {
   }
 
   document.getElementById('dashboardResyncMsg').className = 'msg';
-  showMsg('dashboardResyncMsg', true, 'Идёт пересинхронизация, подождите...');
+  showMsg('dashboardResyncMsg', true, 'Проверяю диапазон. В ЭС пока ничего не записывается...');
+
+  sendDashboardResyncRequest('preview', fromVal, toVal, function(preview) {
+    if (!preview.ok) {
+      showMsg('dashboardResyncMsg', false, 'Ошибка preview: ' + (preview.error || 'неизвестная'));
+      return;
+    }
+
+    var summary =
+      'Проверка завершена.\n\n' +
+      'Будет перезаписано: ' + preview.updated + '\n' +
+      'Будет вставлено новых: ' + preview.inserted + '\n' +
+      'Заблокировано/ошибок: ' + preview.failed + '\n\n' +
+      'Только после подтверждения начнётся реальная запись в ЭС.\n' +
+      'Выполнить?';
+
+    showMsg(
+      'dashboardResyncMsg',
+      true,
+      'Preview: будет переписано ' + preview.updated +
+      ', вставлено новых ' + preview.inserted +
+      ', заблокировано/ошибок ' + preview.failed + '.'
+    );
+
+    if (!confirm(summary)) {
+      showMsg('dashboardResyncMsg', true, 'Отменено после preview. В ЭС ничего не записано.');
+      return;
+    }
+
+    showMsg('dashboardResyncMsg', true, 'Идёт реальная пересинхронизация с ЭС, подождите...');
+    sendDashboardResyncRequest('execute', fromVal, toVal, function(result) {
+      if (result.ok) {
+        showMsg(
+          'dashboardResyncMsg',
+          true,
+          'Готово: переписано ' + result.updated +
+          ', вставлено новых ' + result.inserted +
+          ', ошибок ' + result.failed + '.'
+        );
+      } else {
+        showMsg('dashboardResyncMsg', false, 'Ошибка выполнения: ' + (result.error || 'неизвестная'));
+      }
+    });
+  });
+}
+
+function sendDashboardResyncRequest(action, fromVal, toVal, done) {
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/es-sync/force-resync', true);
   xhr.setRequestHeader('Content-Type', 'application/json');
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
     var data;
-    try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('dashboardResyncMsg', false, 'Ошибка ответа сервера'); return; }
-    if (data.ok) {
-      showMsg('dashboardResyncMsg', true, 'Готово: переписано ' + data.updated + ', вставлено новых ' + data.inserted + ', ошибок ' + data.failed + '.');
-    } else {
-      showMsg('dashboardResyncMsg', false, 'Ошибка: ' + (data.error || 'неизвестная'));
+    try {
+      data = JSON.parse(xhr.responseText);
+    } catch (e) {
+      done({ ok: false, error: 'Ошибка ответа сервера' });
+      return;
     }
+    done(data);
   };
-  xhr.send(JSON.stringify({ device_id: dashboardResyncDeviceId, from: fromVal, to: toVal }));
+  xhr.send(JSON.stringify({
+    device_id: dashboardResyncDeviceId,
+    from: fromVal,
+    to: toVal,
+    action: action
+  }));
 }
 
 // pollReloadProgress(deviceId, generation) — generation фиксируется
@@ -841,7 +895,7 @@ function pollReloadProgress(deviceId, generation) {
 
     if (!data.finished) {
       var pct = data.total > 0 ? Math.round(100 * data.done / data.total) : 0;
-      showMsg('reloadMsg', true, 'Идёт переопрос: обработано ' + data.done + ' из ' + data.total + ' периодов (' + pct + '%). Данные постепенно появляются в ЭС по ходу сбора...');
+      showMsg('reloadMsg', true, 'Идёт переопрос: обработано ' + data.done + ' из ' + data.total + ' периодов (' + pct + '%). Данные перезаписываются в БД МодбасШлюза...');
       setTimeout(function() {
         if (generation !== reloadPollGeneration) { return; } // сменили прибор, пока ждали таймаут
         pollReloadProgress(deviceId, generation);
@@ -855,7 +909,7 @@ function pollReloadProgress(deviceId, generation) {
     if (data.error) {
       showMsg('reloadMsg', false, 'Завершено с ошибкой: ' + data.error + ' (успело перезаписать записей: ' + data.saved + ')');
     } else {
-      showMsg('reloadMsg', true, 'Готово, перезаписано записей: ' + data.saved + '. Нажмите «Показать», чтобы увидеть обновлённые данные.');
+      showMsg('reloadMsg', true, 'Готово, перезаписано записей в БД МодбасШлюза: ' + data.saved + '. Чтобы обновить ЭС, используйте «Принудительную пересинхронизацию с ЭС» на вкладке «Главная».');
     }
   };
   xhr.send();
@@ -1077,6 +1131,18 @@ function flashDeviceActivity(deviceId) {
   el._flashTimer = setTimeout(function () { el.style.opacity = '0.3'; }, 900);
 }
 
+function deviceIdFromLogLine(line) {
+  // Реальная строка лога начинается с timestamp, поэтому искать [device]
+  // только в самом начале строки нельзя. Сверяем квадратные скобки с
+  // фактическими ID настроенных приборов, чтобы не принять [INFO],
+  // [ERROR], [WARN] и другие служебные метки за ID прибора.
+  for (var i = 0; i < allDevices.length; i++) {
+    var id = allDevices[i].id;
+    if (line.indexOf('[' + id + ']') !== -1) { return id; }
+  }
+  return null;
+}
+
 function formatLogLine(line) {
   var html = escapeHtmlForLog(line);
   var cls = '';
@@ -1084,18 +1150,21 @@ function formatLogLine(line) {
   else if (line.indexOf('[WARN]') !== -1) { cls = 'log-warn'; }
   else if (line.indexOf('[OK]') !== -1) { cls = 'status-good'; }
   html = humanizeLogLine(html);
-  // Метка периода архива ("период 29.08.2026 22:30") — жирным, чтобы
-  // легко находить глазами момент, о котором идёт речь в строке.
+
+  // Метка периода архива ("период 29.08.2026 22:30") — жирным.
   html = html.replace(/(период \d{2}\.\d{2}\.\d{4} \d{2}:\d{2})/g, '<b>$1</b>');
-  // Префикс прибора в квадратных скобках в начале строки — жирным и
-  // ЦВЕТОМ ЭТОГО ПРИБОРА (см. colorForDevice выше, добавлено
-  // 2026-09-02) — тот же цвет, что и в полоске активности, чтобы
-  // визуально сразу было видно, какая строка от какого прибора, даже
-  // когда строки от разных приборов идут вперемешку (параллельный опрос).
-  html = html.replace(/^(\[[^\]]+\])/, function (match, bracketed) {
-    var devId = bracketed.slice(1, -1);
-    return '<b style="color:' + colorForDevice(devId) + '">' + bracketed + '</b>';
-  });
+
+  // Подсвечиваем реальный ID прибора независимо от timestamp и
+  // служебных префиксов перед ним.
+  var devId = deviceIdFromLogLine(line);
+  if (devId) {
+    var bracketed = '[' + devId + ']';
+    html = html.replace(
+      bracketed,
+      '<b style="color:' + colorForDevice(devId) + '">' + bracketed + '</b>'
+    );
+  }
+
   if (cls) { return '<span class="' + cls + '">' + html + '</span>'; }
   return html;
 }
@@ -1129,8 +1198,8 @@ function loadLog() {
       // Вспышка индикатора прибора, упомянутого в строке (см.
       // flashDeviceActivity выше) — не влияет на сам текст лога,
       // только на полоску активности над ним.
-      var m = /^\[([^\]]+)\]/.exec(data.entries[i].text);
-      if (m) { flashDeviceActivity(m[1]); }
+      var deviceId = deviceIdFromLogLine(data.entries[i].text);
+      if (deviceId) { flashDeviceActivity(deviceId); }
     }
     var html = '';
     for (var j = data.entries.length - 1; j >= 0; j--) {
@@ -1307,6 +1376,26 @@ function dashboardSortValue(row, key) {
 
 function renderDashboardTable() {
   var rows = dashboardData.slice(); // копия — не трогаем исходный порядок с сервера
+
+  var systemHealth = document.getElementById('dashboardSystemHealth');
+  if (systemHealth) {
+    if (rows.length === 0) {
+      systemHealth.innerHTML = 'Состояние процесса: нет настроенных приборов';
+    } else {
+      var h = rows[0];
+      var pollerText = h.poller_last_cycle ? ('poller: ' + h.poller_last_cycle) : 'poller: нет данных';
+      var sqliteText;
+      if (!h.sqlite_checked_at) {
+        sqliteText = 'SQLite: нет данных';
+      } else if (h.sqlite_ok) {
+        sqliteText = '<span class="status-good">SQLite: OK</span> (' + h.sqlite_checked_at + ')';
+      } else {
+        sqliteText = '<span class="status-bad">SQLite: ERROR</span> (' + h.sqlite_checked_at + ')' +
+          (h.sqlite_error ? ' — ' + h.sqlite_error : '');
+      }
+      systemHealth.innerHTML = 'Состояние процесса — ' + pollerText + '; ' + sqliteText;
+    }
+  }
   if (dashboardSortKey) {
     rows.sort(function(a, b) {
       var va = dashboardSortValue(a, dashboardSortKey);
@@ -1347,6 +1436,14 @@ function renderDashboardTable() {
     var lastPeriodText = d.last_period || '—';
     var nextPollText = d.next_poll_at || '—';
 
+    var workParts = [];
+    workParts.push('текущие: ' + (d.last_current_success || '—'));
+    workParts.push('архив: ' + (d.last_archive_success || '—'));
+    if (d.sync_supported) {
+      workParts.push('ЭС: ' + (d.last_es_write_success || '—'));
+    }
+    var workText = workParts.join('<br>');
+
     var actionCell = '';
     if (d.sync_supported) {
       actionCell = '<button class="btn secondary" onclick="openDashboardResyncBox(\'' + d.id + '\')">Принудительная пересинхронизация с ЭС</button>';
@@ -1355,9 +1452,9 @@ function renderDashboardTable() {
     html += '<tr><td>' + (d.name || d.id) + ' (' + d.id + ')</td><td>' + d.kind + '</td><td>' +
       enabledText + '</td><td class="' + lagClass + '">' + lagText + '</td><td>' + lastPeriodText +
       '</td><td>' + nextPollText + '</td><td class="' + driftClass + '"' + driftTitle + '>' +
-      driftText + '</td><td>' + actionCell + '</td></tr>';
+      driftText + '</td><td>' + workText + '</td><td>' + actionCell + '</td></tr>';
   }
-  if (html === '') { html = '<tr><td colspan="8">Приборов пока нет</td></tr>'; }
+  if (html === '') { html = '<tr><td colspan="9">Приборов пока нет</td></tr>'; }
   document.getElementById('dashboardTable').innerHTML = html;
 }
 
@@ -1610,7 +1707,7 @@ var POINT_TAG_DEFS = {
     { tag: 'Pi', label: 'Давление (Pi)', hint: 'Сырое значение с прибора — Паскали (Па). Множитель 1 = в ЭС уйдут Па. Для МПа поставьте <b>0.000001</b>; для кгс/см² — <b>0.0000101972</b>.' }
   ],
   akron: [
-    { tag: 'V', label: 'Объём (V)', hint: 'Сырое значение с прибора — м³. Множитель 1 = в ЭС уйдут м³ «как есть».' }
+    { tag: 'V', label: 'Объём (V)', hint: 'Часовой расход вычисляется по разнице накопительного V и автоматически делится поровну на две получасовки ЭС. Множитель 1 = м³ без дополнительного пересчёта.' }
   ]
 };
 
@@ -1635,9 +1732,11 @@ function renderChannelsTable(kind) {
   for (var i = 0; i < defs.length; i++) {
     var d = defs[i];
     html += '<tr><td>' + d.label + '</td><td><input id="ch_' + d.tag + '_id" type="text"></td>' +
-      '<td><input id="ch_' + d.tag + '_factor" type="text" value="1"><div class="small-note">' + d.hint + '</div></td></tr>';
+      '<td><input id="ch_' + d.tag + '_factor" type="text" value="1"><div class="small-note">' + d.hint + '</div></td>' +
+      '<td><input id="ch_' + d.tag + '_min" type="text" placeholder="выкл."></td>' +
+      '<td><input id="ch_' + d.tag + '_max" type="text" placeholder="выкл."></td></tr>';
   }
-  if (html === '') { html = '<tr><td colspan="3">Выберите прибор</td></tr>'; }
+  if (html === '') { html = '<tr><td colspan="5">Выберите прибор</td></tr>'; }
   document.getElementById('channelsTableBody').innerHTML = html;
 }
 
@@ -1673,9 +1772,13 @@ function loadChannels() {
       var t = tags[j];
       var idEl = document.getElementById('ch_' + t + '_id');
       var factorEl = document.getElementById('ch_' + t + '_factor');
+      var minEl = document.getElementById('ch_' + t + '_min');
+      var maxEl = document.getElementById('ch_' + t + '_max');
       if (!idEl) { continue; }
       idEl.value = byTag[t] ? byTag[t].es_channel_id : '';
       factorEl.value = byTag[t] ? byTag[t].factor : '1';
+      minEl.value = (byTag[t] && byTag[t].min_value !== null && byTag[t].min_value !== undefined) ? byTag[t].min_value : '';
+      maxEl.value = (byTag[t] && byTag[t].max_value !== null && byTag[t].max_value !== undefined) ? byTag[t].max_value : '';
     }
   };
   xhr.send();
@@ -1692,7 +1795,37 @@ function saveChannels(force) {
     var idVal = document.getElementById('ch_' + t + '_id').value;
     if (idVal === '') { continue; }
     var chId = intOrZero(idVal);
-    channels.push({ tag: t, es_channel_id: chId, factor: floatOrOne(document.getElementById('ch_' + t + '_factor').value) });
+    var minText = document.getElementById('ch_' + t + '_min').value.replace(/^\s+|\s+$/g, '');
+    var maxText = document.getElementById('ch_' + t + '_max').value.replace(/^\s+|\s+$/g, '');
+    var minValue = null;
+    var maxValue = null;
+
+    if (minText !== '') {
+      minValue = parseFloat(minText);
+      if (isNaN(minValue)) {
+        showMsg('channelsMsg', false, 'Некорректный минимум для ' + t);
+        return;
+      }
+    }
+    if (maxText !== '') {
+      maxValue = parseFloat(maxText);
+      if (isNaN(maxValue)) {
+        showMsg('channelsMsg', false, 'Некорректный максимум для ' + t);
+        return;
+      }
+    }
+    if (minValue !== null && maxValue !== null && minValue > maxValue) {
+      showMsg('channelsMsg', false, 'Для ' + t + ' минимум не может быть больше максимума');
+      return;
+    }
+
+    channels.push({
+      tag: t,
+      es_channel_id: chId,
+      factor: floatOrOne(document.getElementById('ch_' + t + '_factor').value),
+      min_value: minValue,
+      max_value: maxValue
+    });
     channelIds.push(chId);
   }
 

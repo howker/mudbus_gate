@@ -69,9 +69,11 @@ CREATE TABLE IF NOT EXISTS devices (
 -- chan_heat/chan_mass/chan_temp/chan_pressure/factor_* keys.
 CREATE TABLE IF NOT EXISTS es_vkm_channels (
     device_id     TEXT NOT NULL,
-    tag           TEXT NOT NULL,           -- 'ST' | 'S' | 'T' | 'Pi'
+    tag           TEXT NOT NULL,           -- 'ST' | 'S' | 'T' | 'Pi' | 'V'
     es_channel_id INTEGER NOT NULL,
     factor        REAL NOT NULL DEFAULT 1.0,
+    min_value     REAL NULL,               -- NULL = lower safety limit disabled
+    max_value     REAL NULL,               -- NULL = upper safety limit disabled
     PRIMARY KEY (device_id, tag)
 );
 
@@ -120,6 +122,12 @@ CREATE TABLE IF NOT EXISTS es_akron_northbound (
 	// (сдвиг времени при записи в Mains) — ошибка "duplicate column
 	// name" на уже обновлённой базе безвредна и намеренно игнорируется.
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE es_connection ADD COLUMN time_shift_minutes INTEGER NOT NULL DEFAULT 0`)
+
+	// Optional per-channel safety limits for direct writes to ЭС.
+	// NULL means "limit disabled", so upgrading an existing production DB
+	// does not invent or silently enforce any engineering range.
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE es_vkm_channels ADD COLUMN min_value REAL NULL`)
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE es_vkm_channels ADD COLUMN max_value REAL NULL`)
 
 	return nil
 }
@@ -299,9 +307,14 @@ func (r *Repo) DeleteCurrentReadings(ctx context.Context, deviceID string) error
 // VKMChannelRecord is one tag->ЭС-channel mapping row.
 type VKMChannelRecord struct {
 	DeviceID    string
-	Tag         string // "ST" | "S" | "T" | "Pi"
+	Tag         string // "ST" | "S" | "T" | "Pi" | "V"
 	ESChannelID int
 	Factor      float64
+	// MinValue/MaxValue are checked AFTER Factor is applied, immediately
+	// before writing to ЭС. nil means that side of the safety range is
+	// disabled. Both nil = no range check, preserving current behaviour.
+	MinValue *float64
+	MaxValue *float64
 }
 
 // SetVKMChannels replaces every channel mapping for a device in one call
@@ -365,9 +378,9 @@ func (r *Repo) SetVKMChannels(ctx context.Context, deviceID string, rows []VKMCh
 	}
 	for _, row := range rows {
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO es_vkm_channels (device_id, tag, es_channel_id, factor)
-VALUES (?, ?, ?, ?)
-`, deviceID, row.Tag, row.ESChannelID, row.Factor); err != nil {
+INSERT INTO es_vkm_channels (device_id, tag, es_channel_id, factor, min_value, max_value)
+VALUES (?, ?, ?, ?, ?, ?)
+`, deviceID, row.Tag, row.ESChannelID, row.Factor, row.MinValue, row.MaxValue); err != nil {
 			return fmt.Errorf("set vkm channels: insert %s: %w", row.Tag, err)
 		}
 	}
@@ -381,7 +394,7 @@ VALUES (?, ?, ?, ?)
 // (empty slice, not an error, if none are set yet).
 func (r *Repo) GetVKMChannels(ctx context.Context, deviceID string) ([]VKMChannelRecord, error) {
 	rows, err := r.db.QueryContext(ctx, `
-SELECT device_id, tag, es_channel_id, factor
+SELECT device_id, tag, es_channel_id, factor, min_value, max_value
 FROM es_vkm_channels WHERE device_id = ? ORDER BY tag
 `, deviceID)
 	if err != nil {
@@ -392,8 +405,17 @@ FROM es_vkm_channels WHERE device_id = ? ORDER BY tag
 	var out []VKMChannelRecord
 	for rows.Next() {
 		var v VKMChannelRecord
-		if err := rows.Scan(&v.DeviceID, &v.Tag, &v.ESChannelID, &v.Factor); err != nil {
+		var minValue, maxValue sql.NullFloat64
+		if err := rows.Scan(&v.DeviceID, &v.Tag, &v.ESChannelID, &v.Factor, &minValue, &maxValue); err != nil {
 			return nil, fmt.Errorf("scan vkm channel: %w", err)
+		}
+		if minValue.Valid {
+			value := minValue.Float64
+			v.MinValue = &value
+		}
+		if maxValue.Valid {
+			value := maxValue.Float64
+			v.MaxValue = &value
 		}
 		out = append(out, v)
 	}

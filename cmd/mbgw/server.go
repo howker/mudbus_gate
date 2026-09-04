@@ -17,11 +17,11 @@ import (
 
 	"mbgw/internal/dbg"
 	"mbgw/internal/device"
+	"mbgw/internal/health"
 	"mbgw/internal/integration"
 	"mbgw/internal/lease"
 	"mbgw/internal/logbuf"
 	"mbgw/internal/monitor"
-	"mbgw/internal/northbound"
 	"mbgw/internal/pollcore"
 	"mbgw/internal/poller"
 	"mbgw/internal/profile"
@@ -118,8 +118,8 @@ func nextToExe(name string) string {
 // server is the target single-process command (T14 minimal-slice step 2):
 // ONE mbgw process that reads its device list from the DATABASE (not
 // config.yaml) and runs everything the four separate windows used to —
-// southbound polling for every enabled device, the Akron northbound
-// carrier, and ВКМ→Энергосфера direct-DB sync — so the future Web UI
+// southbound polling for every enabled device and direct-DB sync to
+// Энергосфера for configured VKM/Akron points — so the Web UI
 // (step 4) can add/edit devices and channel mappings and have them take
 // effect without the operator hand-editing text files or juggling
 // windows.
@@ -165,7 +165,7 @@ func runServer() {
 	// rotatingFile (см. rotating_log.go) — раньше здесь был обычный
 	// os.OpenFile с O_APPEND, растущий БЕСКОНЕЧНО без единого ограничения
 	// на размер, пока процесс работает — найдено оператором живьём
-	// (2026-08-29): mbgw_server.log и *_akron_live.jsonl на проде растут
+	// (2026-08-29): mbgw_server.log на проде мог расти без ограничения
 	// без остановки, потому что перезапуск сервера (единственный момент,
 	// когда файл раньше начинал расти "с нуля" — при старом os.OpenFile
 	// он всё равно ДОПИСЫВАЛ поверх старого через O_APPEND, так что даже
@@ -293,6 +293,9 @@ func runServer() {
 	if err := repo.InitAppSettingsSchema(context.Background()); err != nil {
 		log.Fatalf("[FATAL] ошибка инициализации схемы настроек: %v", err)
 	}
+	if err := repo.InitESForceResyncAuditSchema(context.Background()); err != nil {
+		log.Fatalf("[FATAL] ошибка инициализации audit принудительной пересинхронизации ЭС: %v", err)
+	}
 	log.Printf("[OK] Хранилище инициализировано (%s)\n", dbPath)
 
 	// PORT SELECTION RULE: the DB (app_settings.configured_port) is
@@ -368,6 +371,29 @@ func runServer() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// SQLite health heartbeat: one immediate check, then every 10 seconds.
+	// This is an actual DB Ping, not "the process is alive", so the
+	// dashboard can distinguish a live process from a broken local store.
+	go func() {
+		check := func() {
+			checkedAt := time.Now()
+			err := repo.Ping(ctx)
+			health.SetSQLite(checkedAt, err == nil, err)
+		}
+		check()
+
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				check()
+			}
+		}
+	}()
 
 	webServer := web.NewServer(repo, webPort)
 
@@ -565,44 +591,86 @@ func runServer() {
 	// оператором действие с указанным диапазоном, а не часть обычного
 	// расписания, так что отдельное подключение проще и не рискует
 	// помешать штатному циклу синхронизации.
-	webServer.SetForceResyncES(func(ctx context.Context, deviceID string, from, to time.Time) (updated, inserted, failed int, err error) {
+	webServer.SetForceResyncES(func(ctx context.Context, deviceID string, from, to time.Time, action string) (updated, inserted, failed int, err error) {
+		// Durable audit is written for BOTH preview and execute, including
+		// failed attempts. Keep this defer at the top so every return path
+		// is covered (bad device/config, SQL connection error, validation
+		// error inside integration, etc.).
+		defer func() {
+			auditErr := repo.AddESForceResyncAudit(context.Background(), sqliterepo.ESForceResyncAudit{
+				DeviceID: deviceID,
+				From:     from,
+				To:       to,
+				Action:   action,
+				Updated:  updated,
+				Inserted: inserted,
+				Failed:   failed,
+				OK:       err == nil,
+				Error: func() string {
+					if err != nil {
+						return err.Error()
+					}
+					return ""
+				}(),
+			})
+			if auditErr != nil {
+				log.Printf("[ERROR] не удалось записать audit принудительной пересинхронизации ЭС (%s, %s): %v\n",
+					deviceID, action, auditErr)
+			}
+		}()
+
 		devicesMu.Lock()
 		kind := deviceKinds[deviceID]
 		devicesMu.Unlock()
-		// ИЗМЕНЕНО (2026-08-31): раньше работало только для ВКМ — теперь
-		// оба типа приборов пишут в ЭС одним и тем же путём
-		// (buildIntegrationConfig сам умеет и в тот, и в другой), так что
-		// ограничение убрано; неизвестный/пустой kind по-прежнему отказ.
 		if kind != "vkm360" && kind != "akron" {
-			return 0, 0, 0, fmt.Errorf("принудительная пересинхронизация с ЭС не поддерживается для типа прибора %q (прибор %s)", kind, deviceID)
+			err = fmt.Errorf("принудительная пересинхронизация с ЭС не поддерживается для типа прибора %q (прибор %s)", kind, deviceID)
+			return
 		}
 
-		cfg, found, cerr := buildIntegrationConfig(ctx, repo, deviceID, kind)
-		if cerr != nil {
-			return 0, 0, 0, cerr
+		var cfg integration.Config
+		var found bool
+		cfg, found, err = buildIntegrationConfig(ctx, repo, deviceID, kind)
+		if err != nil {
+			return
 		}
 		if !found {
-			return 0, 0, 0, fmt.Errorf("для прибора %s не настроено подключение к ЭС или точки", deviceID)
+			err = fmt.Errorf("для прибора %s не настроено подключение к ЭС или точки", deviceID)
+			return
 		}
 
-		writer, werr := integration.OpenPointMainsWriter(integration.SQLServerConfig{
+		var writer *integration.PointMainsWriter
+		writer, err = integration.OpenPointMainsWriter(integration.SQLServerConfig{
 			Server: cfg.SQLServer, Database: cfg.SQLDatabase,
 			User: cfg.SQLUser, Password: cfg.SQLPassword, Port: cfg.SQLPort,
 		})
-		if werr != nil {
-			return 0, 0, 0, fmt.Errorf("подключение к БД ЭС: %w", werr)
+		if err != nil {
+			err = fmt.Errorf("подключение к БД ЭС: %w", err)
+			return
 		}
 		defer writer.Close()
 
 		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
 		if perr := writer.Ping(pingCtx); perr != nil {
-			return 0, 0, 0, fmt.Errorf("проверка подключения к БД ЭС: %w", perr)
+			err = fmt.Errorf("проверка подключения к БД ЭС: %w", perr)
+			return
 		}
 
-		log.Printf("[WEB] принудительная пересинхронизация с ЭС: прибор %s, %s..%s\n",
-			deviceID, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
-		return integration.ForceResyncRange(ctx, repo, writer, cfg, from, to)
+		switch action {
+		case "preview":
+			log.Printf("[WEB] preview принудительной пересинхронизации с ЭС: прибор %s, %s..%s\n",
+				deviceID, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
+			updated, inserted, failed, err = integration.PreviewForceResyncRange(ctx, repo, writer, cfg, from, to)
+			return
+		case "execute":
+			log.Printf("[WEB] ВЫПОЛНЕНИЕ принудительной пересинхронизации с ЭС: прибор %s, %s..%s\n",
+				deviceID, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
+			updated, inserted, failed, err = integration.ForceResyncRange(ctx, repo, writer, cfg, from, to)
+			return
+		default:
+			err = fmt.Errorf("неизвестное действие принудительной пересинхронизации %q", action)
+			return
+		}
 	})
 
 	// Вкладка «Служба» в /admin (добавлено 2026-08-30, прямой запрос
@@ -657,9 +725,9 @@ func runServer() {
 
 // registerOneDevice делает всё, что раньше было одной итерацией
 // последовательного цикла в runServer: открывает транспорт/сессию,
-// собирает паспорт (Akron), выполняет БЛОКИРУЮЩИЙ стартовый дозабор
-// архива, регистрирует прибор в планировщике и запускает northbound/
-// es-sync. Теперь вызывается в СВОЕЙ горутине на каждый прибор (см.
+// собирает паспорт (Akron), регистрирует прибор в планировщике,
+// ставит стартовый дозабор в очередь и запускает es-sync.
+// Теперь вызывается в СВОЕЙ горутине на каждый прибор (см.
 // комментарий в runServer у wg.Wait()) — ошибка/долгий дозабор одного
 // прибора здесь никак не влияет на остальные горутины, вызванные для
 // других приборов.
@@ -704,7 +772,10 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 		log.Printf("[ERROR] прибор %s: не удалось открыть транспорт: %v\n", devRec.ID, err)
 		return
 	}
-	if err := sess.Open(ctx, tr); err != nil {
+	unlockIO := pollcore.LockKey(devRec.ID)
+	err = sess.Open(ctx, tr)
+	unlockIO()
+	if err != nil {
 		log.Printf("[ERROR] ошибка сессии %s: %v\n", devRec.ID, err)
 		return
 	}
@@ -714,7 +785,7 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	if unitID == 0 {
 		unitID = 1
 	}
-	reader := pollcore.New(tr, isTCP, uint8(unitID))
+	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), devRec.ID)
 
 	// Сбор паспорта прибора (заводской номер, тип, версия прошивки) —
 	// ОБЯЗАТЕЛЬНЫЙ шаг для Akron перед запуском приёма данных для ЭС:
@@ -736,22 +807,11 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	if devRec.GapScanWindowHours > 0 {
 		dev.GapScanWindowHours = devRec.GapScanWindowHours
 	}
+	dev.BackfillMaxDepthHours = devRec.BackfillMaxDepthHours
 	devicesMu.Lock()
 	devices[devRec.ID] = dev
 	deviceKinds[devRec.ID] = devRec.Kind
 	devicesMu.Unlock()
-
-	// Same blocking-backfill-before-scheduler-register reasoning as
-	// run.go/serve.go — see those files' identical comment for the
-	// 2026-07-29 incident this order avoids. Долгий дозабор здесь
-	// по-прежнему блокирует РЕГИСТРАЦИЮ ЭТОГО прибора в планировщике —
-	// это не изменилось и не должно меняться — но теперь блокирует
-	// только ЭТУ горутину, не остальные приборы.
-	if len(p.Archives) > 0 {
-		dev.BackfillArchives(ctx, device.BackfillOptions{
-			MaxDepthHours: devRec.BackfillMaxDepthHours,
-		})
-	}
 
 	// Интервал опроса архива зависит от того, КАК прибор сам делит
 	// свой архив на записи — не универсальная константа. ВКМ360
@@ -787,26 +847,19 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	log.Printf("[OK] прибор %s (%s) зарегистрирован (текущие каждые %s, архив каждые %s в HH:%02d)\n",
 		devRec.ID, devRec.Kind, currentInterval, archiveInterval, archiveAtMinute)
 
-	// Per-kind upstream delivery, started right after the device is
-	// registered for southbound polling.
-	//
-	// ИЗМЕНЕНО (2026-08-31, прямой запрос оператора: "переделать опрос
-	// акрона... сделать также как вкм... убрать как атавизм... опрос
-	// через драйвер энергосферы"): раньше Akron получал данные в ЭС
-	// СОВСЕМ ДРУГИМ путём — эмуляцией физического прибора для родного
-	// драйвера ЭС (startAkronNorthboundForDevice, определена ниже,
-	// оставлена в коде НЕЗАКОММЕНТИРОВАННОЙ как функция — но её ВЫЗОВ
-	// здесь закомментирован, вдруг понадобится вернуться к этому пути).
-	// Теперь оба типа приборов идут через ОДИН общий механизм прямой
-	// записи в PointMains (startESyncForDevice) — единственная разница
-	// между ними теперь в самом механизме — сколько точек и откуда
-	// берутся исходные данные (см. buildIntegrationConfig,
-	// internal/integration/energosphere_sync.go).
+	// Startup backfill no longer blocks device registration or server
+	// startup. Queue it through the same scheduler/poller path as other
+	// device work so the normal per-device serialization applies.
+	if len(p.Archives) > 0 {
+		sched.RequestManualPoll(devRec.ID, scheduler.KindBackfill)
+		log.Printf("[INFO] прибор %s: стартовый дозабор поставлен в очередь\n", devRec.ID)
+	}
+
+	// Upstream delivery: both VKM and Akron use the same direct write
+	// path to PointMains. The old Akron device-emulation carrier is not
+	// part of the current `mbgw server` path.
 	switch devRec.Kind {
 	case "akron", "vkm360":
-		// startAkronNorthboundForDevice(ctx, repo, devRec.ID) — старый
-		// путь через эмуляцию прибора для драйвера ЭС, закомментирован,
-		// см. пояснение выше.
 		if trigger := startESyncForDevice(ctx, repo, devRec.ID, devRec.Kind, dbPath); trigger != nil {
 			devicesMu.Lock()
 			esSyncTriggers[devRec.ID] = trigger
@@ -845,53 +898,6 @@ func isPortFree(port int) bool {
 	}
 	_ = ln.Close()
 	return true
-}
-
-// startAkronNorthboundForDevice starts the Akron raw-RTU northbound
-// carrier for one device, IF a listen address has been configured for it
-// (es_akron_northbound row) — mirrors serve()'s cfg.NorthboundAkron
-// opt-in check, just sourced from the DB instead of config.yaml. Runs in
-// its own goroutine; a missing/misconfigured address logs and skips
-// rather than failing the whole server startup, so one bad device
-// doesn't take down polling for every other device.
-//
-// ОТКЛЮЧЕНО (2026-08-31, прямой запрос оператора: "переделать опрос
-// акрона - убрать как атавизм (закомментировать код может когда-то
-// понадобится вернуться к опросу через драйвер энергосферы)"). Функция
-// НЕ УДАЛЕНА и по-прежнему компилируется — только единственный вызов
-// в registerOneDevice закомментирован (ищите "startAkronNorthboundForDevice(ctx,
-// repo, devRec.ID) — старый путь" в этом же файле). Akron теперь
-// получает данные в ЭС ТЕМ ЖЕ путём, что и ВКМ — прямой записью в
-// PointMains через startESyncForDevice, см. buildIntegrationConfig
-// выше. Если когда-нибудь понадобится вернуться к эмуляции прибора для
-// родного драйвера ЭС — раскомментировать тот один вызов, эта функция
-// уже готова к работе как есть.
-func startAkronNorthboundForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID string) {
-	addr, found, err := repo.GetAkronNorthboundAddr(ctx, deviceID)
-	if err != nil {
-		log.Printf("[ERROR] прибор %s: ошибка чтения адреса northbound: %v\n", deviceID, err)
-		return
-	}
-	if !found || addr == "" {
-		log.Printf("[INFO] прибор %s: адрес northbound не настроен — carrier не запущен\n", deviceID)
-		return
-	}
-
-	logPath := deviceID + "_akron_live.jsonl"
-	dlog, err := northbound.NewDiscoveryLog(logPath)
-	if err != nil {
-		log.Printf("[ERROR] прибор %s: northbound: %v\n", deviceID, err)
-		return
-	}
-
-	srv := northbound.NewAkronLiveServer(addr, dlog, repo, deviceID)
-	go func() {
-		defer dlog.Close()
-		log.Printf("[OK] northbound (Akron carrier) для %s: слушаем %s (лог: %s)\n", deviceID, addr, logPath)
-		if err := srv.Listen(ctx); err != nil {
-			log.Printf("[ERROR] northbound (Akron carrier) %s: %v\n", deviceID, err)
-		}
-	}()
 }
 
 // startESyncForDevice starts the ВКМ→Энергосфера direct-DB sync loop for
@@ -986,6 +992,7 @@ func buildIntegrationConfig(ctx context.Context, repo *sqliterepo.Repo, deviceID
 		}
 		cfg.Points = append(cfg.Points, integration.PointMapping{
 			Tag: ch.Tag, PointID: ch.ESChannelID, Factor: factor, Label: label,
+			MinValue: ch.MinValue, MaxValue: ch.MaxValue,
 		})
 	}
 	cfg.IntervalSec = 60

@@ -56,11 +56,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"strconv"
 	"strings"
 	"time"
 
+	"mbgw/internal/health"
+	"mbgw/internal/interval"
 	sqliterepo "mbgw/internal/storage/sqlite"
 )
 
@@ -73,6 +76,11 @@ type PointMapping struct {
 	PointID int    // ID_PP в PointMains
 	Factor  float64
 	Label   string // человекочитаемое название для лога
+
+	// Optional safety range applied to the FINAL value, after Factor and
+	// all counter/interval conversion. nil means that side is disabled.
+	MinValue *float64
+	MaxValue *float64
 }
 
 // Config holds everything the sync needs that must not be baked into the
@@ -108,17 +116,12 @@ type Config struct {
 	BackfillHours int
 	DryRun        bool
 
-	// TimeShiftMinutes — сдвиг метки времени (в минутах), применяемый к
-	// DT ПЕРЕД записью в PointMains. Подробное объяснение, зачем это
-	// нужно и почему значение настраиваемое, а не захардкоженное — см.
-	// ESConnection.TimeShiftMinutes в internal/storage/sqlite/
-	// repo_device_config.go. 0 = без сдвига (поведение по умолчанию, как
-	// было до появления этой настройки).
+	// TimeShiftMinutes — общий сдвиг метки времени перед записью в
+	// PointMains. Применяется и к ВКМ, и к Akron.
 	//
-	// ТОЛЬКО ДЛЯ ВКМ (найдено оператором живьём, 2026-09-02): применяется
-	// в collectVKMReadings, но НЕ в collectAkronReadings — значение
-	// подобрано эмпирически специально для ВКМ, нет оснований считать
-	// его верным для Akron с его совсем другим источником данных.
+	// 0 = без сдвига. Отрицательное значение сдвигает метку назад.
+	// Для текущей ЭС живьём подтверждена необходимость коррекции -90 минут
+	// как для ВКМ, так и для Akron.
 	TimeShiftMinutes int
 }
 
@@ -308,6 +311,10 @@ func RunEnergosphereSync(ctx context.Context, sqlitePath string, cfg Config, tri
 	}
 	defer repo.Close()
 
+	if err := repo.InitESSyncCursorSchema(ctx); err != nil {
+		return fmt.Errorf("init ES sync cursor: %w", err)
+	}
+
 	writer, err := OpenPointMainsWriter(SQLServerConfig{
 		Server:   cfg.SQLServer,
 		Database: cfg.SQLDatabase,
@@ -320,13 +327,45 @@ func RunEnergosphereSync(ctx context.Context, sqlitePath string, cfg Config, tri
 	}
 	defer writer.Close()
 
-	pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err = writer.Ping(pingCtx)
-	cancel()
-	if err != nil {
-		return fmt.Errorf("подключение к БД ЭС не удалось (проверь настройки подключения: сервер/база/логин/пароль): %w", err)
+	// БД ЭС может быть недоступна в момент старта mbgw. Это не должно
+	// навсегда убивать worker синхронизации: локальный сбор продолжает
+	// работать, а здесь ждём восстановления ЭС с ограниченным backoff.
+	retryDelay := 5 * time.Second
+	for {
+		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err = writer.Ping(pingCtx)
+		cancel()
+
+		if err == nil {
+			log.Printf("[es-sync] подключение к БД ЭС OK: сервер=%s база=%s логин=%s\n", cfg.SQLServer, cfg.SQLDatabase, cfg.SQLUser)
+			break
+		}
+
+		if ctx.Err() != nil {
+			log.Println("[es-sync] остановлен до восстановления подключения к БД ЭС")
+			return nil
+		}
+
+		log.Printf("[es-sync] БД ЭС недоступна: %v; повтор через %s\n", err, retryDelay)
+
+		timer := time.NewTimer(retryDelay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			log.Println("[es-sync] остановлен до восстановления подключения к БД ЭС")
+			return nil
+		case <-timer.C:
+		}
+
+		if retryDelay < 30*time.Second {
+			retryDelay *= 2
+			if retryDelay > 30*time.Second {
+				retryDelay = 30 * time.Second
+			}
+		}
 	}
-	log.Printf("[es-sync] подключение к БД ЭС OK: сервер=%s база=%s логин=%s\n", cfg.SQLServer, cfg.SQLDatabase, cfg.SQLUser)
 
 	if cfg.Kind == "vkm360" {
 		if n, oldest, newest, found, err := repo.CountVKMRaw(ctx, cfg.DeviceID, cfg.Pipe); err != nil {
@@ -371,6 +410,23 @@ type pointReading struct {
 	value   float64
 }
 
+// validatePointReading is the final safety barrier immediately before
+// writing a calculated value to ЭС. Ranges are optional/configurable;
+// NaN/Inf are always rejected because SQL/financial data must never
+// receive a non-finite measurement.
+func validatePointReading(r pointReading) error {
+	if math.IsNaN(r.value) || math.IsInf(r.value, 0) {
+		return fmt.Errorf("неконечное значение %g", r.value)
+	}
+	if r.mapping.MinValue != nil && r.value < *r.mapping.MinValue {
+		return fmt.Errorf("значение %g ниже минимума %g", r.value, *r.mapping.MinValue)
+	}
+	if r.mapping.MaxValue != nil && r.value > *r.mapping.MaxValue {
+		return fmt.Errorf("значение %g выше максимума %g", r.value, *r.mapping.MaxValue)
+	}
+	return nil
+}
+
 // collectVKMReadings читает диапазон сырых строк архива ВКМ и извлекает
 // из каждой все теги, перечисленные в cfg.Points — тот же путь, что был
 // и раньше, просто вынесен в отдельную функцию, чтобы runPointSyncOnce
@@ -400,27 +456,32 @@ func collectVKMReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, 
 	return out, nil
 }
 
-// collectAkronReadings reads hourly Akron snapshots from archive_hourly.
-// For tag V, archive_hourly stores a cumulative totalizer value, not an
-// already calculated hourly volume. Energosphere therefore receives the
-// delta between two adjacent hourly snapshots:
+// collectAkronReadings читает часовые снимки Akron из archive_hourly.
 //
-//	V(17:00) - V(16:00) = volume for the 16:00..17:00 interval.
+// Для тега V archive_hourly хранит накопительный счётчик, поэтому расход
+// за час вычисляется как разность двух соседних часовых снимков:
 //
-// One hour before the requested range is loaded as the baseline needed to
-// calculate the first requested delta. If two snapshots are not exactly one
-// hour apart, or the cumulative counter decreases, that point is skipped.
-// This prevents assigning several hours of consumption to a single hour and
-// prevents sending a negative value.
+//	V(17:00) - V(16:00) = расход за интервал 16:00..17:00.
 //
-// cfg.TimeShiftMinutes is intentionally NOT applied to Akron. That shift was
-// verified for VKM only and must not be transferred to Akron without a
-// separate verification.
+// Энергосфера хранит объём в получасовых интервалах. Поэтому полученный
+// часовой расход делится поровну между двумя получасовками:
+//
+//	100 м3 за 16:00..17:00 -> 50 м3 на 16:30 и 50 м3 на 17:00.
+//
+// Метка означает КОНЕЦ интервала. После формирования получасовых меток
+// к каждой из них применяется cfg.TimeShiftMinutes.
+//
+// Если между соседними снимками не ровно один час или накопительный
+// счётчик уменьшился, такой час пропускается: нельзя приписывать расход
+// нескольких часов одному интервалу или отправлять отрицательный объём.
 func collectAkronReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, from, now time.Time) ([]pointReading, error) {
 	var out []pointReading
+	shift := time.Duration(cfg.TimeShiftMinutes) * time.Minute
+
 	for _, m := range cfg.Points {
 		queryFrom := from
 		if m.Tag == "V" {
+			// Для расчёта первой дельты нужна предыдущая часовая точка.
 			queryFrom = from.Add(-time.Hour)
 		}
 
@@ -429,16 +490,17 @@ func collectAkronReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config
 			return nil, err
 		}
 
+		// Защитная ветка на случай появления у Akron параметров,
+		// которые уже являются готовыми интервальными значениями.
 		if m.Tag != "V" {
-			// ащитная ветка на случай будущих некумулятивных параметров
-			// Akron: для них значение можно передавать напрямую.
 			for _, row := range rows {
 				if row.TsHour.Before(from) {
 					continue
 				}
+
 				out = append(out, pointReading{
 					mapping: m,
-					ts:      row.TsHour,
+					ts:      row.TsHour.Add(shift),
 					value:   row.Value * m.Factor,
 				})
 			}
@@ -451,29 +513,45 @@ func collectAkronReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config
 
 		for _, row := range rows {
 			if havePrev && !row.TsHour.Before(from) {
-				if row.TsHour.Sub(prevTS) == time.Hour {
-					delta := row.Value - prevValue
-					if delta >= 0 {
-						out = append(out, pointReading{
+				delta, ok := interval.CounterDelta(
+					prevTS, prevValue,
+					row.TsHour, row.Value,
+					time.Hour,
+				)
+				if ok {
+					half := delta * m.Factor / 2
+
+					// row.TsHour — конец часового интервала.
+					// Создаём две получасовые точки: HH:30 и следующий HH:00.
+					firstHalfEnd := row.TsHour.Add(-30 * time.Minute).Add(shift)
+					secondHalfEnd := row.TsHour.Add(shift)
+
+					out = append(out,
+						pointReading{
 							mapping: m,
-							ts:      row.TsHour,
-							value:   delta * m.Factor,
-						})
-					} else {
-						log.Printf(
-							"[es-sync] Akron %s: пропуск %s — накопительный V уменьшился: %g -> %g\n",
-							cfg.DeviceID,
-							row.TsHour.Format("02.01.2006 15:04"),
-							prevValue,
-							row.Value,
-						)
-					}
-				} else {
+							ts:      firstHalfEnd,
+							value:   half,
+						},
+						pointReading{
+							mapping: m,
+							ts:      secondHalfEnd,
+							value:   half,
+						},
+					)
+				} else if row.TsHour.Sub(prevTS) != time.Hour {
 					log.Printf(
 						"[es-sync] Akron %s: пропуск %s — нет соседнего часового снимка перед ним (предыдущий %s)\n",
 						cfg.DeviceID,
 						row.TsHour.Format("02.01.2006 15:04"),
 						prevTS.Format("02.01.2006 15:04"),
+					)
+				} else {
+					log.Printf(
+						"[es-sync] Akron %s: пропуск %s — накопительный V уменьшился: %g -> %g\n",
+						cfg.DeviceID,
+						row.TsHour.Format("02.01.2006 15:04"),
+						prevValue,
+						row.Value,
 					)
 				}
 			}
@@ -483,6 +561,7 @@ func collectAkronReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config
 			havePrev = true
 		}
 	}
+
 	return out, nil
 }
 
@@ -499,13 +578,56 @@ func collectReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, fro
 	}
 }
 
-// runPointSyncOnce — один проход синхронизации: читает всё, что успело
-// накопиться локально за окно BackfillHours, и записывает в PointMains
-// то, чего там ещё нет. ОБЩАЯ для обоих типов приборов — различие
-// только в том, откуда берутся кандидаты на запись (collectReadings).
+// runPointSyncOnce — обычный автоматический проход синхронизации.
+//
+// Первый проход для точки, у которой ещё нет cursor, смотрит назад на
+// cfg.BackfillHours. После подтверждённой записи/наличия точки в ЭС
+// сохраняется cursor по (device, ID_PP), и следующие проходы читают
+// локальный архив только от самого раннего подтверждённого cursor.
+//
+// ВАЖНО: cursor двигается только после подтверждения конкретной точки:
+// PointExists=true, успешный InsertPoint или duplicate-key (то есть точка
+// уже успела появиться). Если на одной точке возникла ошибка, дальнейшие
+// более новые значения ЭТОЙ ЖЕ точки в текущем проходе не двигают cursor
+// через дырку. Остальные точки продолжают работать независимо.
+//
+// ForceResyncRange ниже cursor намеренно не использует и не двигает.
 func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointMainsWriter, cfg Config) {
 	now := time.Now()
-	from := now.Add(-time.Duration(cfg.BackfillHours) * time.Hour)
+	fallbackFrom := now.Add(-time.Duration(cfg.BackfillHours) * time.Hour)
+
+	cursors := make(map[int]time.Time)
+	allHaveCursor := len(cfg.Points) > 0
+	var earliestSourceCursor time.Time
+	shift := time.Duration(cfg.TimeShiftMinutes) * time.Minute
+
+	for _, m := range cfg.Points {
+		cur, found, err := repo.GetESSyncCursor(ctx, cfg.DeviceID, m.PointID)
+		if err != nil {
+			log.Printf("[es-sync] чтение cursor (%s ID_PP=%d): %v\n", m.Label, m.PointID, err)
+			allHaveCursor = false
+			continue
+		}
+		if !found {
+			allHaveCursor = false
+			continue
+		}
+
+		cursors[m.PointID] = cur
+
+		// Cursor хранит уже СДВИНУТУЮ метку ЭС. collectReadings принимает
+		// диапазон в шкале локального архива, поэтому сдвиг разворачиваем
+		// обратно только для выбора нижней границы чтения.
+		sourceCursor := cur.Add(-shift)
+		if earliestSourceCursor.IsZero() || sourceCursor.Before(earliestSourceCursor) {
+			earliestSourceCursor = sourceCursor
+		}
+	}
+
+	from := fallbackFrom
+	if allHaveCursor && !earliestSourceCursor.IsZero() {
+		from = earliestSourceCursor
+	}
 
 	readings, err := collectReadings(ctx, repo, cfg, from, now)
 	if err != nil {
@@ -516,45 +638,130 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 		return
 	}
 
-	var inserted, skipped, failed int
-	for _, r := range readings {
-		present, err := writer.PointExists(ctx, r.mapping.PointID, r.ts)
-		if err != nil {
-			log.Printf("[es-sync] проверка наличия точки (%s ID_PP=%d %s): %v\n",
+	var inserted, skipped, skippedByCursor, failed int
+	blocked := make(map[int]bool)
+
+	advanceCursor := func(r pointReading) bool {
+		if err := repo.SetESSyncCursor(ctx, cfg.DeviceID, r.mapping.PointID, r.ts); err != nil {
+			log.Printf("[es-sync] запись cursor (%s ID_PP=%d %s): %v\n",
 				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), err)
 			failed++
+			blocked[r.mapping.PointID] = true
+			return false
+		}
+		cursors[r.mapping.PointID] = r.ts
+		return true
+	}
+
+	for _, r := range readings {
+		pointID := r.mapping.PointID
+
+		if cur, ok := cursors[pointID]; ok && !r.ts.After(cur) {
+			skippedByCursor++
+			continue
+		}
+
+		// Не перескакиваем cursor через ошибку более раннего значения
+		// этой же точки. Иначе дырка стала бы невидимой навсегда.
+		if blocked[pointID] {
+			continue
+		}
+
+		if err := validatePointReading(r); err != nil {
+			log.Printf("[es-sync] БЛОКИРОВКА записи (%s ID_PP=%d %s): %v\n",
+				r.mapping.Label, pointID, r.ts.Format("02.01 15:04"), err)
+			failed++
+			blocked[pointID] = true
+			continue
+		}
+
+		present, err := writer.PointExists(ctx, pointID, r.ts)
+		if err != nil {
+			log.Printf("[es-sync] проверка наличия точки (%s ID_PP=%d %s): %v\n",
+				r.mapping.Label, pointID, r.ts.Format("02.01 15:04"), err)
+			failed++
+			blocked[pointID] = true
 			continue
 		}
 		if present {
 			skipped++
+			advanceCursor(r)
 			continue
 		}
 
 		if cfg.DryRun {
 			log.Printf("[es-sync] DRY-RUN записал бы: %s ID_PP=%d %s value=%g\n",
-				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01.2006 15:04"), r.value)
+				r.mapping.Label, pointID, r.ts.Format("02.01.2006 15:04"), r.value)
 			inserted++
+			// DRY-RUN ничего не подтвердил в ЭС, поэтому cursor не двигаем.
 			continue
 		}
 
 		// state=0 ("достоверно") hardcoded — see package doc's "KNOWN GAP".
-		if err := writer.InsertPoint(ctx, r.mapping.PointID, r.ts, r.value, 0); err != nil {
+		if err := writer.InsertPoint(ctx, pointID, r.ts, r.value, 0); err != nil {
 			if IsDuplicateKeyError(err) {
 				skipped++
+				advanceCursor(r)
 				continue
 			}
 			log.Printf("[es-sync] запись (%s ID_PP=%d %s): %v\n",
-				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), err)
+				r.mapping.Label, pointID, r.ts.Format("02.01 15:04"), err)
 			failed++
+			blocked[pointID] = true
 			continue
 		}
+
 		inserted++
+		health.MarkESWriteSuccess(cfg.DeviceID, time.Now())
+		advanceCursor(r)
 	}
+
 	if inserted > 0 || failed > 0 {
-		log.Printf("[es-sync] проход завершён: записано %d, пропущено (уже есть) %d, ошибок %d, окно %s..%s\n",
-			inserted, skipped, failed,
+		log.Printf("[es-sync] проход завершён: записано %d, пропущено (уже есть) %d, пропущено по cursor %d, ошибок %d, окно %s..%s\n",
+			inserted, skipped, skippedByCursor, failed,
 			from.Format("02.01 15:04"), now.Format("02.01 15:04"))
 	}
+}
+
+// PreviewForceResyncRange performs the same source read and safety
+// validation as ForceResyncRange, but does NOT change PointMains.
+//
+// It answers the operator's key question before a destructive resync:
+// how many values would overwrite existing rows, how many would be new
+// inserts, and how many are blocked by validation or DB-check errors.
+func PreviewForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointMainsWriter, cfg Config, from, to time.Time) (wouldUpdate, wouldInsert, blocked int, err error) {
+	readings, err := collectReadings(ctx, repo, cfg, from, to)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("чтение исходной БД: %w", err)
+	}
+	if len(readings) == 0 {
+		return 0, 0, 0, nil
+	}
+
+	for _, r := range readings {
+		if verr := validatePointReading(r); verr != nil {
+			blocked++
+			continue
+		}
+
+		present, perr := writer.PointExists(ctx, r.mapping.PointID, r.ts)
+		if perr != nil {
+			log.Printf("[es-sync] preview: ошибка проверки точки (%s ID_PP=%d %s): %v\n",
+				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), perr)
+			blocked++
+			continue
+		}
+		if present {
+			wouldUpdate++
+		} else {
+			wouldInsert++
+		}
+	}
+
+	log.Printf("[es-sync] preview принудительной пересинхронизации: будет переписано %d, вставлено %d, заблокировано/ошибок %d, окно %s..%s\n",
+		wouldUpdate, wouldInsert, blocked, from.Format("02.01 15:04"), to.Format("02.01 15:04"))
+
+	return wouldUpdate, wouldInsert, blocked, nil
 }
 
 // ForceResyncRange принудительно ПЕРЕЗАПИСЫВАЕТ (не пропускает уже
@@ -591,6 +798,13 @@ func ForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 	}
 
 	for _, r := range readings {
+		if verr := validatePointReading(r); verr != nil {
+			log.Printf("[es-sync] БЛОКИРОВКА принудительной записи (%s ID_PP=%d %s): %v\n",
+				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), verr)
+			failed++
+			continue
+		}
+
 		affected, uerr := writer.UpdatePoint(ctx, r.mapping.PointID, r.ts, r.value, 0)
 		if uerr != nil {
 			log.Printf("[es-sync] принудительная перезапись (%s ID_PP=%d %s): %v\n",
@@ -600,6 +814,7 @@ func ForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 		}
 		if affected > 0 {
 			updated++
+			health.MarkESWriteSuccess(cfg.DeviceID, time.Now())
 			continue
 		}
 
@@ -610,6 +825,7 @@ func ForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 				// InsertPoint — не беда, пробуем перезаписать ещё раз.
 				if _, uerr2 := writer.UpdatePoint(ctx, r.mapping.PointID, r.ts, r.value, 0); uerr2 == nil {
 					updated++
+					health.MarkESWriteSuccess(cfg.DeviceID, time.Now())
 					continue
 				}
 			}
@@ -619,6 +835,7 @@ func ForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 			continue
 		}
 		inserted++
+		health.MarkESWriteSuccess(cfg.DeviceID, time.Now())
 	}
 
 	log.Printf("[es-sync] принудительная пересинхронизация завершена: переписано %d, вставлено новых %d, ошибок %d, окно %s..%s\n",

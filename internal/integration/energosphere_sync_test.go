@@ -18,34 +18,34 @@ func newIntegrationTestRepo(t *testing.T) *sqliterepo.Repo {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = repo.Close() })
+
+	t.Cleanup(func() {
+		_ = repo.Close()
+	})
 
 	if err := repo.InitArchiveSchema(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+
 	return repo
 }
 
 func saveAkronV(t *testing.T, repo *sqliterepo.Repo, ts time.Time, value float64) {
 	t.Helper()
 
-	if err := repo.SaveHourlyArchive(
-		context.Background(),
-		storage.HourlyArchiveRecord{
-			DeviceID: "osmos",
-			Param:    "V",
-			TsHour:   ts,
-			Value:    value,
-			Unit:     "m3",
-		},
-	); err != nil {
+	if err := repo.SaveHourlyArchive(context.Background(), storage.HourlyArchiveRecord{
+		DeviceID: "osmos",
+		Param:    "V",
+		TsHour:   ts,
+		Value:    value,
+		Unit:     "m3",
+	}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestCollectAkronReadingsUsesHourlyDeltaNotTotalizer(t *testing.T) {
+func TestCollectAkronReadingsSplitsHourlyDeltaIntoHalfHoursAndAppliesShift(t *testing.T) {
 	repo := newIntegrationTestRepo(t)
-
 	loc := time.Local
 
 	t16 := time.Date(2026, 9, 2, 16, 0, 0, 0, loc)
@@ -60,8 +60,9 @@ func TestCollectAkronReadingsUsesHourlyDeltaNotTotalizer(t *testing.T) {
 		context.Background(),
 		repo,
 		Config{
-			DeviceID: "osmos",
-			Kind:     "akron",
+			DeviceID:         "osmos",
+			Kind:             "akron",
+			TimeShiftMinutes: -90,
 			Points: []PointMapping{
 				{
 					Tag:     "V",
@@ -77,30 +78,47 @@ func TestCollectAkronReadingsUsesHourlyDeltaNotTotalizer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(got) != 2 {
-		t.Fatalf("want 2 readings, got %d: %#v", len(got), got)
+	if len(got) != 4 {
+		t.Fatalf("want 4 half-hour readings, got %d: %#v", len(got), got)
 	}
 
-	if !got[0].ts.Equal(t17) || math.Abs(got[0].value-244) > 1e-9 {
-		t.Fatalf(
-			"17:00: want delta 244, got ts=%v value=%g",
-			got[0].ts,
-			got[0].value,
-		)
+	wantTS := []time.Time{
+		time.Date(2026, 9, 2, 15, 0, 0, 0, loc),
+		time.Date(2026, 9, 2, 15, 30, 0, 0, loc),
+		time.Date(2026, 9, 2, 16, 0, 0, 0, loc),
+		time.Date(2026, 9, 2, 16, 30, 0, 0, loc),
 	}
 
-	if !got[1].ts.Equal(t18) || math.Abs(got[1].value-130) > 1e-9 {
-		t.Fatalf(
-			"18:00: want delta 130, got ts=%v value=%g",
-			got[1].ts,
-			got[1].value,
-		)
+	wantValue := []float64{
+		122,
+		122,
+		65,
+		65,
+	}
+
+	for i := range wantTS {
+		if !got[i].ts.Equal(wantTS[i]) {
+			t.Fatalf(
+				"reading %d: want ts=%v, got %v",
+				i,
+				wantTS[i],
+				got[i].ts,
+			)
+		}
+
+		if math.Abs(got[i].value-wantValue[i]) > 1e-9 {
+			t.Fatalf(
+				"reading %d: want value=%g, got %g",
+				i,
+				wantValue[i],
+				got[i].value,
+			)
+		}
 	}
 }
 
 func TestCollectAkronReadingsDoesNotCollapseGapIntoOneHour(t *testing.T) {
 	repo := newIntegrationTestRepo(t)
-
 	loc := time.Local
 
 	t16 := time.Date(2026, 9, 2, 16, 0, 0, 0, loc)

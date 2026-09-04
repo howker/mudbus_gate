@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"mbgw/internal/devicestatus"
+	"mbgw/internal/health"
 )
 
 // api_dashboard.go implements GET /api/dashboard — one row per configured
@@ -64,6 +65,20 @@ type dashboardDeviceStatus struct {
 	TimeDriftNote      string  `json:"time_drift_note,omitempty"`
 	TimeDriftCheckedAt string  `json:"time_drift_checked_at,omitempty"`
 
+	// Useful-work heartbeat. Empty timestamp means that kind of successful
+	// work has not been confirmed since process start.
+	LastCurrentSuccess string `json:"last_current_success,omitempty"`
+	LastArchiveSuccess string `json:"last_archive_success,omitempty"`
+	LastESWriteSuccess string `json:"last_es_write_success,omitempty"`
+
+	// Process-level health is repeated in every row deliberately so the
+	// existing dashboard JSON shape remains backward compatible (an array
+	// of devices) while the UI can still surface system health.
+	PollerLastCycle string `json:"poller_last_cycle,omitempty"`
+	SQLiteCheckedAt string `json:"sqlite_checked_at,omitempty"`
+	SQLiteOK        bool   `json:"sqlite_ok"`
+	SQLiteError     string `json:"sqlite_error,omitempty"`
+
 	SyncSupported bool `json:"sync_supported"`
 }
 
@@ -80,6 +95,7 @@ func (s *Server) handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	drifts := devicestatus.All()
+	healthSnapshot := health.Get()
 
 	out := make([]dashboardDeviceStatus, 0, len(devices))
 	for _, dev := range devices {
@@ -109,6 +125,26 @@ func (s *Server) handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 				st.TimeDriftSeconds = d.DriftSeconds
 			}
 		}
+
+		if h, ok := healthSnapshot.Devices[dev.ID]; ok {
+			if !h.LastCurrentSuccess.IsZero() {
+				st.LastCurrentSuccess = h.LastCurrentSuccess.Format("02.01.2006 15:04:05")
+			}
+			if !h.LastArchiveSuccess.IsZero() {
+				st.LastArchiveSuccess = h.LastArchiveSuccess.Format("02.01.2006 15:04:05")
+			}
+			if !h.LastESWriteSuccess.IsZero() {
+				st.LastESWriteSuccess = h.LastESWriteSuccess.Format("02.01.2006 15:04:05")
+			}
+		}
+		if !healthSnapshot.PollerLastCycle.IsZero() {
+			st.PollerLastCycle = healthSnapshot.PollerLastCycle.Format("02.01.2006 15:04:05")
+		}
+		if !healthSnapshot.SQLiteCheckedAt.IsZero() {
+			st.SQLiteCheckedAt = healthSnapshot.SQLiteCheckedAt.Format("02.01.2006 15:04:05")
+		}
+		st.SQLiteOK = healthSnapshot.SQLiteOK
+		st.SQLiteError = healthSnapshot.SQLiteError
 
 		out = append(out, st)
 	}

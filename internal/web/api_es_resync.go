@@ -18,8 +18,9 @@ import (
 // уже существующее.
 type forceResyncRequest struct {
 	DeviceID string `json:"device_id"`
-	From     string `json:"from"` // формат ГГГГ-ММ-ДДTЧЧ:ММ, локальное время сервера
-	To       string `json:"to"`   // тот же формат; пусто = до "сейчас"
+	From     string `json:"from"`   // формат ГГГГ-ММ-ДДTЧЧ:ММ, локальное время сервера
+	To       string `json:"to"`     // тот же формат; пусто = до "сейчас"
+	Action   string `json:"action"` // "preview" | "execute"; обязательно явно
 }
 
 func (s *Server) handleForceResyncES(w http.ResponseWriter, r *http.Request) {
@@ -41,6 +42,10 @@ func (s *Server) handleForceResyncES(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "поле device_id обязательно")
 		return
 	}
+	if req.Action != "preview" && req.Action != "execute" {
+		writeError(w, http.StatusBadRequest, `поле action должно быть "preview" или "execute"`)
+		return
+	}
 	from, err := time.ParseInLocation("2006-01-02T15:04", req.From, time.Local)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "поле from должно быть в формате ГГГГ-ММ-ДДЧЧ:ММ")
@@ -54,14 +59,19 @@ func (s *Server) handleForceResyncES(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if to.Before(from) {
+		writeError(w, http.StatusBadRequest, "поле to не может быть раньше from")
+		return
+	}
 
-	updated, inserted, failed, err := s.onForceResyncES(r.Context(), req.DeviceID, from, to)
+	updated, inserted, failed, err := s.onForceResyncES(r.Context(), req.DeviceID, from, to, req.Action)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":       true,
+		"action":   req.Action,
 		"updated":  updated,
 		"inserted": inserted,
 		"failed":   failed,
@@ -71,4 +81,4 @@ func (s *Server) handleForceResyncES(w http.ResponseWriter, r *http.Request) {
 // ForceResyncESFunc matches SetForceResyncES's parameter — separated as
 // a named type only so server.go's field declaration and this file's
 // usage stay readable.
-type ForceResyncESFunc func(ctx context.Context, deviceID string, from, to time.Time) (updated, inserted, failed int, err error)
+type ForceResyncESFunc func(ctx context.Context, deviceID string, from, to time.Time, action string) (updated, inserted, failed int, err error)
