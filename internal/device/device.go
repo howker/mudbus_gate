@@ -9,7 +9,9 @@ import (
 
 	"mbgw/internal/archive"
 	"mbgw/internal/codec"
+	"mbgw/internal/devicestatus"
 	"mbgw/internal/errs"
+	"mbgw/internal/health"
 	"mbgw/internal/lease"
 	"mbgw/internal/pointresolver"
 	"mbgw/internal/profile"
@@ -60,9 +62,15 @@ type Device struct {
 
 	// GapScanWindowHours, when > 0, makes each archive poll finish by
 	// patching any missing hours in the last N hours (see GapScan). 0
-	// disables it. Set from config (DeviceConfig.Backfill); left 0 by the
-	// plain New() constructor so existing callers are unaffected.
+	// disables it. Set from config; left 0 by New() so existing callers
+	// are unaffected.
 	GapScanWindowHours int
+
+	// BackfillMaxDepthHours is the configured startup/manual deep-backfill
+	// limit for this device. poller.KindBackfill calls BackfillArchives
+	// without explicit options, so BackfillArchives uses this value as its
+	// default. 0 keeps the existing "use physical buffer depth" behaviour.
+	BackfillMaxDepthHours int
 }
 
 func New(id string, p *profile.Profile, cli PointClient, sess session.Session, repo storage.Repo, l *lease.LocalLease) *Device {
@@ -196,6 +204,7 @@ func (d *Device) detectFirmwareVariant(ctx context.Context) {
 // (exported so internal/poller can drive it centrally; Device.Start
 // still exists for standalone/single-device use and calls this too).
 func (d *Device) Poll(ctx context.Context) {
+	d.updateTimeDrift(ctx)
 	statusValues := d.collectStatusValues(ctx)
 
 	for _, pt := range d.Profile.Points {
@@ -238,6 +247,117 @@ func (d *Device) Poll(ctx context.Context) {
 			d.pollOnePoint(ctx, pt, addr, fmt.Sprintf("%d", i), statusValues)
 		}
 	}
+}
+
+// updateTimeDrift publishes the current meter clock state for the
+// dashboard.
+//
+// Akron has a live-confirmed read-only clock block: function 03,
+// registers 0x10..0x13. All 8 bytes are read in ONE transaction, so the
+// date/time fields cannot come from different seconds. Server time is
+// sampled immediately before and after that transaction and the
+// transaction midpoint is used as the comparison point, removing most
+// request/response latency bias.
+//
+// VKM is deliberately reported as "не определено" here. Its archive
+// Time= label is the archive period boundary, not the current wall clock;
+// using it caused the false stable +0 sec shown by the old dashboard.
+// A live-confirmed safe current-clock read for VKM can replace this
+// explicit unknown state later.
+func (d *Device) updateTimeDrift(ctx context.Context) {
+	if !d.hasAkronArchive() {
+		devicestatus.Set(d.ID, devicestatus.TimeDrift{
+			CheckedAt: time.Now(),
+			Reliable:  false,
+			Note:      "текущее время ВКМ не читается: архивная метка периода не является текущими часами прибора",
+		})
+		return
+	}
+
+	before := time.Now()
+	resp, err := d.Client.Transact(ctx, []byte{0x03, 0x00, 0x10, 0x00, 0x04})
+	after := time.Now()
+	midpoint := before.Add(after.Sub(before) / 2)
+
+	if err != nil {
+		devicestatus.Set(d.ID, devicestatus.TimeDrift{
+			CheckedAt: midpoint,
+			Reliable:  false,
+			Note:      "не удалось прочитать текущие часы Akron: " + err.Error(),
+		})
+		return
+	}
+
+	deviceTime, err := decodeAkronClockResponse(resp, time.Local)
+	if err != nil {
+		devicestatus.Set(d.ID, devicestatus.TimeDrift{
+			CheckedAt: midpoint,
+			Reliable:  false,
+			Note:      "не удалось разобрать текущие часы Akron: " + err.Error(),
+		})
+		return
+	}
+
+	devicestatus.Set(d.ID, devicestatus.TimeDrift{
+		CheckedAt:    midpoint,
+		DriftSeconds: deviceTime.Sub(midpoint).Seconds(),
+		Reliable:     true,
+	})
+}
+
+func (d *Device) hasAkronArchive() bool {
+	for _, a := range d.Profile.Archives {
+		if a.Strategy == "akron_archive" {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeAkronClockResponse(resp []byte, loc *time.Location) (time.Time, error) {
+	// Standard Read Holding Registers response PDU:
+	// [0x03][byteCount=8][sec][min][hour][dow][day][month][year][id/am]
+	if len(resp) < 10 {
+		return time.Time{}, fmt.Errorf("короткий ответ: %d байт, нужно минимум 10", len(resp))
+	}
+	if resp[0] != 0x03 {
+		return time.Time{}, fmt.Errorf("неожиданная функция 0x%02X вместо 0x03", resp[0])
+	}
+	if resp[1] < 8 {
+		return time.Time{}, fmt.Errorf("byte count=%d, нужно минимум 8", resp[1])
+	}
+
+	data := resp[2:10]
+	sec, e1 := codec.DecodeBCDByte(data[0])
+	min, e2 := codec.DecodeBCDByte(data[1])
+	hour, e3 := codec.DecodeBCDByte(data[2])
+	day, e4 := codec.DecodeBCDByte(data[4])
+	month, e5 := codec.DecodeBCDByte(data[5])
+	year, e6 := codec.DecodeBCDByte(data[6])
+
+	for _, err := range []error{e1, e2, e3, e4, e5, e6} {
+		if err != nil {
+			return time.Time{}, err
+		}
+	}
+
+	if sec > 59 || min > 59 || hour > 23 || month < 1 || month > 12 || day < 1 || day > 31 {
+		return time.Time{}, fmt.Errorf(
+			"время вне диапазона: %02d.%02d.20%02d %02d:%02d:%02d",
+			day, month, year, hour, min, sec,
+		)
+	}
+
+	fullYear := 2000 + year
+	t := time.Date(fullYear, time.Month(month), day, hour, min, sec, 0, loc)
+	if t.Year() != fullYear || int(t.Month()) != month || t.Day() != day {
+		return time.Time{}, fmt.Errorf(
+			"некорректная календарная дата: %02d.%02d.%04d",
+			day, month, fullYear,
+		)
+	}
+
+	return t, nil
 }
 
 // pollOnePoint reads, decodes, and saves a single point at a resolved
@@ -338,6 +458,7 @@ func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, i
 		log.Printf("[%s] ошибка сохранения: %v\n", d.ID, err)
 		return
 	}
+	health.MarkCurrentSuccess(d.ID, reading.Timestamp)
 
 	if instance != "" {
 		log.Printf("[%s] [SAVE] %s[%s] = %v %s\n", d.ID, pt.Name, instance, val, pt.Unit)
@@ -436,6 +557,9 @@ func (d *Device) PollArchives(ctx context.Context) {
 		if a.Strategy == "akron_archive" {
 			if kind, _ := a.Params["archive_kind"].(string); kind == "hourly" {
 				saved := persistAkronHourly(ctx, d.Repo, d.ID, a, records)
+				if saved > 0 {
+					health.MarkArchiveSuccess(d.ID, time.Now())
+				}
 				log.Printf("[%s] архив %s: сохранено часовок: %d/%d\n", d.ID, a.ID, saved, len(records))
 			}
 		}

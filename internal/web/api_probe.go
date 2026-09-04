@@ -45,6 +45,7 @@ import (
 // самого архива.
 
 type probeRequest struct {
+	ID            string `json:"id"`
 	Kind          string `json:"kind"` // "vkm360" | "akron"
 	TransportKind string `json:"transport_kind"`
 	Host          string `json:"host"`
@@ -145,7 +146,7 @@ func probeAkron(ctx context.Context, req probeRequest) probeResponse {
 	if unitID == 0 {
 		unitID = 1
 	}
-	reader := pollcore.New(tr, isTCP, uint8(unitID))
+	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), req.ID)
 
 	resp := probeResponse{OK: true}
 
@@ -255,7 +256,10 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 	if err != nil {
 		return probeResponse{OK: false, Error: "создание сессии: " + err.Error()}
 	}
-	if err := sess.Open(probeCtx, tr); err != nil {
+	unlock := pollcore.LockKey(req.ID)
+	err = sess.Open(probeCtx, tr)
+	unlock()
+	if err != nil {
 		return probeResponse{OK: false, Error: "открытие сессии (byte-order/авторизация): " + err.Error()}
 	}
 
@@ -264,7 +268,7 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 	if unitID == 0 {
 		unitID = 1
 	}
-	reader := pollcore.New(tr, isTCP, uint8(unitID))
+	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), req.ID)
 
 	resp := probeResponse{OK: true}
 

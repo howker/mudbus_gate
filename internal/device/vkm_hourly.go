@@ -10,7 +10,7 @@ import (
 
 	"mbgw/internal/archive"
 	"mbgw/internal/dbg"
-	"mbgw/internal/devicestatus"
+	"mbgw/internal/health"
 	"mbgw/internal/profile"
 	"mbgw/internal/storage"
 )
@@ -112,6 +112,9 @@ func persistVKMHourly(ctx context.Context, d *Device, periodLabel time.Time, rec
 	if len(missing) > 0 {
 		log.Printf("[%s] VKM период %s: поля %s отсутствуют в ответе прибора (поля=%v)\n",
 			d.ID, periodLabel.Format("02.01.2006 15:04"), strings.Join(missing, ", "), rec.Fields)
+	}
+	if saved > 0 {
+		health.MarkArchiveSuccess(d.ID, time.Now())
 	}
 	return saved
 }
@@ -300,46 +303,11 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, period
 			d.ID, periodLabel.Format("02.01.2006 15:04"), err)
 	}
 
-	// Мониторинг дрейфа часов прибора (см. internal/devicestatus) —
-	// сравниваем время конца периода, которое НАЗЫВАЕТ САМ ПРИБОР в
-	// своём ответе, с periodLabel (то же самое время, но по НАШИМ часам
-	// сервера, от которого мы формировали запрос q.To). Расхождение
-	// между ними и есть дрейф часов прибора относительно сервера.
-	// Обновляем при КАЖДОМ успешном чтении архива, включая случаи, когда
-	// формат не позволяет определить точное время (Reliable=false) — это
-	// тоже полезная, актуальная информация ("сейчас не можем сказать"),
-	// а не повод молча оставить старое, возможно уже устаревшее значение
-	// висеть на дашборде.
-	if deviceEnd, ok := parseVKMPeriodEndTime(string(records[0].Raw)); ok {
-		devicestatus.Set(d.ID, devicestatus.TimeDrift{
-			CheckedAt:    time.Now(),
-			DriftSeconds: deviceEnd.Sub(periodLabel).Seconds(),
-			Reliable:     true,
-		})
-	} else {
-		devicestatus.Set(d.ID, devicestatus.TimeDrift{
-			CheckedAt: time.Now(),
-			Reliable:  false,
-			Note:      "поле Time отсутствует в ответе прибора, или его формат не подошёл ни под один из двух известных вариантов",
-		})
-		// Логируем ТОЛЬКО фрагмент вокруг Time= (не всю сырую строку —
-		// она может быть длинной), чтобы при следующем разборе "не
-		// определено" на дашборде можно было сразу увидеть ПОЧЕМУ, не
-		// гадая (найдено оператором 2026-08-30 — предыдущая версия
-		// вообще не логировала эту причину).
-		raw := string(records[0].Raw)
-		snippet := raw
-		if idx := strings.Index(raw, "Time="); idx >= 0 {
-			end := idx + 80
-			if end > len(raw) {
-				end = len(raw)
-			}
-			snippet = raw[idx:end]
-		}
-		log.Printf("[%s] VKM период %s: дрейф времени не определён, фрагмент ответа: %q\n",
-			d.ID, periodLabel.Format("02.01.2006 15:04"), snippet)
-	}
-
+	// ВАЖНО: архивная метка Time= НЕ является чтением текущих часов
+	// прибора. Сравнивать её с periodLabel и показывать результат как
+	// "расхождение времени прибора" нельзя: именно это давало ложное
+	// стабильное +0 сек на дашборде. До подтверждения безопасного
+	// read-only чтения текущих часов ВКМ этот путь дрейф не публикует.
 	return persistVKMHourly(ctx, d, periodLabel, records[0]), nil
 }
 

@@ -143,7 +143,7 @@ func run() {
 		if unitID == 0 {
 			unitID = 1
 		}
-		reader := pollcore.New(tr, isTCP, unitID)
+		reader := pollcore.NewWithLockKey(tr, isTCP, unitID, devCfg.ID)
 		dev := device.New(devCfg.ID, p, reader, sess, repo, leaseMgr)
 		dev.GapScanWindowHours = devCfg.Backfill.GapScanWindowOrDefault()
 		devices[devCfg.ID] = dev

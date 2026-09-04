@@ -44,6 +44,14 @@ type BackfillOptions struct {
 // persistAkronHourly (same guard the poller uses), so a corrupted or
 // zeroed device never poisons the store.
 func (d *Device) BackfillArchives(ctx context.Context, opts BackfillOptions) {
+	// KindBackfill is queued by the scheduler without per-task options.
+	// In that path use the device's configured startup depth. Explicit
+	// callers (for example GapScan) still win by passing MaxDepthHours.
+	effective := opts
+	if effective.MaxDepthHours <= 0 && d.BackfillMaxDepthHours > 0 {
+		effective.MaxDepthHours = d.BackfillMaxDepthHours
+	}
+
 	for _, a := range d.Profile.Archives {
 		switch a.Strategy {
 		case "akron_archive":
@@ -51,9 +59,9 @@ func (d *Device) BackfillArchives(ctx context.Context, opts BackfillOptions) {
 			if kind != "hourly" {
 				continue
 			}
-			d.backfillAkronHourly(ctx, a, opts)
+			d.backfillAkronHourly(ctx, a, effective)
 		case "mb_request_poll_string":
-			d.backfillVKMHourly(ctx, a, opts)
+			d.backfillVKMHourly(ctx, a, effective)
 		default:
 			continue // strategy has no backfill path (yet)
 		}

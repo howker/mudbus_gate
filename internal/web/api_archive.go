@@ -7,6 +7,7 @@ import (
 	"sort"
 	"time"
 
+	"mbgw/internal/interval"
 	"mbgw/internal/storage"
 )
 
@@ -187,14 +188,12 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 	var order []string
 
 	for _, param := range params {
-		// Для накопительных параметров нужна ОДНА дополнительная запись
-		// ДО начала окна — иначе для самой первой точки/суток/месяца в
-		// выборке не с чем вычесть разницу. Расширяем окно запроса на
-		// глубину периода назад и просто не включаем эту затравочную
-		// точку в итоговые строки — она нужна только для вычитания.
+		// Для накопительных параметров нужна одна предыдущая СЫРАЯ
+		// часовая запись. Дельта всегда считается между соседними
+		// часовыми снимками ДО любой суточной/месячной группировки.
 		queryFrom := from
 		if paramCumulative[param] {
-			queryFrom = from.Add(-31 * 24 * time.Hour) // с запасом даже для "по месяцам"
+			queryFrom = from.Add(-time.Hour)
 		}
 
 		rows, err := s.repo.GetHourlyArchiveRange(r.Context(), deviceID, "", param, queryFrom, to)
@@ -303,63 +302,49 @@ func formatPeriodLabel(t time.Time, granularity string) string {
 	}
 }
 
-// applyCumulativeDelta превращает СЫРЫЕ показания накопительного счётчика
-// (rows, по возрастанию времени, включая "затравочные" точки ДО from —
-// см. вызов выше) в РАЗНИЦУ между соседними показаниями, и раскладывает
-// результат по тем же корзинам (bucket), что и обычные суммируемые
-// параметры — buckets/order изменяются на месте (передаются по указателю
-// на срез, т.к. append может выделить новый массив).
+// applyCumulativeDelta converts raw cumulative counter snapshots into
+// per-hour interval deltas using the SAME rule as Energosphere export:
+// only two adjacent snapshots exactly one hour apart are valid, and a
+// counter rollback is rejected.
 //
-// Логика: прибор хранит СНИМОК счётчика на момент наступления часа.
-// Разница между снимком на 17:00 и снимком на 16:00 — это расход ЗА ЧАС
-// С 16 ДО 17:00, и подписывается меткой СНИМКА-КОНЦА («17:00»), не
-// началом интервала — так это устроено и в родной программе учёта
-// прибора, и в самой Энергосфере: строка «17:00» показывает готовый
-// расход только когда сам час [16:00,17:00) уже завершился и был заново
-// опрошен; пока идёт ТЕКУЩИЙ, ещё не завершённый час — для него значения
-// попросту ещё нет ни у нас, ни в ЭС.
+// The important order is:
+//  1. raw adjacent-hour counter delta;
+//  2. assign that delta to the interval END timestamp;
+//  3. only then aggregate valid interval deltas into raw/hourly/daily/
+//     monthly UI buckets.
 //
-// ВАЖНО (уточнено 2026-08-23 после ошибочной правки в этом же файле):
-// метка НЕ сдвигается на предыдущий период ни для одной группировки —
-// раньше здесь была неверная логика "raw -> метка начала интервала",
-// отклонённая явно, отменена.
+// This prevents a missing hour from being silently collapsed into one
+// larger delta and keeps UI semantics identical to the ЭС path.
 func applyCumulativeDelta(rows []storage.HourlyArchiveRecord, param string, from time.Time, granularity string, buckets map[string]map[string]float64, order *[]string) {
-	if len(rows) == 0 {
+	if len(rows) < 2 {
 		return
 	}
 
-	snapshots := make(map[string]float64)
-	var snapshotOrder []string
-	for _, row := range rows {
-		key := formatPeriodLabel(row.TsHour, granularity)
-		if _, ok := snapshots[key]; !ok {
-			snapshotOrder = append(snapshotOrder, key)
-		}
-		snapshots[key] = row.Value
-	}
-	sort.Strings(snapshotOrder)
+	for i := 1; i < len(rows); i++ {
+		prev := rows[i-1]
+		current := rows[i]
 
-	fromKey := formatPeriodLabel(from, granularity)
-	var prevValue float64
-	havePrev := false
-	for _, key := range snapshotOrder {
-		current := snapshots[key]
-		if key < fromKey {
-			// затравочная точка ДО окна запроса — не показываем, только
-			// запоминаем как базу для вычитания первой реальной точки
-			prevValue = current
-			havePrev = true
+		delta, ok := interval.CounterDelta(
+			prev.TsHour, prev.Value,
+			current.TsHour, current.Value,
+			time.Hour,
+		)
+		if !ok {
 			continue
 		}
-		if havePrev {
-			if _, ok := buckets[key]; !ok {
-				buckets[key] = make(map[string]float64)
-				*order = append(*order, key)
-			}
-			buckets[key][param] = current - prevValue
+
+		// The current snapshot timestamp is the END of the interval whose
+		// consumption is represented by delta.
+		if current.TsHour.Before(from) {
+			continue
 		}
-		prevValue = current
-		havePrev = true
+
+		key := formatPeriodLabel(current.TsHour, granularity)
+		if _, ok := buckets[key]; !ok {
+			buckets[key] = make(map[string]float64)
+			*order = append(*order, key)
+		}
+		buckets[key][param] += delta
 	}
 }
 
