@@ -152,3 +152,55 @@ func TestCollectAkronReadingsDoesNotCollapseGapIntoOneHour(t *testing.T) {
 		t.Fatalf("want gap to be skipped, got %#v", got)
 	}
 }
+
+func TestCollectReadingsForESRangeIncludesLastAkronHalfHourWithShift(t *testing.T) {
+	repo := newIntegrationTestRepo(t)
+	loc := time.Local
+
+	t16 := time.Date(2026, 9, 5, 16, 0, 0, 0, loc)
+	t17 := t16.Add(time.Hour)
+	t18 := t17.Add(time.Hour)
+
+	saveAkronV(t, repo, t16, 1000)
+	saveAkronV(t, repo, t17, 1130)
+	saveAkronV(t, repo, t18, 1261)
+
+	cfg := Config{
+		DeviceID:         "osmos",
+		Kind:             "akron",
+		TimeShiftMinutes: -90,
+		Points: []PointMapping{
+			{
+				Tag:     "V",
+				PointID: 1,
+				Factor:  1,
+			},
+		},
+	}
+
+	fromES := time.Date(2026, 9, 5, 15, 0, 0, 0, loc)
+	toES := time.Date(2026, 9, 5, 16, 30, 0, 0, loc)
+
+	got, err := collectReadingsForESRange(
+		context.Background(),
+		repo,
+		cfg,
+		fromES,
+		toES,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(got) != 4 {
+		t.Fatalf("want 4 readings in ES range, got %d: %#v", len(got), got)
+	}
+
+	last := got[len(got)-1]
+	if !last.ts.Equal(toES) {
+		t.Fatalf("want last ES timestamp %v, got %v", toES, last.ts)
+	}
+	if math.Abs(last.value-65.5) > 1e-9 {
+		t.Fatalf("want last half-hour value 65.5, got %g", last.value)
+	}
+}

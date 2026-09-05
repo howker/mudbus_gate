@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"time"
 
 	"mbgw/internal/archive"
@@ -71,6 +72,14 @@ type Device struct {
 	// without explicit options, so BackfillArchives uses this value as its
 	// default. 0 keeps the existing "use physical buffer depth" behaviour.
 	BackfillMaxDepthHours int
+
+	// VKM-360 automatic clock correction settings. The server copies these
+	// from the device row in SQLite. Automatic correction is enabled only
+	// when MaxStepSeconds and DailyLimitSeconds are both > 0. HR1009 itself
+	// is limited by the UVP protocol to at most +/-99 seconds per command.
+	TimeCorrectionDeadbandSeconds   int
+	TimeCorrectionMaxStepSeconds    int
+	TimeCorrectionDailyLimitSeconds int
 }
 
 func New(id string, p *profile.Profile, cli PointClient, sess session.Session, repo storage.Repo, l *lease.LocalLease) *Device {
@@ -252,28 +261,202 @@ func (d *Device) Poll(ctx context.Context) {
 // updateTimeDrift publishes the current meter clock state for the
 // dashboard.
 //
-// Akron has a live-confirmed read-only clock block: function 03,
-// registers 0x10..0x13. All 8 bytes are read in ONE transaction, so the
-// date/time fields cannot come from different seconds. Server time is
-// sampled immediately before and after that transaction and the
-// transaction midpoint is used as the comparison point, removing most
-// request/response latency bias.
+// Akron has a live-confirmed read-only clock block at function 03,
+// registers 0x10..0x13.
 //
-// VKM is deliberately reported as "не определено" here. Its archive
-// Time= label is the archive period boundary, not the current wall clock;
-// using it caused the false stable +0 sec shown by the old dashboard.
-// A live-confirmed safe current-clock read for VKM can replace this
-// explicit unknown state later.
+// VKM-360 has a live-confirmed read-only clock block at holding registers
+// 1800..1805: day, month, year, hour, minute, second. The block is read in
+// ONE transaction so the fields cannot straddle a second boundary.
+//
+// For both meter types, server time is sampled immediately before and
+// after the Modbus transaction and the midpoint is used for comparison,
+// which removes most request/response latency bias.
 func (d *Device) updateTimeDrift(ctx context.Context) {
-	if !d.hasAkronArchive() {
+	if d.hasAkronArchive() {
+		d.updateAkronTimeDrift(ctx)
+		return
+	}
+	d.updateVKMTimeDrift(ctx)
+}
+
+// timeCorrectionStore is deliberately a narrow local interface instead of
+// widening storage.Repo. The production *sqlite.Repo implements it; simple
+// device-package test fakes do not need to implement correction bookkeeping
+// unless a test explicitly enables automatic correction.
+type timeCorrectionStore interface {
+	TimeCorrectionUsedLast24Hours(ctx context.Context, deviceID string, now time.Time) (int, error)
+	RecordTimeCorrection(ctx context.Context, deviceID string, correctionSeconds int, correctedAt time.Time) error
+}
+
+func (d *Device) updateVKMTimeDrift(ctx context.Context) {
+	deviceTime, midpoint, err := d.readVKMClock(ctx)
+	if err != nil {
 		devicestatus.Set(d.ID, devicestatus.TimeDrift{
-			CheckedAt: time.Now(),
+			CheckedAt: midpoint,
 			Reliable:  false,
-			Note:      "текущее время ВКМ не читается: архивная метка периода не является текущими часами прибора",
+			Note:      "не удалось прочитать текущие часы ВКМ: " + err.Error(),
 		})
 		return
 	}
 
+	// First publish the observed drift even when automatic correction is
+	// disabled. The dashboard must always show the real read-only result.
+	devicestatus.Set(d.ID, devicestatus.TimeDrift{
+		CheckedAt:    midpoint,
+		DriftSeconds: deviceTime.Sub(midpoint).Seconds(),
+		Reliable:     true,
+	})
+
+	// Safe opt-in: existing devices have zeros after schema migration and
+	// therefore only READ their clocks until the operator explicitly sets
+	// both correction limits in the device form.
+	if d.TimeCorrectionMaxStepSeconds <= 0 || d.TimeCorrectionDailyLimitSeconds <= 0 {
+		return
+	}
+	// HR1009 correction is signed in the SERVER-minus-DEVICE direction:
+	// positive moves the VKM clock forward, negative moves it backward.
+	desired := int(math.Round(midpoint.Sub(deviceTime).Seconds()))
+	if desired == 0 || absInt(desired) <= d.TimeCorrectionDeadbandSeconds {
+		return
+	}
+
+	store, ok := d.Repo.(timeCorrectionStore)
+	if !ok {
+		log.Printf("[%s] [ВРЕМЯ] автокоррекция ВКМ пропущена: хранилище не поддерживает учёт суточного лимита\n", d.ID)
+		return
+	}
+
+	used, err := store.TimeCorrectionUsedLast24Hours(ctx, d.ID, midpoint)
+	if err != nil {
+		// Fail closed: if the daily budget cannot be read, do not write the
+		// clock. Otherwise a DB problem could silently bypass the operator's
+		// maximum-correction-per-24h safety limit.
+		log.Printf("[%s] [ВРЕМЯ] автокоррекция ВКМ пропущена: не удалось проверить лимит за 24 часа: %v\n", d.ID, err)
+		return
+	}
+
+	remaining := d.TimeCorrectionDailyLimitSeconds - used
+	if remaining <= 0 {
+		log.Printf("[%s] [ВРЕМЯ] коррекция не выполняется: лимит за 24 часа исчерпан (%d/%d сек)\n",
+			d.ID, used, d.TimeCorrectionDailyLimitSeconds)
+		return
+	}
+
+	maxStep := d.TimeCorrectionMaxStepSeconds
+	if maxStep > 99 {
+		maxStep = 99 // protocol hard limit; API also validates this value
+	}
+
+	step := absInt(desired)
+	if step > maxStep {
+		step = maxStep
+	}
+	if step > remaining {
+		step = remaining
+	}
+	if step <= 0 {
+		return
+	}
+	if desired < 0 {
+		step = -step
+	}
+
+	// Reserve this correction in the rolling 24-hour budget BEFORE touching
+	// the meter clock. This is deliberately conservative: if the following
+	// Modbus write fails (or its response is lost), the reservation remains
+	// until it ages out after 24 hours. That may temporarily reduce the
+	// available budget, but it guarantees that a DB/accounting failure can
+	// never let real clock writes exceed the operator's configured daily
+	// limit, including across process restarts.
+	reservedAt := time.Now()
+	if err := store.RecordTimeCorrection(ctx, d.ID, step, reservedAt); err != nil {
+		log.Printf("[%s] [ВРЕМЯ] автокоррекция ВКМ пропущена: не удалось зарезервировать %+d сек в лимите за 24 часа: %v\n", d.ID, step, err)
+		return
+	}
+
+	// UVP-280.01 / VKM-360 live-confirmed encoding of HR1009:
+	// +15 seconds -> 1515 decimal, -24 seconds -> -2424 decimal.
+	// Therefore the signed command word is correctionSeconds * 101.
+	command := int16(step * 101)
+	req := modbus.BuildWriteSingleRegisterPDU(1009, uint16(command))
+	resp, err := d.Client.Transact(ctx, req)
+	if err != nil {
+		log.Printf("[%s] [ВРЕМЯ] ошибка коррекции часов ВКМ на %+d сек: %v; %+d сек остаются зарезервированы в суточном лимите\n", d.ID, step, err, absInt(step))
+		return
+	}
+	if !sameWriteSingleRegisterResponse(resp, req) {
+		log.Printf("[%s] [ВРЕМЯ] ответ на коррекцию часов ВКМ не подтверждён: % X, ожидалось % X; %+d сек остаются зарезервированы в суточном лимите\n", d.ID, resp, req, absInt(step))
+		return
+	}
+
+	log.Printf("[%s] [ВРЕМЯ] часы ВКМ скорректированы на %+d сек (лимит за 24ч: было использовано %d, после этой коррекции зарезервировано %d из %d сек)\n",
+		d.ID, step, used, used+absInt(step), d.TimeCorrectionDailyLimitSeconds)
+
+	// The live probe showed the clock settles immediately but we give the
+	// device a short moment before the verification read. This happens only
+	// when an actual correction was made, not on every poll.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(1500 * time.Millisecond):
+	}
+
+	afterDeviceTime, afterMidpoint, err := d.readVKMClock(ctx)
+	if err != nil {
+		devicestatus.Set(d.ID, devicestatus.TimeDrift{
+			CheckedAt: afterMidpoint,
+			Reliable:  false,
+			Note:      "коррекция времени ВКМ выполнена, но контрольное чтение не удалось: " + err.Error(),
+		})
+		return
+	}
+
+	devicestatus.Set(d.ID, devicestatus.TimeDrift{
+		CheckedAt:    afterMidpoint,
+		DriftSeconds: afterDeviceTime.Sub(afterMidpoint).Seconds(),
+		Reliable:     true,
+	})
+}
+
+func (d *Device) readVKMClock(ctx context.Context) (time.Time, time.Time, error) {
+	// Holding registers 1800..1805 (decimal) = 0x0708..0x070D.
+	// One function-03 request reads all six fields atomically:
+	// day, month, year, hour, minute, second.
+	before := time.Now()
+	resp, err := d.Client.Transact(ctx, []byte{0x03, 0x07, 0x08, 0x00, 0x06})
+	after := time.Now()
+	midpoint := before.Add(after.Sub(before) / 2)
+	if err != nil {
+		return time.Time{}, midpoint, err
+	}
+
+	deviceTime, err := decodeVKMClockResponse(resp, time.Local)
+	if err != nil {
+		return time.Time{}, midpoint, err
+	}
+	return deviceTime, midpoint, nil
+}
+
+func sameWriteSingleRegisterResponse(resp, req []byte) bool {
+	if len(req) != 5 || len(resp) < 5 {
+		return false
+	}
+	for i := 0; i < 5; i++ {
+		if resp[i] != req[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func (d *Device) updateAkronTimeDrift(ctx context.Context) {
 	before := time.Now()
 	resp, err := d.Client.Transact(ctx, []byte{0x03, 0x00, 0x10, 0x00, 0x04})
 	after := time.Now()
@@ -303,6 +486,55 @@ func (d *Device) updateTimeDrift(ctx context.Context) {
 		DriftSeconds: deviceTime.Sub(midpoint).Seconds(),
 		Reliable:     true,
 	})
+}
+
+func decodeVKMClockResponse(resp []byte, loc *time.Location) (time.Time, error) {
+	// Standard Read Holding Registers response PDU:
+	// [0x03][byteCount=12]
+	// [dayHi][dayLo][monthHi][monthLo][yearHi][yearLo]
+	// [hourHi][hourLo][minuteHi][minuteLo][secondHi][secondLo]
+	if len(resp) < 14 {
+		return time.Time{}, fmt.Errorf("короткий ответ: %d байт, нужно минимум 14", len(resp))
+	}
+	if resp[0] != 0x03 {
+		return time.Time{}, fmt.Errorf("неожиданная функция 0x%02X вместо 0x03", resp[0])
+	}
+	if resp[1] < 12 {
+		return time.Time{}, fmt.Errorf("byte count=%d, нужно минимум 12", resp[1])
+	}
+
+	data := resp[2:14]
+	reg := func(i int) int {
+		return int(data[i*2])<<8 | int(data[i*2+1])
+	}
+
+	day := reg(0)
+	month := reg(1)
+	year := reg(2)
+	hour := reg(3)
+	minute := reg(4)
+	second := reg(5)
+
+	if second > 59 || minute > 59 || hour > 23 || month < 1 || month > 12 || day < 1 || day > 31 {
+		return time.Time{}, fmt.Errorf(
+			"время вне диапазона: %02d.%02d.%02d %02d:%02d:%02d",
+			day, month, year, hour, minute, second,
+		)
+	}
+	if year < 0 || year > 99 {
+		return time.Time{}, fmt.Errorf("год вне диапазона 0..99: %d", year)
+	}
+
+	fullYear := 2000 + year
+	t := time.Date(fullYear, time.Month(month), day, hour, minute, second, 0, loc)
+	if t.Year() != fullYear || int(t.Month()) != month || t.Day() != day {
+		return time.Time{}, fmt.Errorf(
+			"некорректная календарная дата: %02d.%02d.%04d",
+			day, month, fullYear,
+		)
+	}
+
+	return t, nil
 }
 
 func (d *Device) hasAkronArchive() bool {

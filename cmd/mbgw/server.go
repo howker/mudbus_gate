@@ -769,7 +769,18 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 		return
 	}
 	if err := tr.Open(ctx); err != nil {
-		log.Printf("[ERROR] прибор %s: не удалось открыть транспорт: %v\n", devRec.ID, err)
+		switch devRec.TransportKind {
+		case "modbus_tcp":
+			log.Printf("[НЕТ СВЯЗИ] прибор %s (%s:%d): прибор не отвечает. Возможно, он выключен или недоступен по сети.\n",
+				devRec.ID, devRec.Host, devRec.Port)
+		default:
+			endpoint := devRec.COM
+			if endpoint == "" {
+				endpoint = devRec.TransportKind
+			}
+			log.Printf("[НЕТ СВЯЗИ] прибор %s (%s): не удалось открыть подключение. Проверьте питание прибора, кабель и настройки подключения.\n",
+				devRec.ID, endpoint)
+		}
 		return
 	}
 	unlockIO := pollcore.LockKey(devRec.ID)
@@ -808,6 +819,17 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 		dev.GapScanWindowHours = devRec.GapScanWindowHours
 	}
 	dev.BackfillMaxDepthHours = devRec.BackfillMaxDepthHours
+
+	// Individual VKM-360 clock-correction safety limits configured in the
+	// device row. Existing devices keep all-zero values after migration, so
+	// automatic correction remains disabled until the operator explicitly
+	// enables it in the device settings.
+	if devRec.Kind == "vkm360" {
+		dev.TimeCorrectionDeadbandSeconds = devRec.TimeCorrectionDeadbandSeconds
+		dev.TimeCorrectionMaxStepSeconds = devRec.TimeCorrectionMaxStepSeconds
+		dev.TimeCorrectionDailyLimitSeconds = devRec.TimeCorrectionDailyLimitSeconds
+	}
+
 	devicesMu.Lock()
 	devices[devRec.ID] = dev
 	deviceKinds[devRec.ID] = devRec.Kind

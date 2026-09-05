@@ -58,10 +58,25 @@ CREATE TABLE IF NOT EXISTS devices (
     backfill_max_depth_hours INTEGER NOT NULL DEFAULT 0,   -- 0 -> "variant В" (fill everything missing)
     gap_scan_window_hours    INTEGER NOT NULL DEFAULT 0,   -- 0 -> config.GapScanDefault
     archive_at_minute        INTEGER NOT NULL DEFAULT -1,  -- -1 sentinel = "unset" -> config.ArchiveAtMinuteDefault
+    time_correction_deadband_seconds INTEGER NOT NULL DEFAULT 0, -- 0 = автокоррекция выключена
+    time_correction_max_step_seconds INTEGER NOT NULL DEFAULT 0, -- 1..99 сек; 0 = автокоррекция выключена
+    time_correction_daily_limit_seconds INTEGER NOT NULL DEFAULT 0, -- суммарный модуль коррекций за скользящие 24ч; 0 = автокоррекция выключена
     enabled                  INTEGER NOT NULL DEFAULT 1,   -- 0/1: poll paused without deleting the device
     created_at               DATETIME NOT NULL,
     updated_at               DATETIME NOT NULL
 );
+
+-- История фактически выполненных коррекций часов ВКМ. Нужна для
+-- ограничения суммарного модуля коррекций за скользящие 24 часа.
+-- Записывается только ПОСЛЕ подтверждённой успешной команды коррекции.
+CREATE TABLE IF NOT EXISTS device_time_corrections (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id          TEXT NOT NULL,
+    corrected_at       DATETIME NOT NULL,
+    correction_seconds INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_device_time_corrections_device_time
+    ON device_time_corrections(device_id, corrected_at);
 
 -- Per-tag mapping of a ВКМ device's archive values into Энергосфера
 -- Mains channels — one row per (device, tag). Read by
@@ -118,6 +133,12 @@ CREATE TABLE IF NOT EXISTS es_akron_northbound (
 	// install's CREATE TABLE above already included it).
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN retries INTEGER NOT NULL DEFAULT 3`)
 
+	// Настройки безопасной автокоррекции часов ВКМ. Нулевые значения
+	// оставляют функцию выключенной на существующих базах после обновления.
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN time_correction_deadband_seconds INTEGER NOT NULL DEFAULT 0`)
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN time_correction_max_step_seconds INTEGER NOT NULL DEFAULT 0`)
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN time_correction_daily_limit_seconds INTEGER NOT NULL DEFAULT 0`)
+
 	// Та же лёгкая миграция для es_connection, добавленного позже
 	// (сдвиг времени при записи в Mains) — ошибка "duplicate column
 	// name" на уже обновлённой базе безвредна и намеренно игнорируется.
@@ -156,7 +177,13 @@ type DeviceRecord struct {
 	BackfillMaxDepthHours int
 	GapScanWindowHours    int
 	ArchiveAtMinute       int // -1 = unset, matches BackfillConfig.ArchiveAtMinute's *int nil sentinel
-	Enabled               bool
+	// VKM clock auto-correction safety settings. All three must be > 0
+	// for automatic correction to be enabled. MaxStepSeconds is additionally
+	// capped by the device/protocol limit of 99 seconds by the caller.
+	TimeCorrectionDeadbandSeconds   int
+	TimeCorrectionMaxStepSeconds    int
+	TimeCorrectionDailyLimitSeconds int
+	Enabled                         bool
 }
 
 // UpsertDevice inserts or replaces a device by ID — the Web UI's "add/
@@ -164,6 +191,16 @@ type DeviceRecord struct {
 // not a partial patch; simpler and sufficient for a single-operator admin
 // screen).
 func (r *Repo) UpsertDevice(ctx context.Context, d DeviceRecord) error {
+	if d.TimeCorrectionDeadbandSeconds < 0 {
+		return fmt.Errorf("upsert device: time correction deadband must be >= 0")
+	}
+	if d.TimeCorrectionMaxStepSeconds < 0 || d.TimeCorrectionMaxStepSeconds > 99 {
+		return fmt.Errorf("upsert device: time correction max step must be in range 0..99 seconds")
+	}
+	if d.TimeCorrectionDailyLimitSeconds < 0 {
+		return fmt.Errorf("upsert device: time correction daily limit must be >= 0")
+	}
+
 	now := time.Now()
 	enabled := 0
 	if d.Enabled {
@@ -174,8 +211,9 @@ INSERT INTO devices (
     id, name, kind, profile, transport_kind, host, port, com, baudrate,
     parity, stopbits, timeout_ms, unit_id, retries, current_poll_seconds,
     backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
-    enabled, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    time_correction_deadband_seconds, time_correction_max_step_seconds,
+    time_correction_daily_limit_seconds, enabled, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     name = excluded.name,
     kind = excluded.kind,
@@ -194,11 +232,15 @@ ON CONFLICT(id) DO UPDATE SET
     backfill_max_depth_hours = excluded.backfill_max_depth_hours,
     gap_scan_window_hours = excluded.gap_scan_window_hours,
     archive_at_minute = excluded.archive_at_minute,
+    time_correction_deadband_seconds = excluded.time_correction_deadband_seconds,
+    time_correction_max_step_seconds = excluded.time_correction_max_step_seconds,
+    time_correction_daily_limit_seconds = excluded.time_correction_daily_limit_seconds,
     enabled = excluded.enabled,
     updated_at = excluded.updated_at
 `, d.ID, d.Name, d.Kind, d.Profile, d.TransportKind, d.Host, d.Port, d.COM,
 		d.Baudrate, d.Parity, d.StopBits, d.TimeoutMs, d.UnitID, d.Retries, d.CurrentPollSeconds,
 		d.BackfillMaxDepthHours, d.GapScanWindowHours, d.ArchiveAtMinute,
+		d.TimeCorrectionDeadbandSeconds, d.TimeCorrectionMaxStepSeconds, d.TimeCorrectionDailyLimitSeconds,
 		enabled, now, now)
 	if err != nil {
 		return fmt.Errorf("upsert device: %w", err)
@@ -215,7 +257,8 @@ func (r *Repo) ListDevices(ctx context.Context) ([]DeviceRecord, error) {
 SELECT id, name, kind, profile, transport_kind, host, port, com, baudrate,
        parity, stopbits, timeout_ms, unit_id, retries, current_poll_seconds,
        backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
-       enabled
+       time_correction_deadband_seconds, time_correction_max_step_seconds,
+       time_correction_daily_limit_seconds, enabled
 FROM devices ORDER BY id
 `)
 	if err != nil {
@@ -230,7 +273,8 @@ FROM devices ORDER BY id
 		if err := rows.Scan(&d.ID, &d.Name, &d.Kind, &d.Profile, &d.TransportKind,
 			&d.Host, &d.Port, &d.COM, &d.Baudrate, &d.Parity, &d.StopBits,
 			&d.TimeoutMs, &d.UnitID, &d.Retries, &d.CurrentPollSeconds, &d.BackfillMaxDepthHours,
-			&d.GapScanWindowHours, &d.ArchiveAtMinute, &enabled); err != nil {
+			&d.GapScanWindowHours, &d.ArchiveAtMinute, &d.TimeCorrectionDeadbandSeconds,
+			&d.TimeCorrectionMaxStepSeconds, &d.TimeCorrectionDailyLimitSeconds, &enabled); err != nil {
 			return nil, fmt.Errorf("scan device: %w", err)
 		}
 		d.Enabled = enabled != 0
@@ -248,12 +292,14 @@ func (r *Repo) GetDevice(ctx context.Context, id string) (DeviceRecord, bool, er
 SELECT id, name, kind, profile, transport_kind, host, port, com, baudrate,
        parity, stopbits, timeout_ms, unit_id, retries, current_poll_seconds,
        backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
-       enabled
+       time_correction_deadband_seconds, time_correction_max_step_seconds,
+       time_correction_daily_limit_seconds, enabled
 FROM devices WHERE id = ?
 `, id).Scan(&d.ID, &d.Name, &d.Kind, &d.Profile, &d.TransportKind,
 		&d.Host, &d.Port, &d.COM, &d.Baudrate, &d.Parity, &d.StopBits,
 		&d.TimeoutMs, &d.UnitID, &d.Retries, &d.CurrentPollSeconds, &d.BackfillMaxDepthHours,
-		&d.GapScanWindowHours, &d.ArchiveAtMinute, &enabled)
+		&d.GapScanWindowHours, &d.ArchiveAtMinute, &d.TimeCorrectionDeadbandSeconds,
+		&d.TimeCorrectionMaxStepSeconds, &d.TimeCorrectionDailyLimitSeconds, &enabled)
 	if err == sql.ErrNoRows {
 		return DeviceRecord{}, false, nil
 	}
@@ -276,6 +322,9 @@ func (r *Repo) DeleteDevice(ctx context.Context, id string) error {
 	}
 	if _, err := r.db.ExecContext(ctx, `DELETE FROM es_akron_northbound WHERE device_id = ?`, id); err != nil {
 		return fmt.Errorf("delete device akron northbound: %w", err)
+	}
+	if _, err := r.db.ExecContext(ctx, `DELETE FROM device_time_corrections WHERE device_id = ?`, id); err != nil {
+		return fmt.Errorf("delete device time corrections: %w", err)
 	}
 	if err := r.DeleteCurrentReadings(ctx, id); err != nil {
 		return fmt.Errorf("delete device current readings: %w", err)
@@ -302,6 +351,38 @@ func (r *Repo) DeleteCurrentReadings(ctx context.Context, deviceID string) error
 		return fmt.Errorf("delete current readings: %w", err)
 	}
 	return nil
+}
+
+// RecordTimeCorrection stores one successfully applied VKM clock correction.
+// correctionSeconds is signed: positive moves the meter clock forward,
+// negative moves it backward. The daily limiter intentionally sums ABS()
+// values, so +20 followed by -20 consumes 40 seconds of the 24h budget.
+func (r *Repo) RecordTimeCorrection(ctx context.Context, deviceID string, correctionSeconds int, correctedAt time.Time) error {
+	if correctionSeconds == 0 {
+		return nil
+	}
+	if _, err := r.db.ExecContext(ctx, `
+INSERT INTO device_time_corrections (device_id, corrected_at, correction_seconds)
+VALUES (?, ?, ?)
+`, deviceID, correctedAt, correctionSeconds); err != nil {
+		return fmt.Errorf("record device time correction: %w", err)
+	}
+	return nil
+}
+
+// TimeCorrectionUsedLast24Hours returns the sum of absolute values of
+// successful corrections during the rolling 24 hours ending at now.
+func (r *Repo) TimeCorrectionUsedLast24Hours(ctx context.Context, deviceID string, now time.Time) (int, error) {
+	cutoff := now.Add(-24 * time.Hour)
+	var used int
+	if err := r.db.QueryRowContext(ctx, `
+SELECT COALESCE(SUM(ABS(correction_seconds)), 0)
+FROM device_time_corrections
+WHERE device_id = ? AND corrected_at > ? AND corrected_at <= ?
+`, deviceID, cutoff, now).Scan(&used); err != nil {
+		return 0, fmt.Errorf("sum device time corrections: %w", err)
+	}
+	return used, nil
 }
 
 // VKMChannelRecord is one tag->ЭС-channel mapping row.

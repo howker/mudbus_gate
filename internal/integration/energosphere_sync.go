@@ -578,6 +578,36 @@ func collectReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, fro
 	}
 }
 
+// collectReadingsForESRange принимает диапазон в той же временной шкале,
+// которую оператор видит в Энергосфере. collectReadings, напротив, читает
+// локальный архив до применения TimeShiftMinutes. Поэтому границы сначала
+// переводятся обратно во время локального архива, а готовые точки затем
+// дополнительно фильтруются по исходному диапазону ЭС.
+//
+// Это особенно важно для Akron V: одна часовая дельта превращается в две
+// получасовые точки. Без обратного пересчёта верхней границы последняя
+// получасовка диапазона могла не попасть в ForceResync при ненулевом сдвиге.
+func collectReadingsForESRange(ctx context.Context, repo *sqliterepo.Repo, cfg Config, from, to time.Time) ([]pointReading, error) {
+	shift := time.Duration(cfg.TimeShiftMinutes) * time.Minute
+	sourceFrom := from.Add(-shift)
+	sourceTo := to.Add(-shift)
+
+	readings, err := collectReadings(ctx, repo, cfg, sourceFrom, sourceTo)
+	if err != nil {
+		return nil, err
+	}
+
+	out := readings[:0]
+	for _, r := range readings {
+		if r.ts.Before(from) || r.ts.After(to) {
+			continue
+		}
+		out = append(out, r)
+	}
+
+	return out, nil
+}
+
 // runPointSyncOnce — обычный автоматический проход синхронизации.
 //
 // Первый проход для точки, у которой ещё нет cursor, смотрит назад на
@@ -730,7 +760,7 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 // how many values would overwrite existing rows, how many would be new
 // inserts, and how many are blocked by validation or DB-check errors.
 func PreviewForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointMainsWriter, cfg Config, from, to time.Time) (wouldUpdate, wouldInsert, blocked int, err error) {
-	readings, err := collectReadings(ctx, repo, cfg, from, to)
+	readings, err := collectReadingsForESRange(ctx, repo, cfg, from, to)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("чтение исходной БД: %w", err)
 	}
@@ -789,7 +819,7 @@ func PreviewForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer 
 // уже есть); если затронуто 0 строк — точки ещё не было, вставляем
 // обычным InsertPoint.
 func ForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointMainsWriter, cfg Config, from, to time.Time) (updated, inserted, failed int, err error) {
-	readings, err := collectReadings(ctx, repo, cfg, from, to)
+	readings, err := collectReadingsForESRange(ctx, repo, cfg, from, to)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("чтение исходной БД: %w", err)
 	}

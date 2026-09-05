@@ -130,7 +130,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
     <div class="section">
       <h3>Статус приборов</h3>
       <p class="small-note">Кнопка «Принудительная пересинхронизация с ЭС» — когда нужно обновить данные в БД ЭС.</p>
-      <div id="dashboardSystemHealth" class="small-note" style="margin:8px 0 12px 0;">Состояние процесса: загрузка...</div>
+      <div id="dashboardSystemHealth" class="small-note" style="margin:8px 0 12px 0;">Состояние шлюза: проверка...</div>
       <table>
         <thead><tr>
           <th style="cursor:pointer;" onclick="sortDashboard('name')">Прибор ⇅</th>
@@ -234,6 +234,17 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <p class="small-note">Как часто опрашивать мгновенные показания (не архив). Раз в час обычно достаточно — этот шлюз собирает архив, не ведёт непрерывную телеметрию.</p>
         <div class="form-row"><label>Опрос архива, минута после границы</label><input id="d_archive_at_minute" type="text" value="5"></div>
         <p class="small-note">Через сколько минут ПОСЛЕ границы периода запрашивать архив (получасовки у ВКМ — в HH:05 и HH:35, часовки у Akron — в HH:05, при значении по умолчанию 5). Прибору нужно время, чтобы закрыть период и подготовить данные — опрос точно на самой границе (0) обычно даёт ещё не готовый или неполный результат. Значение видно и настраивается здесь же, что и на вкладке «Главная» в столбце «Следующий опрос».</p>
+
+        <div id="vkmTimeCorrectionFields" style="display:none;margin-top:18px;padding-top:12px;border-top:1px solid #3e3e42;">
+          <p style="margin-top:0;color:#ffffff;font-size:13px;"><b>Коррекция времени ВКМ-360</b></p>
+          <div class="form-row"><label>Допустимая рассинхронизация, сек</label><input id="d_time_correction_deadband_seconds" type="text" value="0"></div>
+          <p class="small-note" style="margin-left:220px;margin-top:-8px;">Если расхождение времени прибора и сервера по модулю не больше этого значения, часы не корректируются.</p>
+          <div class="form-row"><label>Макс. коррекция за один раз, сек</label><input id="d_time_correction_max_step_seconds" type="text" value="0"></div>
+          <p class="small-note" style="margin-left:220px;margin-top:-8px;">Верхняя граница одной коррекции. Допустимо 0–99 сек; УВП не позволяет корректировать больше 99 секунд одной командой.</p>
+          <div class="form-row"><label>Макс. коррекция за 24 часа, сек</label><input id="d_time_correction_daily_limit_seconds" type="text" value="0"></div>
+          <p class="small-note" style="margin-left:220px;margin-top:-8px;">Суточный лимит считается как сумма модулей реально выполненных коррекций за последние 24 часа. Например, +20 сек и затем -20 сек используют 40 сек лимита.</p>
+          <p class="small-note" style="color:#ffd479;">Автокоррекция выключена, пока «Макс. коррекция за один раз» или «Макс. коррекция за 24 часа» равна 0.</p>
+        </div>
       </div>
 
       <p>
@@ -255,10 +266,9 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <select id="ch_device" onchange="loadChannels()"></select>
       </div>
       <table>
-        <thead><tr><th>Величина</th><th>ID_PP</th><th>Множитель</th><th>Мин.</th><th>Макс.</th></tr></thead>
-        <tbody id="channelsTableBody"><tr><td colspan="5">Выберите прибор</td></tr></tbody>
+        <thead><tr><th>Величина</th><th>ID_PP</th><th>Множитель</th></tr></thead>
+        <tbody id="channelsTableBody"><tr><td colspan="3">Выберите прибор</td></tr></tbody>
       </table>
-      <p class="small-note">Мин./Макс. — необязательный защитный диапазон уже ПОСЛЕ применения множителя. Пустое поле = предел выключен.</p>
       <p><button class="btn" onclick="saveChannels()">Сохранить точки</button></p>
       <div id="channelsMsg" class="msg"></div>
     </div>
@@ -426,6 +436,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 var allDevices = [];
 var allProfiles = [];
 var editingOriginalKind = null; // set by editDevice(), cleared by resetDeviceForm() — used to warn if the operator changes "Тип прибора" while editing an EXISTING device (root cause of the 2026-08-23 incident: switching kind mid-edit silently repurposed one device's saved row into a different device).
+var channelSafetyByTag = {}; // min/max остаются backend-настройкой; из обычного операторского UI они скрыты, но при сохранении существующие значения не теряются.
 
 function loadProfiles() {
   var xhr = new XMLHttpRequest();
@@ -511,6 +522,7 @@ function onKindChange() {
     if (!profileEl.value) { profileEl.value = 'profiles/acron-01.yaml'; }
   }
   onTransportKindChange();
+  updateVKMTimeCorrectionVisibility();
 }
 function onTransportKindChange() {
   var tk = document.getElementById('d_transport_kind').value;
@@ -518,6 +530,12 @@ function onTransportKindChange() {
   var showSerial = (tk === 'rtu_serial' || tk === 'tcp_serial');
   document.getElementById('tcpFields').style.display = showTCP ? 'block' : 'none';
   document.getElementById('serialFields').style.display = showSerial ? 'block' : 'none';
+}
+
+function updateVKMTimeCorrectionVisibility() {
+  var el = document.getElementById('vkmTimeCorrectionFields');
+  if (!el) { return; }
+  el.style.display = document.getElementById('d_kind').value === 'vkm360' ? 'block' : 'none';
 }
 
 function toggleAdvanced() {
@@ -589,6 +607,20 @@ function validateTransportFields(body) {
     if (!body.host) { return 'Заполните поле "IP-адрес"'; }
   } else {
     if (!body.com) { return 'Заполните поле "COM-порт"'; }
+  }
+  return '';
+}
+
+function validateTimeCorrectionFields(body) {
+  if (body.kind !== 'vkm360') { return ''; }
+  if (body.time_correction_deadband_seconds < 0) {
+    return 'Поле "Допустимая рассинхронизация" не может быть отрицательным';
+  }
+  if (body.time_correction_max_step_seconds < 0 || body.time_correction_max_step_seconds > 99) {
+    return 'Поле "Макс. коррекция за один раз" должно быть от 0 до 99 секунд';
+  }
+  if (body.time_correction_daily_limit_seconds < 0) {
+    return 'Поле "Макс. коррекция за 24 часа" не может быть отрицательным';
   }
   return '';
 }
@@ -1380,20 +1412,22 @@ function renderDashboardTable() {
   var systemHealth = document.getElementById('dashboardSystemHealth');
   if (systemHealth) {
     if (rows.length === 0) {
-      systemHealth.innerHTML = 'Состояние процесса: нет настроенных приборов';
+      systemHealth.innerHTML = 'Состояние шлюза: нет настроенных приборов';
     } else {
       var h = rows[0];
-      var pollerText = h.poller_last_cycle ? ('poller: ' + h.poller_last_cycle) : 'poller: нет данных';
+      var pollerText = h.poller_last_cycle
+        ? ('опрос приборов работает (последняя проверка ' + h.poller_last_cycle + ')')
+        : 'нет данных о работе опроса приборов';
       var sqliteText;
       if (!h.sqlite_checked_at) {
-        sqliteText = 'SQLite: нет данных';
+        sqliteText = 'нет данных о локальной базе';
       } else if (h.sqlite_ok) {
-        sqliteText = '<span class="status-good">SQLite: OK</span> (' + h.sqlite_checked_at + ')';
+        sqliteText = '<span class="status-good">локальная база работает</span> (проверено ' + h.sqlite_checked_at + ')';
       } else {
-        sqliteText = '<span class="status-bad">SQLite: ERROR</span> (' + h.sqlite_checked_at + ')' +
+        sqliteText = '<span class="status-bad">ошибка локальной базы</span> (проверено ' + h.sqlite_checked_at + ')' +
           (h.sqlite_error ? ' — ' + h.sqlite_error : '');
       }
-      systemHealth.innerHTML = 'Состояние процесса — ' + pollerText + '; ' + sqliteText;
+      systemHealth.innerHTML = 'Состояние шлюза — ' + pollerText + '; ' + sqliteText;
     }
   }
   if (dashboardSortKey) {
@@ -1531,8 +1565,12 @@ function editDevice(id) {
   // реальное действующее значение (5), а не сырое "-1", чтобы не
   // пришлось разбираться, что оно значит.
   document.getElementById('d_archive_at_minute').value = (d.archive_at_minute !== undefined && d.archive_at_minute >= 0) ? d.archive_at_minute : '5';
+  document.getElementById('d_time_correction_deadband_seconds').value = (d.time_correction_deadband_seconds !== undefined ? d.time_correction_deadband_seconds : '0');
+  document.getElementById('d_time_correction_max_step_seconds').value = (d.time_correction_max_step_seconds !== undefined ? d.time_correction_max_step_seconds : '0');
+  document.getElementById('d_time_correction_daily_limit_seconds').value = (d.time_correction_daily_limit_seconds !== undefined ? d.time_correction_daily_limit_seconds : '0');
   document.getElementById('d_enabled').checked = !!d.enabled;
   onTransportKindChange();
+  updateVKMTimeCorrectionVisibility();
   showTab('devices');
   window.scrollTo(0, document.body.scrollHeight);
 }
@@ -1560,13 +1598,18 @@ function resetDeviceForm() {
   document.getElementById('d_current_poll_seconds').value = '3600';
   document.getElementById('d_backfill_max_depth_hours').value = '0';
   document.getElementById('d_archive_at_minute').value = '5';
+  document.getElementById('d_time_correction_deadband_seconds').value = '0';
+  document.getElementById('d_time_correction_max_step_seconds').value = '0';
+  document.getElementById('d_time_correction_daily_limit_seconds').value = '0';
   document.getElementById('d_enabled').checked = true;
   onTransportKindChange();
+  updateVKMTimeCorrectionVisibility();
   document.getElementById('probeMsg').className = 'msg';
   document.getElementById('deviceMsg').className = 'msg';
 }
 
 function currentDeviceFormAsJSON() {
+  var isVKM = document.getElementById('d_kind').value === 'vkm360';
   return {
     id: document.getElementById('d_id').value,
     name: document.getElementById('d_name').value,
@@ -1609,6 +1652,9 @@ function currentDeviceFormAsJSON() {
     // (см. HTML value="5"), так что для типового случая оператору
     // ничего менять не нужно — то же самое поведение, что и раньше.
     archive_at_minute: intOrZero(document.getElementById('d_archive_at_minute').value),
+    time_correction_deadband_seconds: isVKM ? intOrZero(document.getElementById('d_time_correction_deadband_seconds').value) : 0,
+    time_correction_max_step_seconds: isVKM ? intOrZero(document.getElementById('d_time_correction_max_step_seconds').value) : 0,
+    time_correction_daily_limit_seconds: isVKM ? intOrZero(document.getElementById('d_time_correction_daily_limit_seconds').value) : 0,
     enabled: document.getElementById('d_enabled').checked,
     overwrite: document.getElementById('d_id').disabled // true only when editing an existing device
   };
@@ -1632,6 +1678,8 @@ function saveDevice() {
   }
   var validationErr = validateTransportFields(body);
   if (validationErr) { showMsg('deviceMsg', false, validationErr); return; }
+  var timeCorrectionErr = validateTimeCorrectionFields(body);
+  if (timeCorrectionErr) { showMsg('deviceMsg', false, timeCorrectionErr); return; }
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/devices', true);
   xhr.setRequestHeader('Content-Type', 'application/json');
@@ -1732,11 +1780,9 @@ function renderChannelsTable(kind) {
   for (var i = 0; i < defs.length; i++) {
     var d = defs[i];
     html += '<tr><td>' + d.label + '</td><td><input id="ch_' + d.tag + '_id" type="text"></td>' +
-      '<td><input id="ch_' + d.tag + '_factor" type="text" value="1"><div class="small-note">' + d.hint + '</div></td>' +
-      '<td><input id="ch_' + d.tag + '_min" type="text" placeholder="выкл."></td>' +
-      '<td><input id="ch_' + d.tag + '_max" type="text" placeholder="выкл."></td></tr>';
+      '<td><input id="ch_' + d.tag + '_factor" type="text" value="1"><div class="small-note">' + d.hint + '</div></td></tr>';
   }
-  if (html === '') { html = '<tr><td colspan="5">Выберите прибор</td></tr>'; }
+  if (html === '') { html = '<tr><td colspan="3">Выберите прибор</td></tr>'; }
   document.getElementById('channelsTableBody').innerHTML = html;
 }
 
@@ -1758,6 +1804,7 @@ function loadChannels() {
   var deviceId = document.getElementById('ch_device').value;
   var kind = currentChannelsKind();
   renderChannelsTable(kind);
+  channelSafetyByTag = {};
   if (!deviceId) { return; }
   var tags = (POINT_TAG_DEFS[kind] || []).map(function(d) { return d.tag; });
 
@@ -1768,17 +1815,14 @@ function loadChannels() {
     var rows = JSON.parse(xhr.responseText) || [];
     var byTag = {};
     for (var i = 0; i < rows.length; i++) { byTag[rows[i].tag] = rows[i]; }
+    channelSafetyByTag = byTag;
     for (var j = 0; j < tags.length; j++) {
       var t = tags[j];
       var idEl = document.getElementById('ch_' + t + '_id');
       var factorEl = document.getElementById('ch_' + t + '_factor');
-      var minEl = document.getElementById('ch_' + t + '_min');
-      var maxEl = document.getElementById('ch_' + t + '_max');
       if (!idEl) { continue; }
       idEl.value = byTag[t] ? byTag[t].es_channel_id : '';
       factorEl.value = byTag[t] ? byTag[t].factor : '1';
-      minEl.value = (byTag[t] && byTag[t].min_value !== null && byTag[t].min_value !== undefined) ? byTag[t].min_value : '';
-      maxEl.value = (byTag[t] && byTag[t].max_value !== null && byTag[t].max_value !== undefined) ? byTag[t].max_value : '';
     }
   };
   xhr.send();
@@ -1795,36 +1839,14 @@ function saveChannels(force) {
     var idVal = document.getElementById('ch_' + t + '_id').value;
     if (idVal === '') { continue; }
     var chId = intOrZero(idVal);
-    var minText = document.getElementById('ch_' + t + '_min').value.replace(/^\s+|\s+$/g, '');
-    var maxText = document.getElementById('ch_' + t + '_max').value.replace(/^\s+|\s+$/g, '');
-    var minValue = null;
-    var maxValue = null;
-
-    if (minText !== '') {
-      minValue = parseFloat(minText);
-      if (isNaN(minValue)) {
-        showMsg('channelsMsg', false, 'Некорректный минимум для ' + t);
-        return;
-      }
-    }
-    if (maxText !== '') {
-      maxValue = parseFloat(maxText);
-      if (isNaN(maxValue)) {
-        showMsg('channelsMsg', false, 'Некорректный максимум для ' + t);
-        return;
-      }
-    }
-    if (minValue !== null && maxValue !== null && minValue > maxValue) {
-      showMsg('channelsMsg', false, 'Для ' + t + ' минимум не может быть больше максимума');
-      return;
-    }
+    var safety = channelSafetyByTag[t] || {};
 
     channels.push({
       tag: t,
       es_channel_id: chId,
       factor: floatOrOne(document.getElementById('ch_' + t + '_factor').value),
-      min_value: minValue,
-      max_value: maxValue
+      min_value: (safety.min_value !== undefined ? safety.min_value : null),
+      max_value: (safety.max_value !== undefined ? safety.max_value : null)
     });
     channelIds.push(chId);
   }

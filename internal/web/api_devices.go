@@ -37,25 +37,28 @@ import (
 // of its own, since it is also used internally by cmd/mbgw/server.go
 // without ever being serialized there).
 type deviceJSON struct {
-	ID                    string `json:"id"`
-	Name                  string `json:"name"`
-	Kind                  string `json:"kind"` // "vkm360" | "akron"
-	Profile               string `json:"profile"`
-	TransportKind         string `json:"transport_kind"`
-	Host                  string `json:"host"`
-	Port                  int    `json:"port"`
-	COM                   string `json:"com"`
-	Baudrate              int    `json:"baudrate"`
-	Parity                string `json:"parity"`
-	StopBits              int    `json:"stopbits"`
-	TimeoutMs             int    `json:"timeout_ms"`
-	UnitID                int    `json:"unit_id"`
-	Retries               int    `json:"retries"`
-	CurrentPollSeconds    int    `json:"current_poll_seconds"`
-	BackfillMaxDepthHours int    `json:"backfill_max_depth_hours"`
-	GapScanWindowHours    int    `json:"gap_scan_window_hours"`
-	ArchiveAtMinute       int    `json:"archive_at_minute"` // -1 = unset/default
-	Enabled               bool   `json:"enabled"`
+	ID                              string `json:"id"`
+	Name                            string `json:"name"`
+	Kind                            string `json:"kind"` // "vkm360" | "akron"
+	Profile                         string `json:"profile"`
+	TransportKind                   string `json:"transport_kind"`
+	Host                            string `json:"host"`
+	Port                            int    `json:"port"`
+	COM                             string `json:"com"`
+	Baudrate                        int    `json:"baudrate"`
+	Parity                          string `json:"parity"`
+	StopBits                        int    `json:"stopbits"`
+	TimeoutMs                       int    `json:"timeout_ms"`
+	UnitID                          int    `json:"unit_id"`
+	Retries                         int    `json:"retries"`
+	CurrentPollSeconds              int    `json:"current_poll_seconds"`
+	BackfillMaxDepthHours           int    `json:"backfill_max_depth_hours"`
+	GapScanWindowHours              int    `json:"gap_scan_window_hours"`
+	ArchiveAtMinute                 int    `json:"archive_at_minute"` // -1 = unset/default
+	TimeCorrectionDeadbandSeconds   int    `json:"time_correction_deadband_seconds"`
+	TimeCorrectionMaxStepSeconds    int    `json:"time_correction_max_step_seconds"`
+	TimeCorrectionDailyLimitSeconds int    `json:"time_correction_daily_limit_seconds"`
+	Enabled                         bool   `json:"enabled"`
 	// Overwrite must be explicitly true to upsert over an ID that already
 	// exists. Defense in depth against the 2026-08-23 incident (saving a
 	// new device silently overwrote a different, already-saved one that
@@ -75,7 +78,10 @@ func deviceToJSON(d sqliterepo.DeviceRecord) deviceJSON {
 		TimeoutMs: d.TimeoutMs, UnitID: d.UnitID, Retries: d.Retries,
 		CurrentPollSeconds: d.CurrentPollSeconds, BackfillMaxDepthHours: d.BackfillMaxDepthHours,
 		GapScanWindowHours: d.GapScanWindowHours, ArchiveAtMinute: d.ArchiveAtMinute,
-		Enabled: d.Enabled,
+		TimeCorrectionDeadbandSeconds:   d.TimeCorrectionDeadbandSeconds,
+		TimeCorrectionMaxStepSeconds:    d.TimeCorrectionMaxStepSeconds,
+		TimeCorrectionDailyLimitSeconds: d.TimeCorrectionDailyLimitSeconds,
+		Enabled:                         d.Enabled,
 	}
 }
 
@@ -87,7 +93,10 @@ func deviceFromJSON(j deviceJSON) sqliterepo.DeviceRecord {
 		TimeoutMs: j.TimeoutMs, UnitID: j.UnitID, Retries: j.Retries,
 		CurrentPollSeconds: j.CurrentPollSeconds, BackfillMaxDepthHours: j.BackfillMaxDepthHours,
 		GapScanWindowHours: j.GapScanWindowHours, ArchiveAtMinute: j.ArchiveAtMinute,
-		Enabled: j.Enabled,
+		TimeCorrectionDeadbandSeconds:   j.TimeCorrectionDeadbandSeconds,
+		TimeCorrectionMaxStepSeconds:    j.TimeCorrectionMaxStepSeconds,
+		TimeCorrectionDailyLimitSeconds: j.TimeCorrectionDailyLimitSeconds,
+		Enabled:                         j.Enabled,
 	}
 }
 
@@ -143,6 +152,26 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 		if j.Kind != "vkm360" && j.Kind != "akron" {
 			writeError(w, http.StatusBadRequest, `поле kind должно быть "vkm360" или "akron"`)
 			return
+		}
+		if j.TimeCorrectionDeadbandSeconds < 0 {
+			writeError(w, http.StatusBadRequest, "допустимое рассинхронизирование времени не может быть отрицательным")
+			return
+		}
+		if j.TimeCorrectionMaxStepSeconds < 0 || j.TimeCorrectionMaxStepSeconds > 99 {
+			writeError(w, http.StatusBadRequest, "максимальная коррекция за один раз должна быть от 0 до 99 секунд")
+			return
+		}
+		if j.TimeCorrectionDailyLimitSeconds < 0 {
+			writeError(w, http.StatusBadRequest, "максимальная коррекция за 24 часа не может быть отрицательной")
+			return
+		}
+		if j.Kind != "vkm360" {
+			// Эти настройки относятся только к ВКМ-360. При смене типа
+			// прибора на Akron не оставляем скрытые значения, которые
+			// могут неожиданно сработать при последующей смене типа обратно.
+			j.TimeCorrectionDeadbandSeconds = 0
+			j.TimeCorrectionMaxStepSeconds = 0
+			j.TimeCorrectionDailyLimitSeconds = 0
 		}
 		existing, existsAlready, err := s.repo.GetDevice(r.Context(), j.ID)
 		if err != nil {
