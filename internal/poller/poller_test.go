@@ -163,3 +163,35 @@ func TestPoller_ArchiveTask_Dispatched(t *testing.T) {
 		t.Fatalf("expected an archive task to NOT call ReadRaw (that's Poll's path, not PollArchives'), got %d reads", cli.Reads())
 	}
 }
+
+func TestRunDeviceQueue_CancelDropsPendingTasks(t *testing.T) {
+	dev, cli := newTestDevice(t, "dev1")
+	sched := scheduler.New(nil)
+	p := New(sched, map[string]*device.Device{"dev1": dev}, time.Second)
+
+	q := &deviceTaskQueue{
+		tasks: []scheduler.Task{
+			{DeviceID: "dev1", Kind: scheduler.KindCurrent},
+			{DeviceID: "dev1", Kind: scheduler.KindCurrent},
+		},
+		running: true,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	p.runDeviceQueue(ctx, q)
+
+	if cli.Reads() != 0 {
+		t.Fatalf("expected cancelled queue to dispatch no pending tasks, got %d reads", cli.Reads())
+	}
+
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.running {
+		t.Fatal("expected cancelled queue worker to mark itself stopped")
+	}
+	if len(q.tasks) != 0 {
+		t.Fatalf("expected cancelled queue to drop pending tasks, got %d", len(q.tasks))
+	}
+}

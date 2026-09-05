@@ -94,14 +94,14 @@ func New(id string, p *profile.Profile, cli PointClient, sess session.Session, r
 }
 
 // leaseAcquireRetries / leaseAcquireRetryDelay управляют повторными
-// попытками занять lease конкретного прибора+архива, когда она временно
-// занята чем-то ещё — прежде всего принудительным переопросом (см.
+// попытками занять lease конкретного прибора, когда он временно
+// занят другой логической операцией — прежде всего принудительным переопросом (см.
 // vkm_reload.go/ForceReloadVKMHourly, akron_reload.go/
 // ForceReloadAkronHourly — оба держат lease только на время ОДНОГО
 // запрошенного периода, отпуская её между периодами через
 // collectVKMPeriod/аналогичную функцию Akron). Без повтора обычный
-// плановый такт (pollVKMHourlyLatest / generic-ветка PollArchives ниже),
-// попавший ровно в момент, когда переопрос удерживает линию, молча
+// плановый такт (Poll / pollVKMHourlyLatest / generic-ветка PollArchives ниже),
+// попавший ровно в момент, когда переопрос удерживает прибор, молча
 // пропускал бы весь такт — до часа простоя получасовки, пока не
 // сработает следующий тик планировщика.
 //
@@ -119,7 +119,7 @@ const (
 )
 
 // acquireLeaseWithRetry — обёртка над d.Lease.Acquire с повтором ИМЕННО
-// при конфликте занятости (errs.ErrLease, см. internal/lease/lease.go).
+// при конфликте занятости всего прибора (errs.ErrLease, см. internal/lease/lease.go).
 // Прочие ошибки (например, пустой deviceID) возвращаются немедленно, без
 // бессмысленного ожидания — они сами по себе не "рассосутся" со
 // временем, в отличие от занятой линии связи.
@@ -146,7 +146,7 @@ func (d *Device) acquireLeaseWithRetry(ctx context.Context, leaseContext string,
 		case <-time.After(leaseAcquireRetryDelay):
 		}
 	}
-	return nil, fmt.Errorf("после %d попыток за %v (линия связи занята другой операцией): %w",
+	return nil, fmt.Errorf("после %d попыток за %v (прибор занят другой операцией): %w",
 		leaseAcquireRetries, time.Duration(leaseAcquireRetries)*leaseAcquireRetryDelay, lastErr)
 }
 
@@ -213,6 +213,13 @@ func (d *Device) detectFirmwareVariant(ctx context.Context) {
 // (exported so internal/poller can drive it centrally; Device.Start
 // still exists for standalone/single-device use and calls this too).
 func (d *Device) Poll(ctx context.Context) {
+	release, leaseErr := d.acquireLeaseWithRetry(ctx, "current", 30*time.Second)
+	if leaseErr != nil {
+		log.Printf("[%s] текущий опрос: не удалось занять lease прибора: %v\n", d.ID, leaseErr)
+		return
+	}
+	defer release()
+
 	d.updateTimeDrift(ctx)
 	statusValues := d.collectStatusValues(ctx)
 

@@ -783,7 +783,8 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 		}
 		return
 	}
-	unlockIO := pollcore.LockKey(devRec.ID)
+	ioLockKey := pollcore.PhysicalIOLockKey(trParams, devRec.ID)
+	unlockIO := pollcore.LockKey(ioLockKey)
 	err = sess.Open(ctx, tr)
 	unlockIO()
 	if err != nil {
@@ -796,7 +797,7 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	if unitID == 0 {
 		unitID = 1
 	}
-	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), devRec.ID)
+	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), ioLockKey)
 
 	// Сбор паспорта прибора (заводской номер, тип, версия прошивки) —
 	// ОБЯЗАТЕЛЬНЫЙ шаг для Akron перед запуском приёма данных для ЭС:

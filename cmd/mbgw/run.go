@@ -130,7 +130,12 @@ func run() {
 			log.Printf("[ERROR] прибор %s: не удалось открыть транспорт: %v\n", devCfg.ID, err)
 			continue
 		}
-		if err := sess.Open(ctx, tr); err != nil {
+
+		ioLockKey := pollcore.PhysicalIOLockKey(trParams, devCfg.ID)
+		unlockIO := pollcore.LockKey(ioLockKey)
+		err = sess.Open(ctx, tr)
+		unlockIO()
+		if err != nil {
 			log.Printf("[ERROR] ошибка сессии %s: %v\n", devCfg.ID, err)
 			continue
 		}
@@ -143,7 +148,7 @@ func run() {
 		if unitID == 0 {
 			unitID = 1
 		}
-		reader := pollcore.NewWithLockKey(tr, isTCP, unitID, devCfg.ID)
+		reader := pollcore.NewWithLockKey(tr, isTCP, unitID, ioLockKey)
 		dev := device.New(devCfg.ID, p, reader, sess, repo, leaseMgr)
 		dev.GapScanWindowHours = devCfg.Backfill.GapScanWindowOrDefault()
 		devices[devCfg.ID] = dev

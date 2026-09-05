@@ -136,6 +136,20 @@ func (p *Poller) enqueueAsync(ctx context.Context, task scheduler.Task) {
 
 func (p *Poller) runDeviceQueue(ctx context.Context, q *deviceTaskQueue) {
 	for {
+		// Shutdown means this per-device queue is no longer useful. Drop
+		// pending work instead of walking the FIFO and dispatching tasks with
+		// an already-cancelled context. The task currently inside dispatch
+		// still receives ctx and is responsible for stopping its own I/O.
+		select {
+		case <-ctx.Done():
+			q.mu.Lock()
+			q.tasks = nil
+			q.running = false
+			q.mu.Unlock()
+			return
+		default:
+		}
+
 		q.mu.Lock()
 		if len(q.tasks) == 0 {
 			q.running = false

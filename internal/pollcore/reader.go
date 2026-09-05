@@ -2,15 +2,47 @@ package pollcore
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 
 	"mbgw/internal/protocol/modbus"
 	"mbgw/internal/transport"
 )
 
-// sharedIOLocks serializes access to the same physical device/channel even
-// when different Reader instances are created for it (for example the
-// long-lived server reader and a one-shot diagnostic probe).
+// PhysicalIOLockKey returns the mutex key for the physical southbound
+// channel represented by params.
+//
+// RTU serial is keyed by COM port because multiple Modbus unit IDs can
+// share one RS-485 bus. TCP-serial is keyed by host:port because one
+// converter endpoint normally represents one serial bus. Native Modbus
+// TCP keeps the existing per-device isolation: separate devices use
+// separate TCP connections and do not need to block each other.
+func PhysicalIOLockKey(params transport.Params, deviceID string) string {
+	switch params.Kind {
+	case transport.KindRTUSerial:
+		if com := strings.TrimSpace(params.COM); com != "" {
+			return "rtu_serial:" + strings.ToUpper(com)
+		}
+	case transport.KindTCPSerial:
+		host := strings.ToLower(strings.TrimSpace(params.Host))
+		if host != "" && params.Port > 0 {
+			return fmt.Sprintf("tcp_serial:%s:%d", host, params.Port)
+		}
+	case transport.KindModbusTCP:
+		if deviceID != "" {
+			return "modbus_tcp:" + deviceID
+		}
+	}
+
+	if deviceID != "" {
+		return "device:" + deviceID
+	}
+	return ""
+}
+
+// sharedIOLocks serializes access to the same physical channel even
+// when different Reader instances are created for devices that share it.
 var sharedIOLocks sync.Map // map[string]*sync.Mutex
 
 func sharedIOMutex(lockKey string) *sync.Mutex {
@@ -26,7 +58,7 @@ func sharedIOMutex(lockKey string) *sync.Mutex {
 // such as a session handshake.
 //
 // Callers must use the exact same lockKey that was passed to
-// NewWithLockKey for the same physical device.
+// NewWithLockKey for the same physical channel.
 func LockKey(lockKey string) func() {
 	mu := sharedIOMutex(lockKey)
 	mu.Lock()
@@ -38,7 +70,7 @@ func LockKey(lockKey string) func() {
 //
 // ioMu covers the WHOLE transaction, including protocol retries. When a
 // shared lock key is supplied, different Reader instances for the same
-// physical device use the same mutex, so current/archive/backfill/manual
+// physical channel use the same mutex, so current/archive/backfill/manual
 // reload/diagnostic traffic cannot overlap on the wire.
 type Reader struct {
 	tr     transport.Transport
