@@ -266,24 +266,127 @@ func (d *Device) Poll(ctx context.Context) {
 }
 
 // updateTimeDrift publishes the current meter clock state for the
-// dashboard.
+// dashboard using a clock source that is explicitly known for this profile.
 //
-// Akron has a live-confirmed read-only clock block at function 03,
-// registers 0x10..0x13.
+// IMPORTANT: do not fall back to VKM for an unknown Modbus profile. That old
+// behaviour made every non-Akron profile (including VZLET/IVK-TER) try the
+// VKM-specific HR1800..1805 clock block and could therefore report a bogus
+// or permanently unavailable time state.
 //
-// VKM-360 has a live-confirmed read-only clock block at holding registers
-// 1800..1805: day, month, year, hour, minute, second. The block is read in
-// ONE transaction so the fields cannot straddle a second boundary.
+// Known clock sources:
+//   - Akron: function 03, registers 0x10..0x13 (BCD clock block);
+//   - VZLET profiles with current_time: IR 0x8000, uint32 Unix timestamp;
+//   - VKM-360: HR1800..1805, day/month/year/hour/minute/second.
 //
-// For both meter types, server time is sampled immediately before and
-// after the Modbus transaction and the midpoint is used for comparison,
-// which removes most request/response latency bias.
+// Server time is sampled immediately before and after the physical read and
+// the midpoint is used for comparison, which removes most request/response
+// latency bias.
 func (d *Device) updateTimeDrift(ctx context.Context) {
-	if d.hasAkronArchive() {
+	switch {
+	case d.hasAkronArchive():
 		d.updateAkronTimeDrift(ctx)
+	case d.hasVZLETUnixClock():
+		d.updateVZLETTimeDrift(ctx)
+	case d.hasVKMArchive():
+		d.updateVKMTimeDrift(ctx)
+	default:
+		model := "unknown"
+		if d.Profile != nil && d.Profile.Meta.Model != "" {
+			model = d.Profile.Meta.Model
+		}
+		devicestatus.Set(d.ID, devicestatus.TimeDrift{
+			CheckedAt: time.Now(),
+			Reliable:  false,
+			Note:      fmt.Sprintf("проверка текущих часов для профиля %s не поддерживается", model),
+		})
+	}
+}
+
+// hasVZLETUnixClock detects the explicit VZLET-style current clock point.
+// The profile is authoritative here: IVK-TER and TSRV-024 declare a readable
+// current_time point as uint32 Unix time. Requiring the exact point shape
+// avoids accidentally treating an unrelated uint32 timestamp as the clock.
+func (d *Device) hasVZLETUnixClock() bool {
+	if d.Profile == nil {
+		return false
+	}
+	for _, pt := range d.Profile.Points {
+		if pt.Name == "current_time" && pt.Space == "IR" && pt.AddrOrZero() == 32768 &&
+			pt.Type == "uint32" && pt.Epoch != "" && pt.Access != "write" {
+			return true
+		}
+	}
+	return false
+}
+
+// hasVKMArchive identifies VKM by its dedicated archive strategy instead of
+// by exclusion. This keeps model routing fail-closed when a new Modbus profile
+// is added later.
+func (d *Device) hasVKMArchive() bool {
+	if d.Profile == nil {
+		return false
+	}
+	for _, a := range d.Profile.Archives {
+		if a.Strategy == "mb_request_poll_string" {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *Device) updateVZLETTimeDrift(ctx context.Context) {
+	deviceTime, midpoint, err := d.readVZLETUnixClock(ctx)
+	if err != nil {
+		devicestatus.Set(d.ID, devicestatus.TimeDrift{
+			CheckedAt: midpoint,
+			Reliable:  false,
+			Note:      "не удалось прочитать текущие часы VZLET: " + err.Error(),
+		})
 		return
 	}
-	d.updateVKMTimeDrift(ctx)
+
+	devicestatus.Set(d.ID, devicestatus.TimeDrift{
+		CheckedAt:    midpoint,
+		DriftSeconds: deviceTime.Sub(midpoint).Seconds(),
+		Reliable:     true,
+	})
+}
+
+func (d *Device) readVZLETUnixClock(ctx context.Context) (time.Time, time.Time, error) {
+	if d.Profile == nil {
+		return time.Time{}, time.Now(), errors.New("профиль прибора не задан")
+	}
+
+	var clockPoint *profile.Point
+	for i := range d.Profile.Points {
+		pt := &d.Profile.Points[i]
+		if pt.Name == "current_time" && pt.Space == "IR" && pt.AddrOrZero() == 32768 &&
+			pt.Type == "uint32" && pt.Epoch != "" && pt.Access != "write" {
+			clockPoint = pt
+			break
+		}
+	}
+	if clockPoint == nil {
+		return time.Time{}, time.Now(), errors.New("в профиле нет читаемой точки current_time IR 0x8000 uint32")
+	}
+
+	before := time.Now()
+	raw, err := d.Client.ReadRaw(ctx, clockPoint.Space, clockPoint.AddrOrZero(), clockPoint.Type)
+	after := time.Now()
+	midpoint := before.Add(after.Sub(before) / 2)
+	if err != nil {
+		return time.Time{}, midpoint, err
+	}
+
+	seconds, err := codec.DecodeUint32(raw, d.Profile.Codec.WordOrder32)
+	if err != nil {
+		return time.Time{}, midpoint, err
+	}
+	if seconds == 0 || seconds == 0xFFFFFFFF {
+		return time.Time{}, midpoint, fmt.Errorf("некорректное значение часов 0x%08X", seconds)
+	}
+
+	return time.Unix(int64(seconds), 0).UTC(), midpoint, nil
 }
 
 // timeCorrectionStore is deliberately a narrow local interface instead of
