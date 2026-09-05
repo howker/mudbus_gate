@@ -75,6 +75,7 @@ type dashboardDeviceStatus struct {
 	// existing dashboard JSON shape remains backward compatible (an array
 	// of devices) while the UI can still surface system health.
 	PollerLastCycle string `json:"poller_last_cycle,omitempty"`
+	PollerOK        bool   `json:"poller_ok"`
 	SQLiteCheckedAt string `json:"sqlite_checked_at,omitempty"`
 	SQLiteOK        bool   `json:"sqlite_ok"`
 	SQLiteError     string `json:"sqlite_error,omitempty"`
@@ -139,6 +140,10 @@ func (s *Server) handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		if !healthSnapshot.PollerLastCycle.IsZero() {
 			st.PollerLastCycle = healthSnapshot.PollerLastCycle.Format("02.01.2006 15:04:05")
+			// Poller.Run is driven by a one-second ticker in the production
+			// server. Ten seconds gives ample scheduling headroom while still
+			// turning the dashboard red quickly if the polling loop stops.
+			st.PollerOK = time.Since(healthSnapshot.PollerLastCycle) <= 10*time.Second
 		}
 		if !healthSnapshot.SQLiteCheckedAt.IsZero() {
 			st.SQLiteCheckedAt = healthSnapshot.SQLiteCheckedAt.Format("02.01.2006 15:04:05")

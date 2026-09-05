@@ -209,9 +209,8 @@ func probeAkron(ctx context.Context, req probeRequest) probeResponse {
 // (byte-order detection + authorization — required for this device,
 // unlike Akron's session "none", see profiles/vkm360.yaml's session
 // type "modbus_byteorder_auth"), then reads a handful of plain
-// registers: serial number + firmware version (identification-
-// equivalent), the device's own clock (1800-1805HR, read-only per
-// registri_mbrrtu_vkm.pdf), and three instantaneous readings on pipe 1
+// registers: the device's own clock (1800-1805HR, live-confirmed
+// 2026-09-05) and three instantaneous readings on pipe 1
 // (pressure/temperature/mass flow) as a live proof-of-life beyond just
 // the clock. Deliberately does NOT touch the archive-string dance
 // (registers 7900-9999) — that's tools/vkmprobe's job for deep protocol
@@ -229,7 +228,7 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 		timeoutMs = 1000
 	}
 
-	tr, err := transport.New(transport.Params{
+	trParams := transport.Params{
 		Kind:            transport.Kind(req.TransportKind),
 		Host:            req.Host,
 		Port:            req.Port,
@@ -238,13 +237,14 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 		Parity:          req.Parity,
 		StopBits:        req.StopBits,
 		ResponseTimeout: time.Duration(timeoutMs) * time.Millisecond,
-		Retries:         3, // см. комментарий у Retries в probeAkron выше — тот же расчёт
-	})
+		Retries:         3,
+	}
+	tr, err := transport.New(trParams)
 	if err != nil {
 		return probeResponse{OK: false, Error: "не удалось создать транспорт: " + err.Error()}
 	}
 
-	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
 	if err := tr.Open(probeCtx); err != nil {
@@ -252,11 +252,17 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 	}
 	defer tr.Close()
 
+	// Используем тот же ключ физического канала, что и боевой poller.
+	// Это особенно важно для tcp_serial/общего конвертера: ручная
+	// проверка из UI не должна врезаться в текущий обмен другого прибора
+	// на том же физическом канале.
+	ioLockKey := pollcore.PhysicalIOLockKey(trParams, req.ID)
+
 	sess, err := session.New("modbus_byteorder_auth")
 	if err != nil {
 		return probeResponse{OK: false, Error: "создание сессии: " + err.Error()}
 	}
-	unlock := pollcore.LockKey(req.ID)
+	unlock := pollcore.LockKey(ioLockKey)
 	err = sess.Open(probeCtx, tr)
 	unlock()
 	if err != nil {
@@ -268,32 +274,31 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 	if unitID == 0 {
 		unitID = 1
 	}
-	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), req.ID)
+	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), ioLockKey)
 
 	resp := probeResponse{OK: true}
 
-	// ИЗМЕНЕНО (2026-08-29, проверено живьём через tools/vkmtimeprobe на
-	// boylernaya_par): здесь раньше были попытки прочитать серийный номер
-	// (1810HR), версию ПО (1807HR) и часы прибора (1800-1805HR) — все три
-	// взяты из документации ЭЛЕМЕР (registri_mbrrtu_vkm.pdf) как "должны
-	// быть реализованы", но НИ ОДИН из них не ответил на реальном приборе
-	// (таймаут, не ошибка Modbus — устройство просто не отвечает на эти
-	// адреса вообще). Убраны совсем, а не оставлены "на всякий случай" —
-	// иначе КАЖДАЯ проверка прибора ждала бы retries×backoff по трём
-	// заведомо мёртвым регистрам, прежде чем дойти до полезных данных.
-	// Если для другого экземпляра/прошивки ВКМ-360 этот блок всё же
-	// работает — его стоит вернуть, но уже как проверенный факт для
-	// конкретного прибора, не как общее предположение по документации.
+	// ТЕКУЩИЕ ЧАСЫ ВКМ-360 — подтверждено живьём 2026-09-05.
+	// Holding registers 1800..1805 (decimal) = day, month, year,
+	// hour, minute, second. Читаем все 6 регистров одной функцией 03,
+	// тем же способом, что боевой код device.readVKMClock.
+	clockResp, clockErr := reader.Transact(probeCtx, []byte{0x03, 0x07, 0x08, 0x00, 0x06})
+	if clockErr != nil {
+		resp.Error = firstNonEmpty(resp.Error, "время прибора (HR1800..1805): "+clockErr.Error())
+	} else if deviceTime, err := decodeProbeVKMClockResponse(clockResp, time.Local); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "разбор времени прибора: "+err.Error())
+	} else {
+		resp.DeviceTime = deviceTime.Format("02.01.2006 15:04:05")
+	}
+
+	// Заводской номер ВКМ здесь намеренно НЕ читаем. Ранее пробовали
+	// документированный HR1810, но на живом boylernaya_par прибор на этот
+	// адрес не отвечал. Без подтверждённого регистра/команды нельзя
+	// показывать оператору случайное значение как заводской номер.
 	//
-	// Мгновенные показания на трубопроводе №1 — единственное, что
-	// реально проверено. Адреса взяты НЕ из чужой документации, а прямо
-	// из profiles/vkm360.yaml (тот же профиль, что использует боевой
-	// цикл опроса этого самого прибора): IR 2000 (Избыточное давление),
-	// IR 2004 (Температура), IR 2000+(pipe-1)*100+8 = IR 2008 при pipe=1
-	// (Массовый расход). Форма добавления прибора пока не собирает номер
-	// трубы отдельно (это делается позже, на вкладке каналов ЭС), так
-	// что пробник намеренно всегда проверяет трубу №1 — просто как живой
-	// признак того, что прибор действительно отдаёт измерения.
+	// Мгновенные показания трубопровода №1 остаются дополнительным
+	// proof-of-life: это те же подтверждённые адреса, что использует
+	// профиль боевого опроса.
 	if data, err := reader.ReadRaw(probeCtx, "IR", 2000, "float"); err != nil {
 		resp.Error = firstNonEmpty(resp.Error, "давление (IR 2000): "+err.Error())
 	} else if v, err := codec.DecodeFloat32(data, "0123"); err == nil {
@@ -310,23 +315,61 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 		resp.MassFlow = fmt.Sprintf("%.4f кг/с", v)
 	}
 
-	// Если не прочиталось ВООБЩЕ ничего — сессия открылась, но за этим
-	// явно стоит неверный unit id, незасинхронизированная труба или
-	// нестандартная прошивка, а не частичный успех. Сообщаем как отказ,
-	// а не как "успех" с полностью пустым ответом.
-	//
-	// ИСПРАВЛЕНО (2026-08-29): раньше эта проверка смотрела на
-	// SerialNumber/DeviceTime — поля, которые probeVKM теперь вообще не
-	// заполняет (см. выше), так что она бы ВСЕГДА считала результат
-	// неуспешным, даже если все три мгновенных значения прочитались
-	// нормально. Теперь проверяет именно те поля, которые эта функция
-	// реально может заполнить.
-	if resp.Pressure == "" && resp.Temperature == "" && resp.MassFlow == "" {
+	// Если не прочиталось вообще ничего полезного, это уже не частичный
+	// успех. Время теперь тоже считается полноценным подтверждением
+	// живого ВКМ, даже если конкретные измерительные каналы трубы №1
+	// не настроены.
+	if resp.DeviceTime == "" && resp.Pressure == "" && resp.Temperature == "" && resp.MassFlow == "" {
 		resp.OK = false
-		resp.Error = firstNonEmpty(resp.Error, "сессия открыта, но ни один регистр не прочитался — проверьте unit id")
+		resp.Error = firstNonEmpty(resp.Error, "сессия открыта, но ни часы, ни измерительные регистры не прочитались — проверьте unit id")
 	}
 
 	return resp
+}
+
+func decodeProbeVKMClockResponse(resp []byte, loc *time.Location) (time.Time, error) {
+	if len(resp) < 14 {
+		return time.Time{}, fmt.Errorf("короткий ответ: %d байт, нужно минимум 14", len(resp))
+	}
+	if resp[0] != 0x03 {
+		return time.Time{}, fmt.Errorf("неожиданная функция 0x%02X вместо 0x03", resp[0])
+	}
+	if resp[1] < 12 {
+		return time.Time{}, fmt.Errorf("byte count=%d, нужно минимум 12", resp[1])
+	}
+
+	data := resp[2:14]
+	reg := func(i int) int {
+		return int(data[i*2])<<8 | int(data[i*2+1])
+	}
+
+	day := reg(0)
+	month := reg(1)
+	year := reg(2)
+	hour := reg(3)
+	minute := reg(4)
+	second := reg(5)
+
+	if second > 59 || minute > 59 || hour > 23 || month < 1 || month > 12 || day < 1 || day > 31 {
+		return time.Time{}, fmt.Errorf(
+			"время вне диапазона: %02d.%02d.%02d %02d:%02d:%02d",
+			day, month, year, hour, minute, second,
+		)
+	}
+	if year < 0 || year > 99 {
+		return time.Time{}, fmt.Errorf("год вне диапазона 0..99: %d", year)
+	}
+
+	fullYear := 2000 + year
+	t := time.Date(fullYear, time.Month(month), day, hour, minute, second, 0, loc)
+	if t.Year() != fullYear || int(t.Month()) != month || t.Day() != day {
+		return time.Time{}, fmt.Errorf(
+			"некорректная календарная дата: %02d.%02d.%04d",
+			day, month, fullYear,
+		)
+	}
+
+	return t, nil
 }
 
 // firstNonEmpty returns a if it's non-empty, otherwise b — used above to

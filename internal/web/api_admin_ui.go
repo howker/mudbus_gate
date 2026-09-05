@@ -146,6 +146,15 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <tbody id="dashboardTable"><tr><td colspan="9">Загрузка...</td></tr></tbody>
       </table>
 
+      <div style="margin-top:24px;">
+        <h3>История коррекции времени ВКМ</h3>
+        <p class="small-note">Показываются последние подтверждённые коррекции часов, сохранённые в БД шлюза. Положительное значение — часы прибора были сдвинуты вперёд, отрицательное — назад.</p>
+        <table>
+          <thead><tr><th>Прибор</th><th>Дата и время коррекции</th><th>Коррекция</th></tr></thead>
+          <tbody id="timeCorrectionsTable"><tr><td colspan="3">Загрузка...</td></tr></tbody>
+        </table>
+      </div>
+
       <!-- Всплывающий блок «Принудительная пересинхронизация с ЭС» —
            переехал сюда с вкладки «Подключение к ЭС» (2026-09-02,
            прямой запрос оператора) вместе с кнопкой «Синхронизировать
@@ -483,7 +492,7 @@ function showTab(name) {
   if (name === 'esconn') { loadESConnection(); }
   if (name === 'settings') { loadSettings(); }
   if (name === 'archive') { populateDeviceSelect('ar_device', null); setArchivePreset('week'); }
-  if (name === 'dashboard') { loadDashboard(); }
+  if (name === 'dashboard') { loadDashboard(); loadTimeCorrections(); }
   if (name === 'service') { loadServiceStatus(); }
   if (name === 'log') { renderDeviceActivityStrip(); }
 }
@@ -1100,6 +1109,7 @@ function humanizeLogLine(html) {
   s = s.replace(/сохранено часовок: (\d+)\/(\d+)/g, 'сохранено записей за час: $1 из $2');
   s = s.replace(/сохранено полей: (\d+)\/(\d+)/g, 'сохранено показателей: $1 из $2');
   s = s.replace(/проход завершён:/g, 'цикл отправки в ЭС завершён:');
+  s = s.replace(/\[ВРЕМЯ\] часы ВКМ скорректированы на/g, '[КОРРЕКЦИЯ ВРЕМЕНИ] ВКМ скорректирован на');
   s = s.replace(
     /записано (\d+), пропущено \(уже есть\) (\d+), ошибок (\d+), окно (\S+)\.\.(\S+)/g,
     'отправлено новых точек: $1, уже были в ЭС ранее: $2, ошибок: $3, проверенный период: $4 — $5'
@@ -1178,9 +1188,15 @@ function deviceIdFromLogLine(line) {
 function formatLogLine(line) {
   var html = escapeHtmlForLog(line);
   var cls = '';
-  if (line.indexOf('[ERROR]') !== -1 || line.indexOf('[FATAL]') !== -1) { cls = 'status-bad'; }
-  else if (line.indexOf('[WARN]') !== -1) { cls = 'log-warn'; }
-  else if (line.indexOf('[OK]') !== -1) { cls = 'status-good'; }
+  if (line.indexOf('[НЕТ СВЯЗИ]') !== -1 || line.indexOf('[ERROR]') !== -1 || line.indexOf('[FATAL]') !== -1) {
+    cls = 'status-bad';
+  } else if (line.indexOf('[WARN]') !== -1) {
+    cls = 'log-warn';
+  } else if (line.indexOf('[ВРЕМЯ]') !== -1) {
+    cls = (line.indexOf('часы ВКМ скорректированы на') !== -1) ? 'status-good' : 'log-warn';
+  } else if (line.indexOf('[OK]') !== -1) {
+    cls = 'status-good';
+  }
   html = humanizeLogLine(html);
 
   // Метка периода архива ("период 29.08.2026 22:30") — жирным.
@@ -1357,6 +1373,41 @@ function stopService() {
   xhr.send();
 }
 
+function loadTimeCorrections() {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/time-corrections?limit=100', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    var body = document.getElementById('timeCorrectionsTable');
+    if (!body) { return; }
+    if (xhr.status !== 200) {
+      body.innerHTML = '<tr><td colspan="3" class="status-bad">Не удалось загрузить историю коррекций</td></tr>';
+      return;
+    }
+
+    var data;
+    try { data = JSON.parse(xhr.responseText) || []; } catch (e) {
+      body.innerHTML = '<tr><td colspan="3" class="status-bad">Ошибка ответа сервера</td></tr>';
+      return;
+    }
+
+    var html = '';
+    for (var i = 0; i < data.length; i++) {
+      var r = data[i];
+      var deviceLabel = r.device_name ? (r.device_name + ' (' + r.device_id + ')') : r.device_id;
+      var seconds = parseInt(r.correction_seconds, 10) || 0;
+      var sign = seconds > 0 ? '+' : '';
+      html += '<tr><td>' + deviceLabel + '</td><td>' + r.corrected_at +
+        '</td><td class="status-good">' + sign + seconds + ' сек</td></tr>';
+    }
+    if (html === '') {
+      html = '<tr><td colspan="3">Коррекций времени пока не выполнялось</td></tr>';
+    }
+    body.innerHTML = html;
+  };
+  xhr.send();
+}
+
 function loadDashboard() {
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/api/dashboard', true);
@@ -1415,9 +1466,15 @@ function renderDashboardTable() {
       systemHealth.innerHTML = 'Состояние шлюза: нет настроенных приборов';
     } else {
       var h = rows[0];
-      var pollerText = h.poller_last_cycle
-        ? ('опрос приборов работает (последняя проверка ' + h.poller_last_cycle + ')')
-        : 'нет данных о работе опроса приборов';
+      var pollerOK = (h.poller_ok !== undefined) ? !!h.poller_ok : !!h.poller_last_cycle;
+      var pollerText;
+      if (pollerOK) {
+        pollerText = '<span class="status-good">опрос приборов работает</span>' +
+          (h.poller_last_cycle ? ' (последняя проверка ' + h.poller_last_cycle + ')' : '');
+      } else {
+        pollerText = '<span class="status-bad">опрос приборов НЕ работает</span>' +
+          (h.poller_last_cycle ? ' (последняя проверка ' + h.poller_last_cycle + ')' : '');
+      }
       var sqliteText;
       if (!h.sqlite_checked_at) {
         sqliteText = 'нет данных о локальной базе';
@@ -2295,6 +2352,7 @@ loadDevices();
 loadProfiles();
 resetDeviceForm();
 loadDashboard();
+loadTimeCorrections();
 // Автообновление вкладки «Главная» — раз в 30с, независимо от того,
 // какая вкладка сейчас открыта (дёшево: один маленький GET-запрос), так
 // что оператор видит актуальную картину сразу при переключении на неё,
@@ -2302,6 +2360,7 @@ loadDashboard();
 // дашборда на / (см. handleDashboard в server.go, setInterval(loadData,
 // 30000)) — уже проверенное на практике значение для этого проекта.
 setInterval(loadDashboard, 30000);
+setInterval(loadTimeCorrections, 30000);
 
 loadLog();
 // Опрос новых строк лога каждые 2с — независимо от того, какая вкладка

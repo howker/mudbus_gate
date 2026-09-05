@@ -195,6 +195,7 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/es-sync/trigger", s.handleSyncNow)
 	mux.HandleFunc("/api/es-sync/force-resync", s.handleForceResyncES)
 	mux.HandleFunc("/api/dashboard", s.handleDashboardStatus)
+	mux.HandleFunc("/api/time-corrections", s.handleTimeCorrections)
 	mux.HandleFunc("/api/log", s.handleLog)
 	mux.HandleFunc("/api/log/download", s.handleLogDownload)
 	mux.HandleFunc("/api/service/status", s.handleServiceStatus)

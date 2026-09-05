@@ -100,6 +100,43 @@ func collectAkronPassport(ctx context.Context, repo *sqliterepo.Repo, deviceID s
 // files in C:\, no extra flags to remember, regardless of how the
 // process is launched (double-click, PowerShell from any directory, or
 // as a Windows Service).
+var (
+	serviceReadyOnce            sync.Once
+	serviceReadyCh              = make(chan struct{})
+	serviceShutdownCompleteOnce sync.Once
+	serviceShutdownCompleteCh   = make(chan struct{})
+)
+
+func notifyServiceReady() {
+	serviceReadyOnce.Do(func() { close(serviceReadyCh) })
+}
+
+func notifyServiceShutdownComplete() {
+	serviceShutdownCompleteOnce.Do(func() { close(serviceShutdownCompleteCh) })
+}
+
+// profilePathNextToExe resolves every RELATIVE device-profile path from
+// the executable directory, not from the process working directory.
+// This is essential for Windows Service mode: SCM commonly starts a
+// service with a working directory such as C:\Windows\System32, while
+// the DB stores paths like "profiles/vkm360.yaml". Manual console runs
+// from the mbgw folder happened to work; the same relative path under
+// SCM did not.
+func profilePathNextToExe(name string) string {
+	if name == "" || filepath.IsAbs(name) {
+		return name
+	}
+	exePath, err := os.Executable()
+	if err != nil {
+		return name
+	}
+	exeDir, err := filepath.Abs(filepath.Dir(exePath))
+	if err != nil {
+		return name
+	}
+	return filepath.Join(exeDir, name)
+}
+
 func nextToExe(name string) string {
 	if filepath.IsAbs(name) || filepath.Dir(name) != "." {
 		return name // caller gave an explicit path — leave it alone
@@ -445,7 +482,11 @@ func runServer() {
 	// у dev.BackfillArchives ниже про инцидент 2026-07-29 — та гонка
 	// была между дозабором и ПЛАНОВЫМ опросом ОДНОГО И ТОГО ЖЕ прибора
 	// за lease, никак не связана с моментом запуска веб-сервера).
-	go webServer.Start(ctx)
+	webDone := make(chan struct{})
+	go func() {
+		defer close(webDone)
+		webServer.Start(ctx)
+	}()
 
 	// Devices come from the devices table (UpsertDevice/ListDevices,
 	// internal/storage/sqlite/repo_device_config.go) instead of
@@ -709,7 +750,19 @@ func runServer() {
 	})
 
 	pl := poller.New(sched, devices, 1*time.Second)
-	go pl.Run(ctx)
+	pollerDone := make(chan struct{})
+	go func() {
+		defer close(pollerDone)
+		pl.Run(ctx)
+	}()
+
+	// До этой точки дошли только после открытия БД, запуска web UI,
+	// регистрации доступных приборов и фактического запуска poller.
+	// Только теперь Windows Service может честно перейти из StartPending
+	// в Running. При обычном консольном запуске закрытие этого канала
+	// никому не мешает.
+	notifyServiceReady()
+	log.Println("[OK] основной цикл опроса запущен")
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -721,6 +774,26 @@ func runServer() {
 	case <-webStop:
 		log.Println("=== получен запрос на остановку через веб-интерфейс. остановка... ===")
 	}
+
+	// Сначала реально останавливаем рабочие циклы, и только после этого
+	// mbgwServiceHandler сообщает SCM состояние Stopped. Раньше порядок
+	// был обратным: SCM уже видел "остановлена", пока runServer ещё
+	// только начинал завершение.
+	cancel()
+
+	select {
+	case <-pollerDone:
+	case <-time.After(3 * time.Second):
+		log.Println("[WARN] poller не завершился за 3 секунды — продолжаю остановку")
+	}
+	select {
+	case <-webDone:
+	case <-time.After(3 * time.Second):
+		log.Println("[WARN] web-сервер не завершился за 3 секунды — продолжаю остановку")
+	}
+
+	notifyServiceShutdownComplete()
+	log.Println("=== mbgw остановлен ===")
 }
 
 // registerOneDevice делает всё, что раньше было одной итерацией
@@ -737,9 +810,11 @@ func runServer() {
 // строго последовательно), так что блокировка обязательна на каждую
 // запись, не только ради HTTP-обработчиков, как было раньше.
 func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqliterepo.DeviceRecord, leaseMgr *lease.LocalLease, sched *scheduler.Scheduler, dbPath string, devicesMu *sync.Mutex, devices map[string]*device.Device, deviceKinds map[string]string, esSyncTriggers map[string]chan struct{}) {
-	p, err := profile.Parse(devRec.Profile)
+	profilePath := profilePathNextToExe(devRec.Profile)
+	p, err := profile.Parse(profilePath)
 	if err != nil {
-		log.Printf("[ERROR] прибор %s: ошибка профиля %s: %v\n", devRec.ID, devRec.Profile, err)
+		log.Printf("[ERROR] прибор %s: ошибка профиля %s (разрешённый путь %s): %v\n",
+			devRec.ID, devRec.Profile, profilePath, err)
 		return
 	}
 	sess, err := session.NewFromProfile(p.Session)

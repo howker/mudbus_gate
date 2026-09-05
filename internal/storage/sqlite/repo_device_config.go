@@ -385,6 +385,52 @@ WHERE device_id = ? AND corrected_at > ? AND corrected_at <= ?
 	return used, nil
 }
 
+// TimeCorrectionRecord is one durable clock-correction audit row.
+// CorrectionSeconds is signed: positive moved the device clock forward,
+// negative moved it backward.
+type TimeCorrectionRecord struct {
+	ID                int64
+	DeviceID          string
+	CorrectedAt       time.Time
+	CorrectionSeconds int
+}
+
+// ListTimeCorrections returns the newest correction events first.
+// limit<=0 uses the operator UI default of 100; a hard cap protects the
+// admin endpoint from accidentally loading an unbounded history.
+func (r *Repo) ListTimeCorrections(ctx context.Context, limit int) ([]TimeCorrectionRecord, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	rows, err := r.db.QueryContext(ctx, `
+SELECT id, device_id, corrected_at, correction_seconds
+FROM device_time_corrections
+ORDER BY corrected_at DESC, id DESC
+LIMIT ?
+`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list device time corrections: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]TimeCorrectionRecord, 0)
+	for rows.Next() {
+		var rec TimeCorrectionRecord
+		if err := rows.Scan(&rec.ID, &rec.DeviceID, &rec.CorrectedAt, &rec.CorrectionSeconds); err != nil {
+			return nil, fmt.Errorf("scan device time correction: %w", err)
+		}
+		out = append(out, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate device time corrections: %w", err)
+	}
+	return out, nil
+}
+
 // VKMChannelRecord is one tag->ЭС-channel mapping row.
 type VKMChannelRecord struct {
 	DeviceID    string

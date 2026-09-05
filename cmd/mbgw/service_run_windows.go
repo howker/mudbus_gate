@@ -5,6 +5,8 @@ package main
 import (
 	"fmt"
 	"log"
+	"sync"
+	"time"
 
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
@@ -66,34 +68,71 @@ func runServerAsWindowsServiceIfApplicable() <-chan struct{} {
 }
 
 // mbgwServiceHandler реализует интерфейс svc.Handler — протокол
-// взаимодействия со службами Windows. Сразу подтверждает SCM, что
-// служба запущена (Running), НЕ дожидаясь завершения регистрации
-// приборов — это отдельный, более ранний и быстрый шаг, чем настоящая
-// готовность самого сервера опроса. Слушает запросы на остановку
+// взаимодействия со службами Windows. Сначала сообщает StartPending,
+// а Running отправляет только после notifyServiceReady из runServer —
+// то есть когда основной poller уже действительно запущен. Слушает
+// запросы на остановку
 // (Stop/Shutdown от SCM, например через "Службы Windows" или
 // "sc stop mbgw_service") и по такому запросу закрывает stopChan,
 // сигнализируя основному коду runServer() начать штатную остановку —
 // тот же путь остановки, что и при обычном Ctrl+C.
 type mbgwServiceHandler struct {
 	stopChan chan struct{}
+	stopOnce sync.Once
+}
+
+func (h *mbgwServiceHandler) requestStop(changes chan<- svc.Status) {
+	changes <- svc.Status{State: svc.StopPending}
+	h.stopOnce.Do(func() { close(h.stopChan) })
+
+	// runServer сначала отменяет context и ждёт завершения poller/web,
+	// после чего закрывает serviceShutdownCompleteCh. Не объявляем SCM
+	// "Stopped" раньше фактической остановки рабочих циклов.
+	select {
+	case <-serviceShutdownCompleteCh:
+	case <-time.After(10 * time.Second):
+		// Защитный предел: SCM не должен зависнуть навсегда, даже если
+		// какой-то сторонний I/O не подчинился отмене контекста.
+		log.Printf("[WARN] служба: штатное завершение не подтвердилось за 10 секунд\n")
+	}
+	changes <- svc.Status{State: svc.Stopped}
 }
 
 func (h *mbgwServiceHandler) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
 	const acceptedCommands = svc.AcceptStop | svc.AcceptShutdown
 
+	// ВАЖНО: StartPending держим до тех пор, пока runServer реально не
+	// запустит основной poller. Раньше Running отправлялся сразу после
+	// входа в Execute, хотя БД/профили/приборы ещё могли не открыться.
 	changes <- svc.Status{State: svc.StartPending}
-	changes <- svc.Status{State: svc.Running, Accepts: acceptedCommands}
+
+starting:
+	for {
+		select {
+		case <-serviceReadyCh:
+			changes <- svc.Status{State: svc.Running, Accepts: acceptedCommands}
+			break starting
+
+		case req, ok := <-r:
+			if !ok {
+				return false, 0
+			}
+			switch req.Cmd {
+			case svc.Interrogate:
+				changes <- svc.Status{State: svc.StartPending}
+			case svc.Stop, svc.Shutdown:
+				h.requestStop(changes)
+				return false, 0
+			}
+		}
+	}
 
 	for req := range r {
 		switch req.Cmd {
 		case svc.Interrogate:
-			// SCM периодически спрашивает "как дела" — просто повторяем
-			// последний известный статус, как и требует протокол.
-			changes <- req.CurrentStatus
+			changes <- svc.Status{State: svc.Running, Accepts: acceptedCommands}
 		case svc.Stop, svc.Shutdown:
-			changes <- svc.Status{State: svc.StopPending}
-			close(h.stopChan)
-			changes <- svc.Status{State: svc.Stopped}
+			h.requestStop(changes)
 			return false, 0
 		}
 	}
