@@ -110,6 +110,11 @@ type reloadJob struct {
 	Finished bool   `json:"finished"`
 	Error    string `json:"error,omitempty"`
 
+	// StartedAt нужен runtime-монитору опроса. В JSON прогресса переопроса
+	// отдельно не отдаётся: API монитора читает его внутри процесса.
+	StartedAt  time.Time `json:"-"`
+	FinishedAt time.Time `json:"-"`
+
 	// cancel останавливает именно ЭТОТ переопрос (см. handleForceReload/
 	// handleReloadCancel в api_reload.go) — не экспортируется в JSON,
 	// нужен только внутри процесса.
@@ -134,9 +139,9 @@ func (s *Server) SetForceReload(fn func(jobCtx context.Context, deviceID string,
 	s.onForceReload = fn
 }
 
-// SetSyncNow подключает возможность попросить es-sync сделать внеплановый
-// проход прямо сейчас — используется кнопкой «Синхронизировать сейчас»
-// и «Принудительным переопросом» (добавлено 2026-08-27).
+// SetSyncNow подключает возможность явно попросить синхронизацию с ЭС
+// сделать внеплановый проход прямо сейчас. Принудительный переопрос архива
+// этот callback НЕ вызывает: локальный переопрос и запись в ЭС разделены.
 func (s *Server) SetSyncNow(fn func(deviceID string) error) {
 	s.onSyncNow = fn
 }
@@ -195,6 +200,7 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/es-sync/trigger", s.handleSyncNow)
 	mux.HandleFunc("/api/es-sync/force-resync", s.handleForceResyncES)
 	mux.HandleFunc("/api/dashboard", s.handleDashboardStatus)
+	mux.HandleFunc("/api/poll-monitor", s.handlePollMonitor)
 	mux.HandleFunc("/api/time-corrections", s.handleTimeCorrections)
 	mux.HandleFunc("/api/log", s.handleLog)
 	mux.HandleFunc("/api/log/download", s.handleLogDownload)

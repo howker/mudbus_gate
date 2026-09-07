@@ -273,6 +273,35 @@ func (s *Scheduler) Tick(now time.Time) {
 	}
 }
 
+// NextPollAt returns the exact earliest next scheduled current/archive poll
+// for deviceID according to the scheduler's live due-times. Manual tasks are
+// intentionally not included: they are already queued work, not the next
+// planned poll. Zero/false means the device is unknown or has no enabled
+// schedule.
+func (s *Scheduler) NextPollAt(deviceID string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ds, ok := s.devices[deviceID]
+	if !ok {
+		return time.Time{}, false
+	}
+
+	var next time.Time
+	if ds.currentInterval > 0 && !ds.nextCurrentDue.IsZero() {
+		next = ds.nextCurrentDue
+	}
+	if ds.archiveInterval > 0 && !ds.nextArchiveDue.IsZero() {
+		if next.IsZero() || ds.nextArchiveDue.Before(next) {
+			next = ds.nextArchiveDue
+		}
+	}
+	if next.IsZero() {
+		return time.Time{}, false
+	}
+	return next, true
+}
+
 // RequestManualPoll injects a high-priority task for an operator-requested
 // poll (FINAL_TRD.md section 5.3), jumping ahead of normal-priority tasks
 // already queued.

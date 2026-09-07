@@ -5,13 +5,24 @@ import (
 	"time"
 )
 
-// DeviceStatus is the useful-work heartbeat for one configured meter.
-// A timestamp is updated only after useful work was actually confirmed,
-// not merely because a scheduled task started.
+// DeviceStatus хранит подтверждённую полезную работу и текущее состояние
+// опроса одного прибора. Поля копируются наружу только через Get().
 type DeviceStatus struct {
 	LastCurrentSuccess time.Time
 	LastArchiveSuccess time.Time
 	LastESWriteSuccess time.Time
+
+	PollInProgress bool
+	PollStartedAt  time.Time
+	PollKind       string
+
+	LastPollFinishedAt time.Time
+	LastPollOK         bool
+	LastPollKnown      bool
+	LastPollKind       string
+	LastPollError      string
+
+	NextPollAt time.Time
 }
 
 // Snapshot is a point-in-time copy safe for the Web/API layer.
@@ -74,6 +85,48 @@ func MarkESWriteSuccess(deviceID string, at time.Time) {
 	state.Lock()
 	st := state.devices[deviceID]
 	st.LastESWriteSuccess = at
+	state.devices[deviceID] = st
+	state.Unlock()
+}
+
+// MarkPollStarted отмечает реальное начало задания poller для прибора.
+// Поле нужно вкладке «Монитор опроса»: пока оно установлено, индикатор
+// прибора зелёный.
+func MarkPollStarted(deviceID, kind string, at time.Time) {
+	state.Lock()
+	st := state.devices[deviceID]
+	st.PollInProgress = true
+	st.PollStartedAt = at
+	st.PollKind = kind
+	state.devices[deviceID] = st
+	state.Unlock()
+}
+
+// MarkPollFinished завершает текущее задание. recordResult=false нужен для
+// служебного startup-backfill: он может успешно закончиться без новых строк,
+// поэтому не должен подменять результат последнего обычного current/archive
+// опроса ложным «неуспешно».
+func MarkPollFinished(deviceID, kind string, at time.Time, ok bool, errText string, recordResult bool) {
+	state.Lock()
+	st := state.devices[deviceID]
+	st.PollInProgress = false
+	if recordResult {
+		st.LastPollFinishedAt = at
+		st.LastPollOK = ok
+		st.LastPollKnown = true
+		st.LastPollKind = kind
+		st.LastPollError = errText
+	}
+	state.devices[deviceID] = st
+	state.Unlock()
+}
+
+// SetNextPoll stores the exact next due time calculated by scheduler for
+// this device. Zero means that no scheduled poll is currently known.
+func SetNextPoll(deviceID string, at time.Time) {
+	state.Lock()
+	st := state.devices[deviceID]
+	st.NextPollAt = at
 	state.devices[deviceID] = st
 	state.Unlock()
 }

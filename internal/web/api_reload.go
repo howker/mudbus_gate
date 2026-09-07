@@ -24,16 +24,10 @@ import (
 // прогресс браузер узнаёт отдельными опросами
 // GET /api/devices/reload-progress (см. handleReloadProgress ниже).
 //
-// syncEveryNPeriods — раз в сколько обработанных периодов дополнительно
-// просить es-sync сделать внеплановый проход, чтобы данные появлялись в
-// ЭС ПО ХОДУ длинного переопроса, а не только после его полного
-// завершения (даёт оператору возможность увидеть промежуточный
-// результат в самой ЭС и решить прервать переопрос, если что-то не так
-// — прямой запрос, 2026-08-27). Не после КАЖДОГО периода — это создало
-// бы избыточную нагрузку на БД ЭС при переопросе на тысячу с лишним
-// периодов; раз в 10 — разумный компромисс между "видно скоро" и "не
-// долбим лишний раз".
-const syncEveryNPeriods = 10
+// Принудительный переопрос работает только по цепочке
+// «прибор -> локальная БД МодбасШлюза». Он намеренно не запускает
+// синхронизацию с ЭС ни по ходу работы, ни после завершения. Для ЭС есть
+// отдельная явная операция «Принудительная пересинхронизация с ЭС».
 
 func (s *Server) handleForceReload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -97,45 +91,30 @@ func (s *Server) handleForceReload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobCtx, cancel := context.WithCancel(s.baseCtx)
-	job := &reloadJob{Done: 0, Total: 0, Saved: 0, Finished: false, cancel: cancel}
+	job := &reloadJob{Done: 0, Total: 0, Saved: 0, Finished: false, StartedAt: time.Now(), cancel: cancel}
 	s.reloadJobs[body.DeviceID] = job
 	s.reloadJobsMu.Unlock()
 
 	go func() {
 		defer cancel() // освобождаем ресурсы контекста, даже если переопрос завершился сам, без отмены
 
-		periodsSinceSync := 0
 		saved, err := s.onForceReload(jobCtx, body.DeviceID, from, to, func(done, total int) {
 			s.reloadJobsMu.Lock()
 			job.Done = done
 			job.Total = total
 			s.reloadJobsMu.Unlock()
-
-			periodsSinceSync++
-			if periodsSinceSync >= syncEveryNPeriods {
-				periodsSinceSync = 0
-				if s.onSyncNow != nil {
-					_ = s.onSyncNow(body.DeviceID) // неблокирующий триггер — ошибку намеренно игнорируем, это необязательная "подсветка" прогресса, не должна ронять сам переопрос
-				}
-			}
 		})
 
 		s.reloadJobsMu.Lock()
 		job.Saved = saved
 		job.Finished = true
+		job.FinishedAt = time.Now()
 		if errors.Is(err, context.Canceled) {
 			job.Error = "Отменено оператором"
 		} else if err != nil {
 			job.Error = err.Error()
 		}
 		s.reloadJobsMu.Unlock()
-
-		// Финальный внеплановый проход es-sync — чтобы последние
-		// собранные периоды (после последнего "каждые N") тоже сразу
-		// ушли в ЭС, не дожидаясь часового тикера.
-		if s.onSyncNow != nil {
-			_ = s.onSyncNow(body.DeviceID)
-		}
 	}()
 
 	writeJSON(w, http.StatusOK, map[string]any{"started": true})

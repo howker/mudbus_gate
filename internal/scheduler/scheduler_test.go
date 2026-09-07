@@ -358,3 +358,35 @@ func TestScheduler_ArchiveAnchor_HalfHourInterval_DoesNotSkipPeriods(t *testing.
 		t.Fatalf("expected consecutive archive due-times 30 minutes apart, got %v apart (firstDue=%v, secondDue=%v) — half-hour periods are being skipped again", gap, firstDue, secondDue)
 	}
 }
+
+func TestNextPollAtReturnsEarliestLiveDueTime(t *testing.T) {
+	s := New(nil)
+	s.RegisterWithArchiveAnchor("dev1", 10*time.Minute, time.Hour, nil, 5)
+
+	now := time.Date(2026, 9, 7, 14, 2, 0, 0, time.Local)
+	s.Tick(now)
+
+	next, ok := s.NextPollAt("dev1")
+	if !ok {
+		t.Fatal("ожидалось известное время следующего опроса")
+	}
+	want := time.Date(2026, 9, 7, 14, 5, 0, 0, time.Local)
+	if !next.Equal(want) {
+		t.Fatalf("следующий опрос = %v, ожидался ближайший current/archive %v", next, want)
+	}
+}
+
+func TestManualCurrentQueuedBeforeBackfillKeepsFIFOOrder(t *testing.T) {
+	s := New(nil)
+	s.RequestManualPoll("dev1", KindCurrent)
+	s.RequestManualPoll("dev1", KindBackfill)
+
+	first, ok := s.Next()
+	if !ok || first.DeviceID != "dev1" || first.Kind != KindCurrent {
+		t.Fatalf("первым должен идти первичный current, получено %+v (ok=%v)", first, ok)
+	}
+	second, ok := s.Next()
+	if !ok || second.DeviceID != "dev1" || second.Kind != KindBackfill {
+		t.Fatalf("startup-backfill должен идти вторым, получено %+v (ok=%v)", second, ok)
+	}
+}

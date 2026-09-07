@@ -220,10 +220,12 @@ func runServer() {
 	// (добавлено 2026-08-30, прямой запрос оператора). См. internal/
 	// logbuf/logbuf.go — не пишет на диск, переживать перезапуск ему
 	// не нужно, для полной истории есть сам mbgw_server.log.
-	multiWriter := io.MultiWriter(os.Stdout, logWriter, logbuf.Writer{})
-	log.SetOutput(multiWriter)
+	multiWriter := io.MultiWriter(newNonBlockingWriter(os.Stdout, 512), logWriter, logbuf.Writer{})
+	// Все операторские копии (консоль, файл и web-log) получают одинаковые
+	// русские служебные метки. Технические идентификаторы не переводятся.
+	log.SetOutput(newRussianLogWriter(multiWriter))
 	log.SetFlags(log.Ldate | log.Ltime)
-	log.Println("=== запуск шлюза mbgw (server: единый процесс, конфигурация из БД) ===")
+	log.Println("=== запуск шлюза mbgw (сервер: единый процесс, конфигурация из БД) ===")
 
 	// Защита от двойного запуска — сразу после открытия лога, до
 	// регистрации в диспетчере служб и уж тем более до регистрации
@@ -331,7 +333,7 @@ func runServer() {
 		log.Fatalf("[FATAL] ошибка инициализации схемы настроек: %v", err)
 	}
 	if err := repo.InitESForceResyncAuditSchema(context.Background()); err != nil {
-		log.Fatalf("[FATAL] ошибка инициализации audit принудительной пересинхронизации ЭС: %v", err)
+		log.Fatalf("[FATAL] ошибка инициализации журнала аудита принудительной пересинхронизации ЭС: %v", err)
 	}
 	log.Printf("[OK] Хранилище инициализировано (%s)\n", dbPath)
 
@@ -443,11 +445,11 @@ func runServer() {
 	// решить, какой именно метод вызывать (ForceReloadAkronHourly или
 	// ForceReloadVKMHourly), сам *device.Device своего "типа" не хранит.
 	deviceKinds := make(map[string]string)
-	// esSyncTriggers хранит канал внепланового запуска es-sync для
-	// каждого прибора ВКМ (см. startESyncForDevice) — используется
-	// кнопкой «Синхронизировать сейчас» и «Принудительным переопросом»,
-	// чтобы новые данные появлялись в ЭС по ходу сбора, не дожидаясь
-	// обычного часового цикла (добавлено 2026-08-27).
+	// esSyncTriggers хранит канал внепланового запуска синхронизации с ЭС
+	// для каждого прибора (см. startESyncForDevice). Он используется только
+	// явным запросом синхронизации с ЭС. Принудительный переопрос архива
+	// намеренно НЕ запускает ЭС: его контракт — прибор -> локальная БД
+	// МодбасШлюза; пересинхронизация с ЭС выполняется отдельной командой.
 	esSyncTriggers := make(map[string]chan struct{})
 	// devicesMu защищает три карты выше (devices/deviceKinds/
 	// esSyncTriggers) от одновременного чтения и записи — НУЖНО именно
@@ -589,7 +591,7 @@ func runServer() {
 			return 0, fmt.Errorf("прибор %s не найден среди работающих (сохранён ли он и запущен ли server? если прибор добавлен только что — дождитесь окончания стартовой регистрации всех приборов)", deviceID)
 		}
 		log.Printf("[WEB] принудительный переопрос архива %s (%s) с %s по %s\n",
-			deviceID, kind, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
+			deviceID, deviceKindLabelRU(kind), from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
 		switch kind {
 		case "akron":
 			return dev.ForceReloadAkronHourly(jobCtx, from, onProgress)
@@ -655,7 +657,7 @@ func runServer() {
 				}(),
 			})
 			if auditErr != nil {
-				log.Printf("[ERROR] не удалось записать audit принудительной пересинхронизации ЭС (%s, %s): %v\n",
+				log.Printf("[ERROR] не удалось записать журнал аудита принудительной пересинхронизации ЭС (%s, %s): %v\n",
 					deviceID, action, auditErr)
 			}
 		}()
@@ -699,7 +701,7 @@ func runServer() {
 
 		switch action {
 		case "preview":
-			log.Printf("[WEB] preview принудительной пересинхронизации с ЭС: прибор %s, %s..%s\n",
+			log.Printf("[WEB] предпросмотр принудительной пересинхронизации с ЭС: прибор %s, %s..%s\n",
 				deviceID, from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
 			updated, inserted, failed, err = integration.PreviewForceResyncRange(ctx, repo, writer, cfg, from, to)
 			return
@@ -784,12 +786,12 @@ func runServer() {
 	select {
 	case <-pollerDone:
 	case <-time.After(3 * time.Second):
-		log.Println("[WARN] poller не завершился за 3 секунды — продолжаю остановку")
+		log.Println("[WARN] цикл опроса не завершился за 3 секунды — продолжаю остановку")
 	}
 	select {
 	case <-webDone:
 	case <-time.After(3 * time.Second):
-		log.Println("[WARN] web-сервер не завершился за 3 секунды — продолжаю остановку")
+		log.Println("[WARN] веб-сервер не завершился за 3 секунды — продолжаю остановку")
 	}
 
 	notifyServiceShutdownComplete()
@@ -809,6 +811,17 @@ func runServer() {
 // теперь пишутся ИЗ РАЗНЫХ горутин одновременно (раньше — из одной,
 // строго последовательно), так что блокировка обязательна на каждую
 // запись, не только ради HTTP-обработчиков, как было раньше.
+func deviceKindLabelRU(kind string) string {
+	switch kind {
+	case "vkm360":
+		return "ВКМ-360"
+	case "akron":
+		return "Акрон"
+	default:
+		return kind
+	}
+}
+
 func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqliterepo.DeviceRecord, leaseMgr *lease.LocalLease, sched *scheduler.Scheduler, dbPath string, devicesMu *sync.Mutex, devices map[string]*device.Device, deviceKinds map[string]string, esSyncTriggers map[string]chan struct{}) {
 	profilePath := profilePathNextToExe(devRec.Profile)
 	p, err := profile.Parse(profilePath)
@@ -943,14 +956,22 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	}
 	sched.RegisterWithArchiveAnchor(devRec.ID, currentInterval, archiveInterval, nil, archiveAtMinute)
 	log.Printf("[OK] прибор %s (%s) зарегистрирован (текущие каждые %s, архив каждые %s в HH:%02d)\n",
-		devRec.ID, devRec.Kind, currentInterval, archiveInterval, archiveAtMinute)
+		devRec.ID, deviceKindLabelRU(devRec.Kind), currentInterval, archiveInterval, archiveAtMinute)
 
-	// Startup backfill no longer blocks device registration or server
-	// startup. Queue it through the same scheduler/poller path as other
-	// device work so the normal per-device serialization applies.
+	// Сразу после регистрации сначала ставим текущий опрос с высоким
+	// приоритетом. Это важно после простоя/возврата прибора в сеть: оператор
+	// должен сразу увидеть, отвечает ли прибор и как расходятся его часы,
+	// а не ждать окончания глубокого стартового дозабора.
+	sched.RequestManualPoll(devRec.ID, scheduler.KindCurrent)
+	log.Printf("[ИНФО] прибор %s: первичная проверка текущих данных поставлена в очередь\n", devRec.ID)
+
+	// Стартовый дозабор идёт ВТОРЫМ заданием того же приоритета. Scheduler
+	// сохраняет FIFO для равного приоритета, поэтому current гарантированно
+	// начнётся раньше backfill, но оба по-прежнему сериализованы для одного
+	// прибора и не мешают параллельной работе других приборов.
 	if len(p.Archives) > 0 {
 		sched.RequestManualPoll(devRec.ID, scheduler.KindBackfill)
-		log.Printf("[INFO] прибор %s: стартовый дозабор поставлен в очередь\n", devRec.ID)
+		log.Printf("[ИНФО] прибор %s: стартовый дозабор поставлен в очередь после первичной проверки\n", devRec.ID)
 	}
 
 	// Upstream delivery: both VKM and Akron use the same direct write
@@ -1004,21 +1025,17 @@ func isPortFree(port int) bool {
 // (es_vkm_channels) for it — same "opt-in, missing config = skip with a
 // log line, not a fatal error" principle as the Akron branch above.
 //
-// dbPath — путь к ЕДИНОЙ базе процесса server (та же, что открыта в
-// runServer как repo), а не отдельный "mbgw_vkm.db". Раньше здесь стоял
-// захардкоженный "mbgw_vkm.db" — рабочий путь в старой схеме "четыре
-// окна", где southbound ВКМ реально писал в отдельный файл с этим именем.
-// В единой базе server всё (включая archive_vkm_raw) пишется в ОДИН
-// файл, путь к которому передаётся через --db при запуске — es-sync
-// обязан читать оттуда же, иначе получает "no such table: archive_vkm_raw"
-// (подтверждено живьём, 2026-08-23).
+// В production-режиме `mbgw server` цикл синхронизации получает уже
+// открытый общий Repo процесса, а не открывает тот же SQLite-файл заново.
+// Это важно для параллельного опроса: несколько независимых connection
+// pools к одному файлу дали живой SQLITE_BUSY 07.09.2026.
 //
 // Возвращает канал-триггер внепланового прохода (см. RunEnergosphereSync)
 // — nil, если es-sync для этого прибора не запустился (не настроено
 // подключение/каналы). Вызывающий код регистрирует его в общей карте,
-// чтобы кнопка «Синхронизировать сейчас» и «Принудительный переопрос»
-// могли попросить внеплановый проход, не дожидаясь часового тикера
-// (добавлено 2026-08-27).
+// чтобы явная команда синхронизации с ЭС могла попросить внеплановый
+// проход, не дожидаясь обычного тикера. Принудительный переопрос архива
+// этот trigger больше не вызывает.
 // buildIntegrationConfig собирает integration.Config из текущих
 // настроек в БД (подключение к ЭС + точки для конкретного прибора) —
 // вынесено из startESyncForDevice в отдельную функцию (2026-08-30),
@@ -1108,22 +1125,27 @@ func buildIntegrationConfig(ctx context.Context, repo *sqliterepo.Repo, deviceID
 	return cfg, true, nil
 }
 
-func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, kind, dbPath string) chan struct{} {
+func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, kind, _ string) chan struct{} {
 	cfg, found, err := buildIntegrationConfig(ctx, repo, deviceID, kind)
 	if err != nil {
-		log.Printf("[ERROR] прибор %s: %v — es-sync не запущен\n", deviceID, err)
+		log.Printf("[ОШИБКА] прибор %s: %v — синхронизация с ЭС не запущена\n", deviceID, err)
 		return nil
 	}
 	if !found {
-		log.Printf("[INFO] прибор %s: подключение к БД ЭС или точки не настроены — es-sync не запущен\n", deviceID)
+		log.Printf("[ИНФО] прибор %s: подключение к БД ЭС или точки не настроены — синхронизация с ЭС не запущена\n", deviceID)
 		return nil
 	}
 
 	trigger := make(chan struct{}, 1)
 	go func() {
-		log.Printf("[OK] es-sync для %s (%s): старт (сервер БД ЭС=%s, база=%s)\n", deviceID, kind, cfg.SQLServer, cfg.SQLDatabase)
-		if err := integration.RunEnergosphereSync(ctx, dbPath, cfg, trigger); err != nil {
-			log.Printf("[ERROR] es-sync %s: %v\n", deviceID, err)
+		log.Printf("[ОК] синхронизация с ЭС для %s (%s): запуск (сервер БД ЭС=%s, база=%s)\n", deviceID, deviceKindLabelRU(kind), cfg.SQLServer, cfg.SQLDatabase)
+		// В режиме `mbgw server` все фоновые циклы используют ТОТ ЖЕ Repo,
+		// который уже открыт процессом. Отдельный sqliterepo.New для каждого
+		// прибора создавал независимые SQLite connection pools к одному файлу
+		// и в живой работе 07.09.2026 приводил к SQLITE_BUSY во время
+		// параллельного дозабора/синхронизации.
+		if err := integration.RunEnergosphereSyncWithRepo(ctx, repo, cfg, trigger); err != nil {
+			log.Printf("[ОШИБКА] синхронизация с ЭС %s: %v\n", deviceID, err)
 		}
 	}()
 	return trigger

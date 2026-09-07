@@ -293,9 +293,9 @@ func (c Config) interval() time.Duration {
 // syncing the backfill window, until ctx is cancelled.
 // trigger, если не nil, позволяет вызывающему коду попросить сделать
 // ВНЕПЛАНОВЫЙ проход прямо сейчас, не дожидаясь обычного часового тикера
-// — используется кнопкой «Синхронизировать сейчас» и «Принудительным
-// переопросом» (чтобы данные появлялись в ЭС по ходу сбора, а не только
-// после полного завершения долгой операции — добавлено 2026-08-27).
+// — используется только явной операцией синхронизации с ЭС.
+// Принудительный переопрос архива больше этот trigger не вызывает: он
+// работает только по цепочке «прибор -> локальная БД МодбасШлюза».
 // Переиспользует уже открытые repo/writer того же цикла — не открывает
 // новое подключение к БД ЭС на каждый вызов. Буферизованный (размер 1) —
 // несколько быстрых подряд запросов сливаются в один внеплановый проход,
@@ -307,12 +307,24 @@ func (c Config) interval() time.Duration {
 func RunEnergosphereSync(ctx context.Context, sqlitePath string, cfg Config, trigger <-chan struct{}) error {
 	repo, err := sqliterepo.New(sqlitePath)
 	if err != nil {
-		return fmt.Errorf("open local db (%s): %w", sqlitePath, err)
+		return fmt.Errorf("не удалось открыть локальную БД (%s): %w", sqlitePath, err)
 	}
 	defer repo.Close()
 
+	return RunEnergosphereSyncWithRepo(ctx, repo, cfg, trigger)
+}
+
+// RunEnergosphereSyncWithRepo запускает тот же цикл, но использует уже
+// открытый общий Repo. Production-режим `mbgw server` обязан использовать
+// именно этот вариант: отдельный sqliterepo.New на каждый прибор создаёт
+// несколько независимых пулов соединений к одному SQLite-файлу и может
+// привести к SQLITE_BUSY при параллельной записи.
+func RunEnergosphereSyncWithRepo(ctx context.Context, repo *sqliterepo.Repo, cfg Config, trigger <-chan struct{}) error {
+	if repo == nil {
+		return fmt.Errorf("локальная БД не подключена")
+	}
 	if err := repo.InitESSyncCursorSchema(ctx); err != nil {
-		return fmt.Errorf("init ES sync cursor: %w", err)
+		return fmt.Errorf("не удалось подготовить курсор синхронизации с ЭС: %w", err)
 	}
 
 	writer, err := OpenPointMainsWriter(SQLServerConfig{
@@ -323,7 +335,7 @@ func RunEnergosphereSync(ctx context.Context, sqlitePath string, cfg Config, tri
 		Port:     cfg.SQLPort,
 	})
 	if err != nil {
-		return fmt.Errorf("open ЭС SQL Server: %w", err)
+		return fmt.Errorf("не удалось открыть подключение к SQL Server ЭС: %w", err)
 	}
 	defer writer.Close()
 
@@ -337,16 +349,16 @@ func RunEnergosphereSync(ctx context.Context, sqlitePath string, cfg Config, tri
 		cancel()
 
 		if err == nil {
-			log.Printf("[es-sync] подключение к БД ЭС OK: сервер=%s база=%s логин=%s\n", cfg.SQLServer, cfg.SQLDatabase, cfg.SQLUser)
+			log.Printf("[синхронизация с ЭС] подключение к БД ЭС успешно: сервер=%s база=%s логин=%s\n", cfg.SQLServer, cfg.SQLDatabase, cfg.SQLUser)
 			break
 		}
 
 		if ctx.Err() != nil {
-			log.Println("[es-sync] остановлен до восстановления подключения к БД ЭС")
+			log.Println("[синхронизация с ЭС] остановлен до восстановления подключения к БД ЭС")
 			return nil
 		}
 
-		log.Printf("[es-sync] БД ЭС недоступна: %v; повтор через %s\n", err, retryDelay)
+		log.Printf("[синхронизация с ЭС] БД ЭС недоступна: %v; повтор через %s\n", err, retryDelay)
 
 		timer := time.NewTimer(retryDelay)
 		select {
@@ -354,7 +366,7 @@ func RunEnergosphereSync(ctx context.Context, sqlitePath string, cfg Config, tri
 			if !timer.Stop() {
 				<-timer.C
 			}
-			log.Println("[es-sync] остановлен до восстановления подключения к БД ЭС")
+			log.Println("[синхронизация с ЭС] остановлен до восстановления подключения к БД ЭС")
 			return nil
 		case <-timer.C:
 		}
@@ -369,17 +381,17 @@ func RunEnergosphereSync(ctx context.Context, sqlitePath string, cfg Config, tri
 
 	if cfg.Kind == "vkm360" {
 		if n, oldest, newest, found, err := repo.CountVKMRaw(ctx, cfg.DeviceID, cfg.Pipe); err != nil {
-			log.Printf("[es-sync] предупреждение: не смог опросить исходную БД: %v\n", err)
+			log.Printf("[синхронизация с ЭС] предупреждение: не смог опросить исходную БД: %v\n", err)
 		} else if !found {
-			log.Printf("[es-sync] ВНИМАНИЕ: в локальной БД нет ни одной записи для device=%s pipe=%d — southbound собрал данные?\n", cfg.DeviceID, cfg.Pipe)
+			log.Printf("[синхронизация с ЭС] ВНИМАНИЕ: в локальной БД нет ни одной записи для прибор=%s труба=%d — опрос прибора собрал данные?\n", cfg.DeviceID, cfg.Pipe)
 		} else {
-			log.Printf("[es-sync] исходная БД: %d записей ВКМ, период с %s по %s\n",
+			log.Printf("[синхронизация с ЭС] исходная БД: %d записей ВКМ, период с %s по %s\n",
 				n, oldest.Format("02.01.2006 15:04"), newest.Format("02.01.2006 15:04"))
 		}
 	}
 
 	if cfg.DryRun {
-		log.Println("[es-sync] РЕЖИМ DRY-RUN: в БД ЭС ничего не пишется, только лог того, что было бы записано.")
+		log.Println("[синхронизация с ЭС] РЕЖИМ ПРОВЕРКИ БЕЗ ЗАПИСИ: в БД ЭС ничего не пишется, только лог того, что было бы записано.")
 	}
 
 	runPointSyncOnce(ctx, repo, writer, cfg)
@@ -388,12 +400,12 @@ func RunEnergosphereSync(ctx context.Context, sqlitePath string, cfg Config, tri
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("[es-sync] остановлен")
+			log.Println("[синхронизация с ЭС] остановлен")
 			return nil
 		case <-ticker.C:
 			runPointSyncOnce(ctx, repo, writer, cfg)
 		case <-trigger:
-			log.Println("[es-sync] внеплановая синхронизация по запросу")
+			log.Println("[синхронизация с ЭС] внеплановая синхронизация по запросу")
 			runPointSyncOnce(ctx, repo, writer, cfg)
 		}
 	}
@@ -540,14 +552,14 @@ func collectAkronReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config
 					)
 				} else if row.TsHour.Sub(prevTS) != time.Hour {
 					log.Printf(
-						"[es-sync] Akron %s: пропуск %s — нет соседнего часового снимка перед ним (предыдущий %s)\n",
+						"[синхронизация с ЭС] Akron %s: пропуск %s — нет соседнего часового снимка перед ним (предыдущий %s)\n",
 						cfg.DeviceID,
 						row.TsHour.Format("02.01.2006 15:04"),
 						prevTS.Format("02.01.2006 15:04"),
 					)
 				} else {
 					log.Printf(
-						"[es-sync] Akron %s: пропуск %s — накопительный V уменьшился: %g -> %g\n",
+						"[синхронизация с ЭС] Akron %s: пропуск %s — накопительный V уменьшился: %g -> %g\n",
 						cfg.DeviceID,
 						row.TsHour.Format("02.01.2006 15:04"),
 						prevValue,
@@ -634,7 +646,7 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 	for _, m := range cfg.Points {
 		cur, found, err := repo.GetESSyncCursor(ctx, cfg.DeviceID, m.PointID)
 		if err != nil {
-			log.Printf("[es-sync] чтение cursor (%s ID_PP=%d): %v\n", m.Label, m.PointID, err)
+			log.Printf("[синхронизация с ЭС] чтение курсора (%s ID_PP=%d): %v\n", m.Label, m.PointID, err)
 			allHaveCursor = false
 			continue
 		}
@@ -661,7 +673,7 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 
 	readings, err := collectReadings(ctx, repo, cfg, from, now)
 	if err != nil {
-		log.Printf("[es-sync] чтение исходной БД: %v\n", err)
+		log.Printf("[синхронизация с ЭС] чтение исходной БД: %v\n", err)
 		return
 	}
 	if len(readings) == 0 {
@@ -673,7 +685,7 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 
 	advanceCursor := func(r pointReading) bool {
 		if err := repo.SetESSyncCursor(ctx, cfg.DeviceID, r.mapping.PointID, r.ts); err != nil {
-			log.Printf("[es-sync] запись cursor (%s ID_PP=%d %s): %v\n",
+			log.Printf("[синхронизация с ЭС] запись курсора (%s ID_PP=%d %s): %v\n",
 				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), err)
 			failed++
 			blocked[r.mapping.PointID] = true
@@ -698,7 +710,7 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 		}
 
 		if err := validatePointReading(r); err != nil {
-			log.Printf("[es-sync] БЛОКИРОВКА записи (%s ID_PP=%d %s): %v\n",
+			log.Printf("[синхронизация с ЭС] БЛОКИРОВКА записи (%s ID_PP=%d %s): %v\n",
 				r.mapping.Label, pointID, r.ts.Format("02.01 15:04"), err)
 			failed++
 			blocked[pointID] = true
@@ -707,7 +719,7 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 
 		present, err := writer.PointExists(ctx, pointID, r.ts)
 		if err != nil {
-			log.Printf("[es-sync] проверка наличия точки (%s ID_PP=%d %s): %v\n",
+			log.Printf("[синхронизация с ЭС] проверка наличия точки (%s ID_PP=%d %s): %v\n",
 				r.mapping.Label, pointID, r.ts.Format("02.01 15:04"), err)
 			failed++
 			blocked[pointID] = true
@@ -720,7 +732,7 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 		}
 
 		if cfg.DryRun {
-			log.Printf("[es-sync] DRY-RUN записал бы: %s ID_PP=%d %s value=%g\n",
+			log.Printf("[синхронизация с ЭС] ПРОВЕРКА БЕЗ ЗАПИСИ — было бы записано: %s ID_PP=%d %s значение=%g\n",
 				r.mapping.Label, pointID, r.ts.Format("02.01.2006 15:04"), r.value)
 			inserted++
 			// DRY-RUN ничего не подтвердил в ЭС, поэтому cursor не двигаем.
@@ -734,7 +746,7 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 				advanceCursor(r)
 				continue
 			}
-			log.Printf("[es-sync] запись (%s ID_PP=%d %s): %v\n",
+			log.Printf("[синхронизация с ЭС] запись (%s ID_PP=%d %s): %v\n",
 				r.mapping.Label, pointID, r.ts.Format("02.01 15:04"), err)
 			failed++
 			blocked[pointID] = true
@@ -747,7 +759,7 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 	}
 
 	if inserted > 0 || failed > 0 {
-		log.Printf("[es-sync] проход завершён: записано %d, пропущено (уже есть) %d, пропущено по cursor %d, ошибок %d, окно %s..%s\n",
+		log.Printf("[синхронизация с ЭС] проход завершён: записано %d, пропущено (уже есть) %d, пропущено по курсору %d, ошибок %d, окно %s..%s\n",
 			inserted, skipped, skippedByCursor, failed,
 			from.Format("02.01 15:04"), now.Format("02.01 15:04"))
 	}
@@ -776,7 +788,7 @@ func PreviewForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer 
 
 		present, perr := writer.PointExists(ctx, r.mapping.PointID, r.ts)
 		if perr != nil {
-			log.Printf("[es-sync] preview: ошибка проверки точки (%s ID_PP=%d %s): %v\n",
+			log.Printf("[синхронизация с ЭС] предпросмотр: ошибка проверки точки (%s ID_PP=%d %s): %v\n",
 				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), perr)
 			blocked++
 			continue
@@ -788,7 +800,7 @@ func PreviewForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer 
 		}
 	}
 
-	log.Printf("[es-sync] preview принудительной пересинхронизации: будет переписано %d, вставлено %d, заблокировано/ошибок %d, окно %s..%s\n",
+	log.Printf("[синхронизация с ЭС] предпросмотр принудительной пересинхронизации: будет переписано %d, вставлено %d, заблокировано/ошибок %d, окно %s..%s\n",
 		wouldUpdate, wouldInsert, blocked, from.Format("02.01 15:04"), to.Format("02.01 15:04"))
 
 	return wouldUpdate, wouldInsert, blocked, nil
@@ -829,7 +841,7 @@ func ForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 
 	for _, r := range readings {
 		if verr := validatePointReading(r); verr != nil {
-			log.Printf("[es-sync] БЛОКИРОВКА принудительной записи (%s ID_PP=%d %s): %v\n",
+			log.Printf("[синхронизация с ЭС] БЛОКИРОВКА принудительной записи (%s ID_PP=%d %s): %v\n",
 				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), verr)
 			failed++
 			continue
@@ -837,7 +849,7 @@ func ForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 
 		affected, uerr := writer.UpdatePoint(ctx, r.mapping.PointID, r.ts, r.value, 0)
 		if uerr != nil {
-			log.Printf("[es-sync] принудительная перезапись (%s ID_PP=%d %s): %v\n",
+			log.Printf("[синхронизация с ЭС] принудительная перезапись (%s ID_PP=%d %s): %v\n",
 				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), uerr)
 			failed++
 			continue
@@ -859,7 +871,7 @@ func ForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 					continue
 				}
 			}
-			log.Printf("[es-sync] принудительная запись (%s ID_PP=%d %s): %v\n",
+			log.Printf("[синхронизация с ЭС] принудительная запись (%s ID_PP=%d %s): %v\n",
 				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), ierr)
 			failed++
 			continue
@@ -868,7 +880,7 @@ func ForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 		health.MarkESWriteSuccess(cfg.DeviceID, time.Now())
 	}
 
-	log.Printf("[es-sync] принудительная пересинхронизация завершена: переписано %d, вставлено новых %d, ошибок %d, окно %s..%s\n",
+	log.Printf("[синхронизация с ЭС] принудительная пересинхронизация завершена: переписано %d, вставлено новых %d, ошибок %d, окно %s..%s\n",
 		updated, inserted, failed, from.Format("02.01 15:04"), to.Format("02.01 15:04"))
 	return updated, inserted, failed, nil
 }

@@ -52,6 +52,7 @@ func newTestDevice(t *testing.T, id string) (*device.Device, *countingClient) {
 	if err != nil {
 		t.Fatalf("failed to create repo: %v", err)
 	}
+	t.Cleanup(func() { _ = repo.Close() })
 	if err := repo.InitSchema(context.Background()); err != nil {
 		t.Fatalf("failed to init schema: %v", err)
 	}
@@ -193,5 +194,83 @@ func TestRunDeviceQueue_CancelDropsPendingTasks(t *testing.T) {
 	}
 	if len(q.tasks) != 0 {
 		t.Fatalf("expected cancelled queue to drop pending tasks, got %d", len(q.tasks))
+	}
+}
+
+type parallelClient struct {
+	started chan<- string
+	release <-chan struct{}
+	id      string
+}
+
+func (c *parallelClient) ReadRaw(ctx context.Context, space string, addr int, dataType string) ([]byte, error) {
+	select {
+	case c.started <- c.id:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	select {
+	case <-c.release:
+		return []byte{0x42, 0xC8, 0x00, 0x00}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (c *parallelClient) Transact(ctx context.Context, req []byte) ([]byte, error) {
+	return nil, nil
+}
+
+func newParallelTestDevice(t *testing.T, id string, cli device.PointClient) *device.Device {
+	t.Helper()
+	p := &profile.Profile{
+		Codec:  profile.Codec{WordOrder32: "0123"},
+		Points: []profile.Point{{Name: "V", Type: "float", Access: "read"}},
+	}
+	repo, err := sqliterepo.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create repo: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	if err := repo.InitSchema(context.Background()); err != nil {
+		t.Fatalf("failed to init schema: %v", err)
+	}
+	return device.New(id, p, cli, &session.NoopSession{}, repo, lease.New())
+}
+
+func TestPoller_DifferentDevicesRunInParallel(t *testing.T) {
+	started := make(chan string, 2)
+	release := make(chan struct{})
+
+	dev1 := newParallelTestDevice(t, "dev1", &parallelClient{id: "dev1", started: started, release: release})
+	dev2 := newParallelTestDevice(t, "dev2", &parallelClient{id: "dev2", started: started, release: release})
+
+	sched := scheduler.New(nil)
+	sched.RequestManualPoll("dev1", scheduler.KindCurrent)
+	sched.RequestManualPoll("dev2", scheduler.KindCurrent)
+	p := New(sched, map[string]*device.Device{"dev1": dev1, "dev2": dev2}, time.Second)
+
+	done := make(chan struct{})
+	go func() {
+		p.drain(context.Background())
+		close(done)
+	}()
+
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		select {
+		case id := <-started:
+			seen[id] = true
+		case <-time.After(500 * time.Millisecond):
+			close(release)
+			t.Fatalf("разные приборы не начали опрос параллельно; успели стартовать: %v", seen)
+		}
+	}
+	close(release)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("параллельный опрос не завершился")
 	}
 }

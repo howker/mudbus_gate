@@ -105,6 +105,10 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 .status-good { color: #4caf50; font-weight: bold; }
 .status-bad { color: #f44336; font-weight: bold; }
 .log-warn { color: #ffb300; font-weight: bold; }
+.poll-dot { display:inline-block; width:16px; height:16px; border-radius:50%; background:#666; border:2px solid #444; vertical-align:middle; }
+.poll-dot.active { background:#4caf50; border-color:#7bd17f; box-shadow:0 0 8px rgba(76,175,80,0.8); }
+.log-filter-btn { cursor:pointer; border:2px solid transparent; }
+.log-filter-btn.selected { border-color:#ffffff !important; opacity:1 !important; }
 </style>
 </head>
 <body>
@@ -117,7 +121,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <button class="tab-btn" onclick="showTab('esconn')">Подключение к ЭС</button>
   <button class="tab-btn" onclick="showTab('settings')">Настройки</button>
   <button class="tab-btn" onclick="showTab('archive')">Архив</button>
-  <button class="tab-btn" onclick="showTab('current')">Последний опрос</button>
+  <button class="tab-btn" onclick="showTab('pollmonitor')">Монитор опроса</button>
   <button class="tab-btn" onclick="showTab('log')">Лог</button>
   <button class="tab-btn" onclick="showTab('service')">Служба</button>
 </div>
@@ -137,13 +141,11 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
           <th style="cursor:pointer;" onclick="sortDashboard('kind')">Тип ⇅</th>
           <th>Включён</th>
           <th style="cursor:pointer;" onclick="sortDashboard('lag')">Отставание архива ⇅</th>
-          <th>Последний период</th>
-          <th style="cursor:pointer;" onclick="sortDashboard('next')">Следующий опрос ⇅</th>
           <th style="cursor:pointer;" onclick="sortDashboard('drift')">Расхождение времени ⇅</th>
           <th>Последняя успешная работа</th>
           <th>Действие</th>
         </tr></thead>
-        <tbody id="dashboardTable"><tr><td colspan="9">Загрузка...</td></tr></tbody>
+        <tbody id="dashboardTable"><tr><td colspan="7">Загрузка...</td></tr></tbody>
       </table>
 
       <div style="margin-top:24px;">
@@ -167,11 +169,11 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <h3 style="margin-top:0;">Принудительная пересинхронизация с ЭС — <span id="dashboardResyncDeviceName"></span></h3>
         <p class="small-note">Перезаписывает уже отправленные в ЭС точки за указанный период свежими значениями (по ТЕКУЩИМ настройкам множителя точки) — обычная фоновая синхронизация только добавляет новое и никогда не трогает то, что уже есть в ЭС. Нужно, например: с прибора один раз пришли искажённые данные, вы их переопросили и получили верные — но в ЭС уже успело уйти старое; либо поменяли множитель точки (вкладка «Точки ЭС») — новые точки и так пойдут в правильных единицах, а вот уже отправленная история сама не пересчитается, пока её явно не переписать.</p>
         <div class="form-row"><label>С какой даты</label>
-          <input id="dr_from" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
+          <input id="dr_from" type="text" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
           <select id="dr_from_h" style="width:55px;"></select>:<select id="dr_from_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
         </div>
         <div class="form-row"><label>По какую дату</label>
-          <input id="dr_to" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД (пусто = сейчас)">
+          <input id="dr_to" type="text" style="width:120px;" placeholder="ГГГГ-ММ-ДД (пусто = сейчас)">
           <select id="dr_to_h" style="width:55px;"></select>:<select id="dr_to_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
         </div>
         <p>
@@ -212,9 +214,9 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       </div>
       <div class="form-row"><label>Тип связи</label>
         <select id="d_transport_kind" onchange="onTransportKindChange()">
-          <option value="modbus_tcp">TCP (modbus_tcp)</option>
-          <option value="rtu_serial">Последовательный порт (rtu_serial)</option>
-          <option value="tcp_serial">TCP-serial (конвертер)</option>
+          <option value="modbus_tcp">Modbus TCP</option>
+          <option value="rtu_serial">Последовательный порт (Modbus RTU)</option>
+          <option value="tcp_serial">TCP-последовательный (конвертер)</option>
         </select>
       </div>
       <div id="tcpFields">
@@ -225,11 +227,11 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <div class="form-row"><label>COM-порт</label><input id="d_com" type="text" placeholder="COM105"></div>
         <div class="form-row"><label>Скорость (бод)</label><input id="d_baudrate" type="text" value="9600"></div>
         <div class="form-row"><label>Чётность</label>
-          <select id="d_parity"><option value="none">none</option><option value="even">even</option><option value="odd">odd</option></select>
+          <select id="d_parity"><option value="none">нет</option><option value="even">чётная</option><option value="odd">нечётная</option></select>
         </div>
         <div class="form-row"><label>Стоп-биты</label><input id="d_stopbits" type="text" value="1"></div>
       </div>
-      <div class="form-row"><label>Адрес на линии (unit id)</label><input id="d_unit_id" type="text" value="1"></div>
+      <div class="form-row"><label>Адрес прибора на линии</label><input id="d_unit_id" type="text" value="1"></div>
       <div class="form-row"><label>Таймаут (мс)</label><input id="d_timeout_ms" type="text" value="1000"></div>
       <div class="form-row"><label>Количество повторов при ошибке</label><input id="d_retries" type="text" value="3"></div>
       <p class="small-note" style="margin-left:220px;margin-top:-8px;">При сбое запрос повторяется с растущей паузой (0.2с, 0.4с, 0.8с) — полезно на нестабильной линии (RS-485 с помехами, обрывы).</p>
@@ -242,7 +244,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <p class="small-note">Сколько часов назад искать и добирать пропуски при каждом запуске сервера. 0 — использовать значение по умолчанию (24ч для ВКМ). Если сервер может простаивать дольше суток (плановое обслуживание и т.п.) — увеличьте, например до 72-96, чтобы пропуски добирались автоматически при следующем старте, без ручного «Принудительного переопроса».</p>
         <p class="small-note">Как часто опрашивать мгновенные показания (не архив). Раз в час обычно достаточно — этот шлюз собирает архив, не ведёт непрерывную телеметрию.</p>
         <div class="form-row"><label>Опрос архива, минута после границы</label><input id="d_archive_at_minute" type="text" value="5"></div>
-        <p class="small-note">Через сколько минут ПОСЛЕ границы периода запрашивать архив (получасовки у ВКМ — в HH:05 и HH:35, часовки у Akron — в HH:05, при значении по умолчанию 5). Прибору нужно время, чтобы закрыть период и подготовить данные — опрос точно на самой границе (0) обычно даёт ещё не готовый или неполный результат. Значение видно и настраивается здесь же, что и на вкладке «Главная» в столбце «Следующий опрос».</p>
+        <p class="small-note">Через сколько минут ПОСЛЕ границы периода запрашивать архив (получасовки у ВКМ — в HH:05 и HH:35, часовки у Акрона — в HH:05, при значении по умолчанию 5). Прибору нужно время, чтобы закрыть период и подготовить данные — опрос точно на самой границе (0) обычно даёт ещё не готовый или неполный результат. Значение видно и настраивается здесь же; фактическое следующее время опроса показывается на вкладке «Монитор опроса».</p>
 
         <div id="vkmTimeCorrectionFields" style="display:none;margin-top:18px;padding-top:12px;border-top:1px solid #3e3e42;">
           <p style="margin-top:0;color:#ffffff;font-size:13px;"><b>Коррекция времени ВКМ-360</b></p>
@@ -270,7 +272,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <div id="panel-channels" class="panel">
     <div class="section">
       <h3>Точки ЭС</h3>
-      <p class="small-note">Каждая величина прибора сопоставляется с конкретной точкой ЭС (полем ID_PP в таблице PointMains) — без этого сопоставления прибор не сможет отправлять данные в ЭС вообще. У приборов ВКМ таких величин четыре (масса, тепло, температура, давление), у Akron — одна (объём).</p>
+      <p class="small-note">Каждая величина прибора сопоставляется с конкретной точкой ЭС (полем ID_PP в таблице PointMains).</p>
       <div class="form-row"><label>Прибор</label>
         <select id="ch_device" onchange="loadChannels()"></select>
       </div>
@@ -286,7 +288,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <!-- ===================== ПОДКЛЮЧЕНИЕ К ЭС ===================== -->
   <div id="panel-esconn" class="panel">
     <div class="section">
-      <h3>Подключение к БД Энергосферы (SQL Server) — для приборов с прямой записью в базу</h3>
+      <h3>Подключение к БД Энергосферы (SQL Server)</h3>
       <div id="es_status_configured" style="display:none;background:#1e3d1e;border:1px solid #2d5a2d;color:#4caf50;padding:10px;border-radius:4px;margin-bottom:15px;">
         Подключение настроено (сервер: <span id="es_status_server"></span>, база: <span id="es_status_db"></span>).
       </div>
@@ -303,7 +305,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <div class="form-row"><label>Пароль</label><input id="es_password" type="password"></div>
       <div class="form-row"><label>Порт</label><input id="es_port" type="text" value="1433"></div>
       <div class="form-row"><label>Сдвиг времени при записи в ЭС (минут)</label><input id="es_time_shift" type="text" value="0"></div>
-      <p class="small-note" style="margin-left:220px;margin-top:-8px;color:#ffd479;">Применяется к ВКМ и Akron при прямой записи в БД ЭС. Отрицательное значение сдвигает метку назад; например, -90 — на 90 минут назад. 0 — без сдвига.</p>
+      <p class="small-note" style="margin-left:220px;margin-top:-8px;color:#ffd479;">Отрицательное значение сдвигает метку назад; например, -90 — на 90 минут назад. 0 — без сдвига.</p>
       <p class="small-note" id="es_password_note"></p>
       <p>
         <button class="btn secondary" onclick="testESConnection()">Проверить подключение</button>
@@ -321,6 +323,24 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
            логично, что и «Синхронизировать сейчас» уехала туда же раньше:
            оба действия относятся к конкретному прибору из общей таблицы
            статуса, здесь им было не место. -->
+    </div>
+  </div>
+
+  <!-- ===================== МОНИТОР ОПРОСА ===================== -->
+  <div id="panel-pollmonitor" class="panel">
+    <div class="section">
+      <h3>Монитор опроса</h3>
+      <p class="small-note">Зелёный индикатор означает, что прямо сейчас выполняется опрос этого прибора. Серый — прибор в данный момент не опрашивается.</p>
+      <table>
+        <thead><tr>
+          <th>Статус</th>
+          <th>Имя прибора</th>
+          <th>Начало опроса</th>
+          <th>Следующий опрос</th>
+          <th>Статус последнего опроса</th>
+        </tr></thead>
+        <tbody id="pollMonitorTable"><tr><td colspan="5">Загрузка...</td></tr></tbody>
+      </table>
     </div>
   </div>
 
@@ -346,6 +366,18 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
     <div class="section">
       <h3>Лог сервера</h3>
       <div id="deviceActivityStrip" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px;"></div>
+      <div style="margin-bottom:12px;">
+        <label style="color:#969696;font-size:13px;margin-right:8px;">События</label>
+        <select id="logEventFilter" onchange="setLogEventFilter(this.value)" style="background:#3c3c3c;border:1px solid #3e3e42;color:#cccccc;padding:6px 8px;">
+          <option value="all">Все события</option>
+          <option value="error">Ошибки</option>
+          <option value="poll">Опрос прибора</option>
+          <option value="archive">Архив и дозабор</option>
+          <option value="time">Коррекция времени</option>
+          <option value="es">Запись в БД ЭС</option>
+          <option value="system">Система</option>
+        </select>
+      </div>
       <p>
         <button class="btn secondary" id="logPauseBtn" onclick="toggleLogPause()">Пауза</button>
         <button class="btn secondary" onclick="copyLog()">Скопировать всё</button>
@@ -374,9 +406,9 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <select id="ar_device" onchange="onArchiveDeviceChange()"></select>
       </div>
       <div class="form-row"><label>Период</label>
-        <input id="ar_from" type="text" readonly="readonly" style="width:150px;" placeholder="ГГГГ-ММ-ДД">
+        <input id="ar_from" type="text" style="width:150px;" placeholder="ГГГГ-ММ-ДД">
         &nbsp;—&nbsp;
-        <input id="ar_to" type="text" readonly="readonly" style="width:150px;" placeholder="ГГГГ-ММ-ДД">
+        <input id="ar_to" type="text" style="width:150px;" placeholder="ГГГГ-ММ-ДД">
       </div>
       <div class="form-row"><label></label>
         <button class="btn secondary" onclick="setArchivePreset('today')">Сегодня</button>
@@ -406,11 +438,11 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <h3>Принудительный переопрос</h3>
       <p class="small-note">Немедленно переопрашивает прибор за указанный период и перезаписывает данные в БД МодбасШлюза. В БД ЭС эта операция напрямую ничего не записывает. Чтобы затем обновить уже отправленные данные в ЭС, используйте кнопку «Принудительная пересинхронизация с ЭС» на вкладке «Главная».</p>
       <div class="form-row"><label>Переопросить с</label>
-        <input id="rl_from" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
+        <input id="rl_from" type="text" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
         <select id="rl_from_h" style="width:55px;"></select>:<select id="rl_from_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
       </div>
       <div class="form-row" id="rl_to_row"><label>По какую дату (только ВКМ)</label>
-        <input id="rl_to" type="text" readonly="readonly" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
+        <input id="rl_to" type="text" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
         <select id="rl_to_h" style="width:55px;"></select>:<select id="rl_to_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
       </div>
       <p>
@@ -493,6 +525,7 @@ function showTab(name) {
   if (name === 'settings') { loadSettings(); }
   if (name === 'archive') { populateDeviceSelect('ar_device', null); setArchivePreset('week'); }
   if (name === 'dashboard') { loadDashboard(); loadTimeCorrections(); }
+  if (name === 'pollmonitor') { loadPollMonitor(); }
   if (name === 'service') { loadServiceStatus(); }
   if (name === 'log') { renderDeviceActivityStrip(); }
 }
@@ -724,10 +757,15 @@ var reloadPollGeneration = 0;
 
 function forceReload() {
   var deviceId = document.getElementById('ar_device').value;
-  var fromDate = document.getElementById('rl_from').value; // ГГГГ-ММ-ДД, из календаря
-  var toDate = document.getElementById('rl_to').value;
   if (!deviceId) { showMsg('reloadMsg', false, 'Выберите прибор'); return; }
-  if (!fromDate) { showMsg('reloadMsg', false, 'Выберите дату начала в календаре'); return; }
+  if (!normalizeCalendarInput(document.getElementById('rl_from')) ||
+      !normalizeCalendarInput(document.getElementById('rl_to'))) {
+    showMsg('reloadMsg', false, 'Проверьте формат даты');
+    return;
+  }
+  var fromDate = document.getElementById('rl_from').value;
+  var toDate = document.getElementById('rl_to').value;
+  if (!fromDate) { showMsg('reloadMsg', false, 'Укажите дату начала'); return; }
   if (!confirm('Это ПЕРЕЗАПИШЕТ уже сохранённые данные архива за этот период данными, заново прочитанными с прибора. Продолжить?')) { return; }
 
   // Время внутри суток — отдельные выпадающие списки часа и получаса
@@ -823,11 +861,16 @@ var dashboardResyncDeviceId = null;
 
 function doDashboardResync() {
   if (!dashboardResyncDeviceId) { return; }
+  if (!normalizeCalendarInput(document.getElementById('dr_from')) ||
+      !normalizeCalendarInput(document.getElementById('dr_to'))) {
+    showMsg('dashboardResyncMsg', false, 'Проверьте формат даты');
+    return;
+  }
 
   var fromDate = document.getElementById('dr_from').value;
   var toDate = document.getElementById('dr_to').value;
   if (!fromDate) {
-    showMsg('dashboardResyncMsg', false, 'Выберите дату начала в календаре');
+    showMsg('dashboardResyncMsg', false, 'Укажите дату начала');
     return;
   }
 
@@ -847,7 +890,7 @@ function doDashboardResync() {
 
   sendDashboardResyncRequest('preview', fromVal, toVal, function(preview) {
     if (!preview.ok) {
-      showMsg('dashboardResyncMsg', false, 'Ошибка preview: ' + (preview.error || 'неизвестная'));
+      showMsg('dashboardResyncMsg', false, 'Ошибка предпросмотра: ' + (preview.error || 'неизвестная'));
       return;
     }
 
@@ -862,13 +905,13 @@ function doDashboardResync() {
     showMsg(
       'dashboardResyncMsg',
       true,
-      'Preview: будет переписано ' + preview.updated +
+      'Предпросмотр: будет переписано ' + preview.updated +
       ', вставлено новых ' + preview.inserted +
       ', заблокировано/ошибок ' + preview.failed + '.'
     );
 
     if (!confirm(summary)) {
-      showMsg('dashboardResyncMsg', true, 'Отменено после preview. В ЭС ничего не записано.');
+      showMsg('dashboardResyncMsg', true, 'Отменено после предпросмотра. В ЭС ничего не записано.');
       return;
     }
 
@@ -989,6 +1032,11 @@ function archiveQueryString() {
 function loadArchiveTable() {
   var deviceId = document.getElementById('ar_device').value;
   if (!deviceId) { showMsg('archiveMsg', false, 'Выберите прибор'); return; }
+  if (!normalizeCalendarInput(document.getElementById('ar_from')) ||
+      !normalizeCalendarInput(document.getElementById('ar_to'))) {
+    showMsg('archiveMsg', false, 'Проверьте формат даты');
+    return;
+  }
   if (!document.getElementById('ar_from').value || !document.getElementById('ar_to').value) {
     showMsg('archiveMsg', false, 'Укажите период (с и по)');
     return;
@@ -1039,6 +1087,11 @@ function renderArchiveTable(data) {
 function exportArchiveCSV() {
   var deviceId = document.getElementById('ar_device').value;
   if (!deviceId) { showMsg('archiveMsg', false, 'Выберите прибор'); return; }
+  if (!normalizeCalendarInput(document.getElementById('ar_from')) ||
+      !normalizeCalendarInput(document.getElementById('ar_to'))) {
+    showMsg('archiveMsg', false, 'Проверьте формат даты');
+    return;
+  }
   if (!document.getElementById('ar_from').value || !document.getElementById('ar_to').value) {
     showMsg('archiveMsg', false, 'Укажите период (с и по)');
     return;
@@ -1072,6 +1125,8 @@ var dashboardSortAsc = true;
 var logPaused = false;
 var logAfterSeq = 0;
 var logRawLines = []; // сырой текст без HTML-разметки — для копирования и скачивания
+var logDeviceFilter = ''; // пусто = все приборы
+var logEventFilter = 'all';
 
 function toggleLogPause() {
   logPaused = !logPaused;
@@ -1151,26 +1206,49 @@ function colorForDevice(id) {
 function renderDeviceActivityStrip() {
   var strip = document.getElementById('deviceActivityStrip');
   if (!strip) { return; }
-  var html = '';
+
+  var allSelected = (logDeviceFilter === '');
+  var html = '<span class="log-filter-btn' + (allSelected ? ' selected' : '') +
+    '" onclick="setLogDeviceFilter(\'\')" style="display:inline-block;padding:4px 10px;border-radius:12px;' +
+    'background:#0e639c;opacity:' + (allSelected ? '1' : '0.45') +
+    ';font-size:12px;color:#fff;font-weight:bold;white-space:nowrap;">Все приборы</span>';
+
   for (var i = 0; i < allDevices.length; i++) {
     var d = allDevices[i];
     var color = colorForDevice(d.id);
-    html += '<span id="activity_' + d.id + '" style="display:inline-block;padding:4px 10px;border-radius:12px;background:' + color +
-      ';opacity:0.3;transition:opacity 0.2s ease-out;font-size:12px;color:#111;font-weight:bold;white-space:nowrap;">' +
+    var selected = logDeviceFilter === d.id;
+    html += '<span id="activity_' + d.id + '" class="log-filter-btn' + (selected ? ' selected' : '') +
+      '" onclick="setLogDeviceFilter(\'' + d.id + '\')" style="display:inline-block;padding:4px 10px;border-radius:12px;background:' + color +
+      ';opacity:' + (selected ? '1' : '0.35') +
+      ';transition:opacity 0.2s ease-out;font-size:12px;color:#111;font-weight:bold;white-space:nowrap;">' +
       (d.name || d.id) + '</span>';
   }
   strip.innerHTML = html;
 }
 
+function setLogDeviceFilter(deviceId) {
+  logDeviceFilter = deviceId || '';
+  renderDeviceActivityStrip();
+  renderFilteredLog();
+}
+
+function setLogEventFilter(value) {
+  logEventFilter = value || 'all';
+  renderFilteredLog();
+}
+
 // flashDeviceActivity — вызывается для каждой новой строки лога,
 // упомянувшей конкретный прибор: ярко "зажигает" его индикатор и через
-// секунду плавно гасит обратно.
+// секунду плавно гасит обратно. Выбранный фильтр остаётся ярким постоянно.
 function flashDeviceActivity(deviceId) {
   var el = document.getElementById('activity_' + deviceId);
   if (!el) { return; }
   el.style.opacity = '1';
   clearTimeout(el._flashTimer);
-  el._flashTimer = setTimeout(function () { el.style.opacity = '0.3'; }, 900);
+  if (logDeviceFilter === deviceId) { return; }
+  el._flashTimer = setTimeout(function () {
+    if (logDeviceFilter !== deviceId) { el.style.opacity = '0.35'; }
+  }, 900);
 }
 
 function deviceIdFromLogLine(line) {
@@ -1185,16 +1263,81 @@ function deviceIdFromLogLine(line) {
   return null;
 }
 
+
+function logEventCategory(line) {
+  var lower = (line || '').toLowerCase();
+  if (line.indexOf('[НЕТ СВЯЗИ]') !== -1 ||
+      line.indexOf('[ERROR]') !== -1 || line.indexOf('[ОШИБКА]') !== -1 ||
+      line.indexOf('[FATAL]') !== -1 || line.indexOf('SQLITE_BUSY') !== -1 ||
+      lower.indexOf('ошибка') !== -1) {
+    return 'error';
+  }
+  if (line.indexOf('[ВРЕМЯ]') !== -1 || lower.indexOf('коррекц') !== -1) {
+    return 'time';
+  }
+  if (line.indexOf('[es-sync]') !== -1 || lower.indexOf('[синхронизация с эс]') !== -1 ||
+      line.indexOf('PointMains') !== -1 || lower.indexOf('бд эс') !== -1) {
+    return 'es';
+  }
+  if (lower.indexOf('архив') !== -1 || lower.indexOf('дозабор') !== -1 ||
+      lower.indexOf('довыгруз') !== -1 || lower.indexOf('переопрос') !== -1) {
+    return 'archive';
+  }
+  if (line.indexOf('[SAVE]') !== -1 || line.indexOf('[СОХРАНЕНО]') !== -1 ||
+      line.indexOf('[poller]') !== -1 || lower.indexOf('[опрос]') !== -1 ||
+      lower.indexOf('текущий опрос') !== -1) {
+    return 'poll';
+  }
+  return 'system';
+}
+
+function logLineMatchesFilters(line) {
+  if (logDeviceFilter) {
+    if (deviceIdFromLogLine(line) !== logDeviceFilter) { return false; }
+  }
+  if (logEventFilter !== 'all' && logEventCategory(line) !== logEventFilter) {
+    return false;
+  }
+  return true;
+}
+
+function renderFilteredLog() {
+  var view = document.getElementById('logView');
+  if (!view) { return; }
+  var html = '';
+  for (var i = logRawLines.length - 1; i >= 0; i--) {
+    if (logLineMatchesFilters(logRawLines[i])) {
+      html += formatLogLine(logRawLines[i]) + '\n';
+    }
+  }
+  view.innerHTML = html;
+}
+
+function russifyVisibleLogLine(line) {
+  // Старые технические метки остаются в файле лога для обратной
+  // совместимости, но оператор в UI всегда видит русские названия.
+  return line
+    .replace(/\[INFO\]/g, '[ИНФО]')
+    .replace(/\[OK\]/g, '[ОК]')
+    .replace(/\[WARN\]/g, '[ПРЕДУПРЕЖДЕНИЕ]')
+    .replace(/\[ERROR\]/g, '[ОШИБКА]')
+    .replace(/\[FATAL\]/g, '[КРИТИЧЕСКАЯ ОШИБКА]')
+    .replace(/\[WEB\]/g, '[ВЕБ]')
+    .replace(/\[SAVE\]/g, '[СОХРАНЕНО]')
+    .replace(/\[poller\]/g, '[ОПРОС]')
+    .replace(/\[es-sync\]/g, '[СИНХРОНИЗАЦИЯ С ЭС]');
+}
+
 function formatLogLine(line) {
-  var html = escapeHtmlForLog(line);
+  var html = escapeHtmlForLog(russifyVisibleLogLine(line));
   var cls = '';
-  if (line.indexOf('[НЕТ СВЯЗИ]') !== -1 || line.indexOf('[ERROR]') !== -1 || line.indexOf('[FATAL]') !== -1) {
+  if (line.indexOf('[НЕТ СВЯЗИ]') !== -1 || line.indexOf('[ERROR]') !== -1 || line.indexOf('[ОШИБКА]') !== -1 || line.indexOf('[FATAL]') !== -1) {
     cls = 'status-bad';
-  } else if (line.indexOf('[WARN]') !== -1) {
+  } else if (line.indexOf('[WARN]') !== -1 || line.indexOf('[ПРЕДУПРЕЖДЕНИЕ]') !== -1) {
     cls = 'log-warn';
   } else if (line.indexOf('[ВРЕМЯ]') !== -1) {
     cls = (line.indexOf('часы ВКМ скорректированы на') !== -1) ? 'status-good' : 'log-warn';
-  } else if (line.indexOf('[OK]') !== -1) {
+  } else if (line.indexOf('[OK]') !== -1 || line.indexOf('[ОК]') !== -1) {
     cls = 'status-good';
   }
   html = humanizeLogLine(html);
@@ -1227,41 +1370,17 @@ function loadLog() {
     try { data = JSON.parse(xhr.responseText); } catch (e) { return; }
     if (!data.entries || !data.entries.length) { return; }
 
-    var view = document.getElementById('logView');
-
-    // Новые строки добавляются СВЕРХУ, а не снизу (изменено 2026-08-30,
-    // прямой запрос оператора: "лог автоматически не прокрутился на
-    // новую запись... может сделать наоборот - новые записи вверху
-    // будут добавляться?") — так самая свежая запись всегда видна
-    // сразу, без прокрутки полосой вниз, и не нужно угадывать, где
-    // сейчас находится взгляд оператора, чтобы решить, прокручивать
-    // экран автоматически или нет.
-    //
-    // logRawLines (для копирования/сохранения в файл) остаётся в
-    // ХРОНОЛОГИЧЕСКОМ порядке (старые сверху) — это по-прежнему
-    // естественный порядок чтения для сохранённого файла; порядок на
-    // ЭКРАНЕ и порядок в СОХРАНЁННОМ файле — разные, независимые вещи.
     for (var i = 0; i < data.entries.length; i++) {
       logRawLines.push(data.entries[i].text);
-      // Вспышка индикатора прибора, упомянутого в строке (см.
-      // flashDeviceActivity выше) — не влияет на сам текст лога,
-      // только на полоску активности над ним.
       var deviceId = deviceIdFromLogLine(data.entries[i].text);
       if (deviceId) { flashDeviceActivity(deviceId); }
     }
-    var html = '';
-    for (var j = data.entries.length - 1; j >= 0; j--) {
-      html += formatLogLine(data.entries[j].text) + '\n';
-    }
-    view.innerHTML = html + view.innerHTML;
     logAfterSeq = data.latest_seq;
 
-    // Держим в браузере не больше строк, чем сервер держит в своём
-    // буфере — иначе вкладка, открытая долго, будет бесконечно
-    // разрастаться в памяти самой страницы.
     if (logRawLines.length > 5000) {
       logRawLines = logRawLines.slice(logRawLines.length - 5000);
     }
+    renderFilteredLog();
   };
   xhr.send();
 }
@@ -1295,6 +1414,79 @@ function downloadLog() {
 function clearLogView() {
   document.getElementById('logView').innerHTML = '';
   logRawLines = [];
+}
+
+// ===================== МОНИТОР ОПРОСА =====================
+function pollKindLabel(kind) {
+  if (kind === 'current') { return 'текущие данные'; }
+  if (kind === 'archive') { return 'архив'; }
+  if (kind === 'backfill') { return 'дозабор архива'; }
+  if (kind === 'manual_reload') { return 'принудительный переопрос'; }
+  return kind || 'опрос';
+}
+
+function loadPollMonitor() {
+  var panel = document.getElementById('panel-pollmonitor');
+  if (!panel || panel.className.indexOf('active') === -1) { return; }
+
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/poll-monitor', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    var body = document.getElementById('pollMonitorTable');
+    if (!body) { return; }
+    if (xhr.status !== 200) {
+      body.innerHTML = '<tr><td colspan="5" class="status-bad">Не удалось получить состояние опроса</td></tr>';
+      return;
+    }
+
+    var runtime;
+    try { runtime = JSON.parse(xhr.responseText) || []; } catch (e) {
+      body.innerHTML = '<tr><td colspan="5" class="status-bad">Ошибка ответа сервера</td></tr>';
+      return;
+    }
+
+    var byId = {};
+    for (var i = 0; i < runtime.length; i++) { byId[runtime[i].id] = runtime[i]; }
+
+    var html = '';
+    for (var j = 0; j < allDevices.length; j++) {
+      var d = allDevices[j];
+      var st = byId[d.id] || {};
+      var active = !!d.enabled && !!st.poll_in_progress;
+      var statusTitle = active ? ('Сейчас выполняется: ' + pollKindLabel(st.poll_kind)) :
+        (d.enabled ? 'Сейчас прибор не опрашивается' : 'Прибор отключён');
+      var dot = '<span class="poll-dot' + (active ? ' active' : '') + '" title="' + statusTitle + '"></span>';
+
+      var started = st.poll_started_at || '—';
+      var next = d.enabled ? (st.next_poll_at || 'ожидание расписания') : 'отключён';
+
+      var last;
+      if (!d.enabled) {
+        last = '<span>прибор отключён</span>';
+      } else if (!st.last_poll_known) {
+        last = '<span>ещё нет завершённого планового опроса</span>';
+      } else {
+        var kind = pollKindLabel(st.last_poll_kind);
+        if (st.last_poll_ok) {
+          last = (st.last_poll_finished_at || '—') + ' — <span class="status-good">успешно</span> (' + kind + ')';
+        } else {
+          last = (st.last_poll_finished_at || '—') + ' — <span class="status-bad">неуспешно</span> (' + kind + ')';
+          if (st.last_poll_error) {
+            last += '<br/><span class="muted">' + escapeHtmlForLog(st.last_poll_error) + '</span>';
+          }
+        }
+      }
+
+      html += '<tr><td style="text-align:center;">' + dot + '</td><td>' +
+        escapeHtmlForLog(d.name || d.id) + '</td><td>' + started + '</td><td>' + next + '</td><td>' + last + '</td></tr>';
+    }
+    if (html === '') {
+      html = '<tr><td colspan="5">Приборов пока нет</td></tr>';
+    }
+    body.innerHTML = html;
+  };
+  xhr.send();
 }
 
 // ===================== СЛУЖБА =====================
@@ -1457,6 +1649,12 @@ function dashboardSortValue(row, key) {
   return '';
 }
 
+function deviceKindLabel(kind) {
+  if (kind === 'vkm360') { return 'ВКМ-360'; }
+  if (kind === 'akron') { return 'Акрон'; }
+  return kind || '—';
+}
+
 function renderDashboardTable() {
   var rows = dashboardData.slice(); // копия — не трогаем исходный порядок с сервера
 
@@ -1524,9 +1722,6 @@ function renderDashboardTable() {
     }
     var driftTitle = d.time_drift_checked_at ? ' title="проверено: ' + d.time_drift_checked_at + '"' : '';
 
-    var lastPeriodText = d.last_period || '—';
-    var nextPollText = d.next_poll_at || '—';
-
     var workParts = [];
     workParts.push('текущие: ' + (d.last_current_success || '—'));
     workParts.push('архив: ' + (d.last_archive_success || '—'));
@@ -1540,12 +1735,11 @@ function renderDashboardTable() {
       actionCell = '<button class="btn secondary" onclick="openDashboardResyncBox(\'' + d.id + '\')">Принудительная пересинхронизация с ЭС</button>';
     }
 
-    html += '<tr><td>' + (d.name || d.id) + ' (' + d.id + ')</td><td>' + d.kind + '</td><td>' +
-      enabledText + '</td><td class="' + lagClass + '">' + lagText + '</td><td>' + lastPeriodText +
-      '</td><td>' + nextPollText + '</td><td class="' + driftClass + '"' + driftTitle + '>' +
+    html += '<tr><td>' + (d.name || d.id) + ' (' + d.id + ')</td><td>' + deviceKindLabel(d.kind) + '</td><td>' +
+      enabledText + '</td><td class="' + lagClass + '">' + lagText + '</td><td class="' + driftClass + '"' + driftTitle + '>' +
       driftText + '</td><td>' + workText + '</td><td>' + actionCell + '</td></tr>';
   }
-  if (html === '') { html = '<tr><td colspan="9">Приборов пока нет</td></tr>'; }
+  if (html === '') { html = '<tr><td colspan="7">Приборов пока нет</td></tr>'; }
   document.getElementById('dashboardTable').innerHTML = html;
 }
 
@@ -1568,7 +1762,7 @@ function renderDevicesTable() {
     var d = allDevices[i];
     var transportDesc = d.transport_kind === 'modbus_tcp' ? (d.host + ':' + d.port) : d.com;
     var enabledText = d.enabled ? '<span class="status-good">да</span>' : '<span class="status-bad">нет</span>';
-    rows += '<tr><td>' + d.id + '</td><td>' + d.name + '</td><td>' + d.kind + '</td><td>' +
+    rows += '<tr><td>' + d.id + '</td><td>' + d.name + '</td><td>' + deviceKindLabel(d.kind) + '</td><td>' +
       transportDesc + '</td><td>' + enabledText + '</td><td>' +
       '<button class="btn secondary" onclick="editDevice(\'' + d.id + '\')">Изменить</button> ' +
       '<button class="btn danger" onclick="deleteDevice(\'' + d.id + '\')">Удалить</button>' +
@@ -1743,7 +1937,7 @@ function saveDevice() {
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
     if (xhr.status === 200) {
-      showMsg('deviceMsg', true, 'Сохранено. Для применения запустите/перезапустите mbgw server.');
+      showMsg('deviceMsg', true, 'Сохранено. Для применения запустите/перезапустите сервер mbgw.');
       loadDevices();
     } else {
       var err = 'HTTP ' + xhr.status;
@@ -2175,8 +2369,8 @@ function saveSettings() {
 // откатится на что-то безопасное — не откатывается, календаря нет вообще
 // (подтверждено живьём, 2026-08-26). Поэтому здесь свой собственный,
 // маленький календарь на чистом ES5 — работает одинаково в любом браузере,
-// включая IE, и не требует от оператора вводить дату руками вообще: поля
-// теперь readonly, выбор — только кликом по дню в календаре.
+// включая IE. Календарь остаётся удобным способом выбора, но поле также
+// можно редактировать вручную: принимаются ГГГГ-ММ-ДД и ДД.ММ.ГГГГ.
 
 var calendarPopupEl = null;
 var calendarActiveInputId = null;
@@ -2184,8 +2378,43 @@ var calendarActiveInputId = null;
 var monthNamesRu = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 var weekDaysRu = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 
+function normalizeDateText(s) {
+  s = (s || '').replace(/^\s+|\s+$/g, '');
+  if (!s) { return ''; }
+
+  var y, m, d, match;
+  match = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s);
+  if (match) {
+    y = parseInt(match[1], 10); m = parseInt(match[2], 10); d = parseInt(match[3], 10);
+  } else {
+    match = /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/.exec(s);
+    if (!match) { return null; }
+    d = parseInt(match[1], 10); m = parseInt(match[2], 10); y = parseInt(match[3], 10);
+  }
+
+  var dt = new Date(y, m - 1, d);
+  if (dt.getFullYear() !== y || dt.getMonth() !== m - 1 || dt.getDate() !== d) { return null; }
+  return y + '-' + pad2(m) + '-' + pad2(d);
+}
+
+function normalizeCalendarInput(input) {
+  if (!input) { return false; }
+  var normalized = normalizeDateText(input.value);
+  if (normalized === null) {
+    input.style.borderColor = '#a1260d';
+    input.title = 'Введите дату в формате ГГГГ-ММ-ДД или ДД.ММ.ГГГГ';
+    return false;
+  }
+  if (normalized) { input.value = normalized; }
+  input.style.borderColor = '#3e3e42';
+  input.title = '';
+  return true;
+}
+
 function parseISODate(s) {
-  var parts = s.split('-');
+  var normalized = normalizeDateText(s);
+  if (!normalized) { return null; }
+  var parts = normalized.split('-');
   return new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
 }
 
@@ -2195,9 +2424,10 @@ function parseISODate(s) {
 function attachCalendar(inputId) {
   var input = document.getElementById(inputId);
   if (!input) { return; }
-  input.style.cursor = 'pointer';
+  input.style.cursor = 'text';
   input.style.background = '#3c3c3c';
   input.onclick = function() { toggleCalendarPopup(inputId); };
+  input.onblur = function() { normalizeCalendarInput(input); };
 }
 
 function toggleCalendarPopup(inputId) {
@@ -2225,6 +2455,7 @@ function toggleCalendarPopup(inputId) {
   popup.style.boxShadow = '0 4px 12px rgba(0,0,0,0.5)';
 
   var current = input.value ? parseISODate(input.value) : new Date();
+  if (!current) { current = new Date(); }
 
   document.body.appendChild(popup);
   calendarPopupEl = popup;
@@ -2270,9 +2501,9 @@ function renderCalendarMonth(year, month) {
   if (!calendarPopupEl) { return; }
   var html = '';
   html += '<div style="display:table;width:100%;margin-bottom:8px;">';
-  html += '<div style="display:table-cell;text-align:left;"><button type="button" style="background:#3c3c3c;color:#fff;border:none;padding:4px 10px;cursor:pointer;" onclick="calendarChangeMonth(' + year + ',' + month + ',-1)">&lt;</button></div>';
+  html += '<div style="display:table-cell;text-align:left;"><button type="button" style="background:#3c3c3c;color:#fff;border:none;padding:4px 10px;cursor:pointer;" onclick="return calendarChangeMonth(' + year + ',' + month + ',-1,event)">&lt;</button></div>';
   html += '<div style="display:table-cell;text-align:center;color:#fff;font-size:13px;">' + monthNamesRu[month] + ' ' + year + '</div>';
-  html += '<div style="display:table-cell;text-align:right;"><button type="button" style="background:#3c3c3c;color:#fff;border:none;padding:4px 10px;cursor:pointer;" onclick="calendarChangeMonth(' + year + ',' + month + ',1)">&gt;</button></div>';
+  html += '<div style="display:table-cell;text-align:right;"><button type="button" style="background:#3c3c3c;color:#fff;border:none;padding:4px 10px;cursor:pointer;" onclick="return calendarChangeMonth(' + year + ',' + month + ',1,event)">&gt;</button></div>';
   html += '</div>';
   html += '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
   html += '<tr>';
@@ -2309,11 +2540,17 @@ function renderCalendarMonth(year, month) {
   calendarPopupEl.innerHTML = html;
 }
 
-function calendarChangeMonth(year, month, delta) {
+function calendarChangeMonth(year, month, delta, e) {
+  var evt = e || window.event;
+  if (evt) {
+    if (evt.stopPropagation) { evt.stopPropagation(); }
+    evt.cancelBubble = true;
+  }
   month += delta;
   if (month < 0) { month = 11; year -= 1; }
   if (month > 11) { month = 0; year += 1; }
   renderCalendarMonth(year, month);
+  return false;
 }
 
 function calendarPickDate(dateStr) {
@@ -2353,6 +2590,7 @@ loadProfiles();
 resetDeviceForm();
 loadDashboard();
 loadTimeCorrections();
+loadPollMonitor();
 // Автообновление вкладки «Главная» — раз в 30с, независимо от того,
 // какая вкладка сейчас открыта (дёшево: один маленький GET-запрос), так
 // что оператор видит актуальную картину сразу при переключении на неё,
@@ -2361,6 +2599,9 @@ loadTimeCorrections();
 // 30000)) — уже проверенное на практике значение для этого проекта.
 setInterval(loadDashboard, 30000);
 setInterval(loadTimeCorrections, 30000);
+// Монитор обновляется раз в секунду, но запрос выполняется только когда
+// вкладка открыта. Endpoint читает только память процесса и не трогает SQLite.
+setInterval(loadPollMonitor, 1000);
 
 loadLog();
 // Опрос новых строк лога каждые 2с — независимо от того, какая вкладка

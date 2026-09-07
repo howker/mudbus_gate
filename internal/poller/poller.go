@@ -80,16 +80,21 @@ func (p *Poller) Run(ctx context.Context) {
 	ticker := time.NewTicker(p.tickEvery)
 	defer ticker.Stop()
 
-	log.Printf("[poller] запуск (%d приборов, тик %v)\n", len(p.devices), p.tickEvery)
+	log.Printf("[опрос] запуск (%d приборов, тик %v)\n", len(p.devices), p.tickEvery)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("[poller] остановка")
+			log.Println("[опрос] остановка")
 			return
 		case <-ticker.C:
 			now := time.Now()
 			p.scheduler.Tick(now)
+			for deviceID := range p.devices {
+				if next, ok := p.scheduler.NextPollAt(deviceID); ok {
+					health.SetNextPoll(deviceID, next)
+				}
+			}
 			p.drainAsync(ctx)
 			health.MarkPollerCycle(now)
 		}
@@ -221,9 +226,38 @@ func (p *Poller) dispatchLocked(ctx context.Context, task scheduler.Task) {
 func (p *Poller) dispatch(ctx context.Context, task scheduler.Task) {
 	dev, ok := p.devices[task.DeviceID]
 	if !ok {
-		log.Printf("[poller] задача для неизвестного прибора %q, пропускаю\n", task.DeviceID)
+		log.Printf("[опрос] задача для неизвестного прибора %q, пропускаю\n", task.DeviceID)
 		return
 	}
+
+	startedAt := time.Now()
+	before := health.Get().Devices[task.DeviceID]
+	health.MarkPollStarted(task.DeviceID, string(task.Kind), startedAt)
+
+	recordResult := task.Kind == scheduler.KindCurrent || task.Kind == scheduler.KindArchive
+	defer func() {
+		if !recordResult {
+			health.MarkPollFinished(task.DeviceID, string(task.Kind), time.Now(), true, "", false)
+			return
+		}
+
+		after := health.Get().Devices[task.DeviceID]
+		pollOK := false
+		switch task.Kind {
+		case scheduler.KindCurrent:
+			pollOK = after.LastCurrentSuccess.After(startedAt) &&
+				after.LastCurrentSuccess.After(before.LastCurrentSuccess)
+		case scheduler.KindArchive:
+			pollOK = after.LastArchiveSuccess.After(startedAt) &&
+				after.LastArchiveSuccess.After(before.LastArchiveSuccess)
+		}
+
+		errText := ""
+		if !pollOK {
+			errText = "прибор не подтвердил успешное получение и сохранение данных"
+		}
+		health.MarkPollFinished(task.DeviceID, string(task.Kind), time.Now(), pollOK, errText, true)
+	}()
 
 	switch task.Kind {
 	case scheduler.KindCurrent:
@@ -241,6 +275,6 @@ func (p *Poller) dispatch(ctx context.Context, task scheduler.Task) {
 		// какого бы вида они ни были.
 		dev.BackfillArchives(ctx, device.BackfillOptions{})
 	default:
-		log.Printf("[poller] неизвестный тип задачи %q для %q\n", task.Kind, task.DeviceID)
+		log.Printf("[опрос] неизвестный тип задачи %q для %q\n", task.Kind, task.DeviceID)
 	}
 }
