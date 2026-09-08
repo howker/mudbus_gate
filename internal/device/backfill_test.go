@@ -60,7 +60,7 @@ func (f *fakeArchiveClient) Transact(ctx context.Context, req []byte) ([]byte, e
 
 func hourlyArchiveProfile(maxRows, bufferDepthHours int) *profile.Profile {
 	return &profile.Profile{
-		Codec: profile.Codec{WordOrder32: "0123"},
+		Codec: profile.Codec{WordOrder32: "3210"},
 		Archives: []profile.Archive{
 			{
 				ID:                "hourly",
