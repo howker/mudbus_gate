@@ -22,18 +22,19 @@ type serviceWatchdog struct {
 	timeout          time.Duration
 	runningAsService bool
 	activeDeviceIDs  func() []string
+	closeTransports  func(time.Duration) transportCloseSummary
 	serviceLog       *servicelog.Log
 	status           web.WatchdogStatusJSON
 	lastEventKey     string
 }
 
-func newServiceWatchdog(minutes int, runningAsService bool, serviceLog *servicelog.Log, activeDeviceIDs func() []string) *serviceWatchdog {
+func newServiceWatchdog(minutes int, runningAsService bool, serviceLog *servicelog.Log, activeDeviceIDs func() []string, closeTransports func(time.Duration) transportCloseSummary) *serviceWatchdog {
 	if minutes < 2 {
 		minutes = 10
 	}
 	return &serviceWatchdog{
 		startedAt: time.Now(), timeout: time.Duration(minutes) * time.Minute,
-		runningAsService: runningAsService, serviceLog: serviceLog, activeDeviceIDs: activeDeviceIDs,
+		runningAsService: runningAsService, serviceLog: serviceLog, activeDeviceIDs: activeDeviceIDs, closeTransports: closeTransports,
 		status: web.WatchdogStatusJSON{
 			Enabled: true, TimeoutMinutes: minutes, State: "норма",
 			Message: "контроль зависания активен", RunningAsService: runningAsService,
@@ -126,6 +127,17 @@ func (w *serviceWatchdog) check(now time.Time) {
 
 	if result.GlobalStall && serviceMode {
 		critical := message + ". Процесс запущен как служба Windows — запрошен аварийный перезапуск через политику восстановления SCM."
+
+		// os.Exit не выполняет defer. Поэтому перед SCM Recovery делаем
+		// отдельную ограниченную по времени попытку закрыть все открытые
+		// транспорты. Если зависший I/O держит внутренний mutex транспорта,
+		// Close тоже может не вернуться — тогда ждём не более 1500 мс и всё
+		// равно завершаем процесс; оставшиеся handles освободит Windows.
+		if w.closeTransports != nil {
+			summary := w.closeTransports(1500 * time.Millisecond)
+			logTransportCloseSummary("аварийный watchdog", summary)
+		}
+
 		log.Printf("[КРИТИЧНО] %s\n", critical)
 		// Отдельная БД журнала получает максимум 2 секунды. Даже если диск/БД
 		// сами зависли, watchdog не должен зависнуть вместе с ними.

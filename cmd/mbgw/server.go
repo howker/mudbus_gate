@@ -518,6 +518,15 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 	eventBus := monitor.NewBus(nil)
 	sched := scheduler.New(eventBus)
 	devices := make(map[string]*device.Device)
+	// transports владеет всеми успешно открытыми транспортами production
+	// server. Штатная остановка закрывает их только после завершения poller
+	// и физических Web-операций; watchdog использует тот же registry для
+	// ограниченной по времени best-effort попытки перед SCM Recovery.
+	transports := newTransportRegistry()
+	defer func() {
+		logTransportCloseSummary("завершение server core", transports.CloseAll(5*time.Second))
+	}()
+
 	// deviceKinds хранит тип каждого прибора (akron/vkm360) отдельно от
 	// devices — нужно колбэку принудительного переопроса (ниже), чтобы
 	// решить, какой именно метод вызывать (ForceReloadAkronHourly или
@@ -621,7 +630,7 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			registerOneDevice(ctx, repo, devRec, leaseMgr, sched, dbPath, &devicesMu, devices, deviceKinds, esSyncTriggers)
+			registerOneDevice(ctx, repo, devRec, leaseMgr, sched, dbPath, &devicesMu, devices, deviceKinds, esSyncTriggers, transports)
 		}()
 	}
 	wg.Wait()
@@ -639,7 +648,7 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 		devicesMu.Unlock()
 		return ids
 	}
-	wd := newServiceWatchdog(watchdogTimeoutMinutes, runningAsService, serviceLog, activeDeviceIDs)
+	wd := newServiceWatchdog(watchdogTimeoutMinutes, runningAsService, serviceLog, activeDeviceIDs, transports.CloseAll)
 	webServer.SetWatchdogStatus(wd.Status)
 	webServer.SetWatchdogTimeout(wd.SetTimeoutMinutes)
 	webServer.SetServiceLog(func(limit int) ([]web.ServiceLogEntry, error) {
@@ -898,7 +907,12 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 	<-pollerDone
 	<-webDone
 
-	writeServiceEvent(serviceLog, "успешно", "запуск и остановка", "МодбасШлюз штатно остановлен; активные операции завершены.")
+	// К этому моменту poller и все физические HTTP-операции уже завершены,
+	// поэтому Close не пересекается со штатным обменом. Явное закрытие до
+	// состояния SCM Stopped снижает риск быстрого рестарта на ещё занятом COM.
+	logTransportCloseSummary("штатная остановка", transports.CloseAll(5*time.Second))
+
+	writeServiceEvent(serviceLog, "успешно", "запуск и остановка", "МодбасШлюз штатно остановлен; активные операции завершены, транспорты закрыты.")
 	log.Println("=== МодбасШлюз остановлен ===")
 	return nil
 }
@@ -929,7 +943,7 @@ func deviceKindLabelRU(kind string) string {
 	}
 }
 
-func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqliterepo.DeviceRecord, leaseMgr *lease.LocalLease, sched *scheduler.Scheduler, dbPath string, devicesMu *sync.Mutex, devices map[string]*device.Device, deviceKinds map[string]string, esSyncTriggers map[string]chan struct{}) {
+func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqliterepo.DeviceRecord, leaseMgr *lease.LocalLease, sched *scheduler.Scheduler, dbPath string, devicesMu *sync.Mutex, devices map[string]*device.Device, deviceKinds map[string]string, esSyncTriggers map[string]chan struct{}, transports *transportRegistry) {
 	profilePath := profilePathNextToExe(devRec.Profile)
 	p, err := profile.Parse(profilePath)
 	if err != nil {
@@ -964,6 +978,9 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 		return
 	}
 	if err := tr.Open(ctx); err != nil {
+		// Open мог частично выделить ресурс до возврата ошибки; Close обязан
+		// быть идемпотентным, поэтому безопасно сделать best-effort cleanup.
+		_ = tr.Close()
 		switch devRec.TransportKind {
 		case "modbus_tcp":
 			log.Printf("[НЕТ СВЯЗИ] прибор %s (%s:%d): прибор не отвечает. Возможно, он выключен или недоступен по сети.\n",
@@ -983,7 +1000,13 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	err = sess.Open(ctx, tr)
 	unlockIO()
 	if err != nil {
+		_ = tr.Close()
 		log.Printf("[ERROR] ошибка сессии %s: %v\n", devRec.ID, err)
+		return
+	}
+	if transports == nil || !transports.Add(devRec.ID, tr) {
+		_ = tr.Close()
+		log.Printf("[INFO] прибор %s: регистрация отменена, сервер уже завершает работу\n", devRec.ID)
 		return
 	}
 	isTCP := devRec.TransportKind == "modbus_tcp"

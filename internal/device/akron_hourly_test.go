@@ -1,8 +1,15 @@
 package device
 
 import (
+	"context"
+	"encoding/binary"
+	"math"
 	"testing"
 	"time"
+
+	"mbgw/internal/archive"
+	"mbgw/internal/profile"
+	"mbgw/internal/storage"
 )
 
 func TestAkronRowTime_Valid(t *testing.T) {
@@ -92,5 +99,171 @@ func TestFieldFloat_Types(t *testing.T) {
 	}
 	if _, ok := fieldFloat(map[string]any{}, "volume"); ok {
 		t.Fatal("missing volume should be rejected")
+	}
+}
+
+type akronRolloverRepo struct {
+	storage.Repo
+	rows []storage.HourlyArchiveRecord
+}
+
+func (r *akronRolloverRepo) SaveHourlyArchive(_ context.Context, rec storage.HourlyArchiveRecord) error {
+	for i := range r.rows {
+		if r.rows[i].DeviceID == rec.DeviceID && r.rows[i].Channel == rec.Channel && r.rows[i].Param == rec.Param && r.rows[i].TsHour.Equal(rec.TsHour) {
+			r.rows[i] = rec
+			return nil
+		}
+	}
+	r.rows = append(r.rows, rec)
+	return nil
+}
+
+func (r *akronRolloverRepo) GetPreviousHourlyValue(_ context.Context, deviceID, channel, param string, before time.Time) (float64, bool, error) {
+	var best storage.HourlyArchiveRecord
+	found := false
+	for _, row := range r.rows {
+		if row.DeviceID != deviceID || row.Channel != channel || row.Param != param || !row.TsHour.Before(before) {
+			continue
+		}
+		if !found || row.TsHour.After(best.TsHour) {
+			best = row
+			found = true
+		}
+	}
+	return best.Value, found, nil
+}
+
+func (r *akronRolloverRepo) valueAt(ts time.Time) (float64, bool) {
+	for _, row := range r.rows {
+		if row.TsHour.Equal(ts) {
+			return row.Value, true
+		}
+	}
+	return 0, false
+}
+
+func akronRolloverArchive() profile.Archive {
+	return profile.Archive{
+		ID: "hourly",
+		RecordLayout: []profile.RecordField{
+			{Name: "volume", Unit: "m3"},
+		},
+	}
+}
+
+func akronRolloverRecord(ts time.Time, raw int32, pu byte) archive.ArchiveRecord {
+	b := make([]byte, 9)
+	binary.LittleEndian.PutUint32(b[:4], uint32(raw))
+	b[4] = pu
+	scale := math.Pow10(int(pu) - 3)
+	return archive.ArchiveRecord{
+		Fields: map[string]any{
+			"volume": float64(raw) * scale,
+			"hour":   int64(ts.Hour()),
+			"day":    int64(ts.Day()),
+			"month":  int64(ts.Month()),
+			"year":   int64(ts.Year() % 100),
+		},
+		Raw: b,
+	}
+}
+
+func TestPersistAkronHourly_ConfirmedInt32RolloverContinuesCounter(t *testing.T) {
+	base := time.Now().In(time.Local).Truncate(time.Hour).Add(-4 * time.Hour)
+	t0, t1, t2 := base, base.Add(time.Hour), base.Add(2*time.Hour)
+	const prev = 2147483547.0 // MaxInt32 - 100, Pu=3 => scale 1
+
+	repo := &akronRolloverRepo{rows: []storage.HourlyArchiveRecord{{
+		DeviceID: "ak", Param: "V", TsHour: t0, Value: prev, Unit: "m3",
+	}}}
+	// Device command 104 returns newest-first. Two consecutive negative int32
+	// rows confirm that the sign boundary was crossed rather than one row being
+	// corrupted by line noise.
+	records := []archive.ArchiveRecord{
+		akronRolloverRecord(t2, int32(-2147483648+180), 3),
+		akronRolloverRecord(t1, int32(-2147483648+50), 3),
+	}
+	if got := persistAkronHourly(context.Background(), repo, "ak", akronRolloverArchive(), records); got != 2 {
+		t.Fatalf("saved=%d, want 2", got)
+	}
+
+	v1, ok := repo.valueAt(t1)
+	if !ok {
+		t.Fatal("first rollover hour was not persisted")
+	}
+	v2, ok := repo.valueAt(t2)
+	if !ok {
+		t.Fatal("second rollover hour was not persisted")
+	}
+	if v1 != 2147483698.0 || v2 != 2147483828.0 {
+		t.Fatalf("normalized values = %v, %v; want 2147483698, 2147483828", v1, v2)
+	}
+	if v1-prev != 151 || v2-v1 != 130 {
+		t.Fatalf("rollover deltas = %v, %v; want 151, 130", v1-prev, v2-v1)
+	}
+}
+
+func TestPersistAkronHourly_DoesNotAcceptUnconfirmedNegativeSample(t *testing.T) {
+	base := time.Now().In(time.Local).Truncate(time.Hour).Add(-4 * time.Hour)
+	t0, t1 := base, base.Add(time.Hour)
+	const prev = 2147483547.0
+	repo := &akronRolloverRepo{rows: []storage.HourlyArchiveRecord{{
+		DeviceID: "ak", Param: "V", TsHour: t0, Value: prev, Unit: "m3",
+	}}}
+
+	// Near the sign boundary, but with no following hour to confirm the trend.
+	// The safe behavior is to defer this row; the next regular command-104 page
+	// will contain it again together with the next hour.
+	records := []archive.ArchiveRecord{
+		akronRolloverRecord(t1, int32(-2147483648+50), 3),
+	}
+	if got := persistAkronHourly(context.Background(), repo, "ak", akronRolloverArchive(), records); got != 0 {
+		t.Fatalf("saved=%d, want 0 for unconfirmed rollover", got)
+	}
+	if _, ok := repo.valueAt(t1); ok {
+		t.Fatal("unconfirmed rollover row must not be persisted")
+	}
+}
+
+func TestPersistAkronHourly_LineNoiseStillRejected(t *testing.T) {
+	base := time.Now().In(time.Local).Truncate(time.Hour).Add(-4 * time.Hour)
+	t0, t1, t2 := base, base.Add(time.Hour), base.Add(2*time.Hour)
+	repo := &akronRolloverRepo{rows: []storage.HourlyArchiveRecord{{
+		DeviceID: "ak", Param: "V", TsHour: t0, Value: 2200000, Unit: "m3",
+	}}}
+
+	// Two negative raw values are not enough: the previous real counter is
+	// nowhere near the int32 boundary, so this remains ordinary corruption.
+	records := []archive.ArchiveRecord{
+		akronRolloverRecord(t2, -50, 3),
+		akronRolloverRecord(t1, -100, 3),
+	}
+	if got := persistAkronHourly(context.Background(), repo, "ak", akronRolloverArchive(), records); got != 0 {
+		t.Fatalf("saved=%d, want 0 for line-noise decrease", got)
+	}
+}
+
+func TestPersistAkronHourly_ConfirmedFullUint32Rollover(t *testing.T) {
+	base := time.Now().In(time.Local).Truncate(time.Hour).Add(-4 * time.Hour)
+	t0, t1, t2 := base, base.Add(time.Hour), base.Add(2*time.Hour)
+	const modulus = 4294967296.0
+	repo := &akronRolloverRepo{rows: []storage.HourlyArchiveRecord{{
+		DeviceID: "ak", Param: "V", TsHour: t0, Value: modulus - 100, Unit: "m3",
+	}}}
+
+	records := []archive.ArchiveRecord{
+		akronRolloverRecord(t2, 180, 3),
+		akronRolloverRecord(t1, 50, 3),
+	}
+	if got := persistAkronHourly(context.Background(), repo, "ak", akronRolloverArchive(), records); got != 2 {
+		t.Fatalf("saved=%d, want 2", got)
+	}
+	v1, _ := repo.valueAt(t1)
+	v2, _ := repo.valueAt(t2)
+	if v1 != modulus+50 || v2 != modulus+180 {
+		t.Fatalf("normalized full-wrap values = %v, %v; want %v, %v", v1, v2, modulus+50, modulus+180)
+	}
+	if v1-(modulus-100) != 150 || v2-v1 != 130 {
+		t.Fatalf("full-wrap deltas = %v, %v; want 150, 130", v1-(modulus-100), v2-v1)
 	}
 }
