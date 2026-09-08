@@ -39,7 +39,7 @@ func (r *Repo) InitDeviceConfigSchema(ctx context.Context) error {
 CREATE TABLE IF NOT EXISTS devices (
     id                       TEXT PRIMARY KEY,
     name                     TEXT NOT NULL DEFAULT '',
-    kind                     TEXT NOT NULL,              -- 'vkm360' | 'akron'
+    kind                     TEXT NOT NULL,              -- 'vkm360' | 'akron' | 'ivk-ter'
     profile                  TEXT NOT NULL DEFAULT '',
     transport_kind           TEXT NOT NULL DEFAULT '',   -- 'modbus_tcp' | 'rtu_serial' | 'tcp_serial'
     host                     TEXT NOT NULL DEFAULT '',
@@ -161,7 +161,7 @@ CREATE TABLE IF NOT EXISTS es_akron_northbound (
 type DeviceRecord struct {
 	ID                    string
 	Name                  string
-	Kind                  string // "vkm360" | "akron"
+	Kind                  string // "vkm360" | "akron" | "ivk-ter"
 	Profile               string
 	TransportKind         string
 	Host                  string
@@ -192,13 +192,13 @@ type DeviceRecord struct {
 // screen).
 func (r *Repo) UpsertDevice(ctx context.Context, d DeviceRecord) error {
 	if d.TimeCorrectionDeadbandSeconds < 0 {
-		return fmt.Errorf("upsert device: time correction deadband must be >= 0")
+		return fmt.Errorf("допустимое расхождение времени не может быть отрицательным")
 	}
 	if d.TimeCorrectionMaxStepSeconds < 0 || d.TimeCorrectionMaxStepSeconds > 99 {
-		return fmt.Errorf("upsert device: time correction max step must be in range 0..99 seconds")
+		return fmt.Errorf("максимальная коррекция времени должна быть в диапазоне 0..99 секунд")
 	}
 	if d.TimeCorrectionDailyLimitSeconds < 0 {
-		return fmt.Errorf("upsert device: time correction daily limit must be >= 0")
+		return fmt.Errorf("лимит коррекции времени за 24 часа не может быть отрицательным")
 	}
 
 	now := time.Now()
@@ -393,6 +393,28 @@ type TimeCorrectionRecord struct {
 	DeviceID          string
 	CorrectedAt       time.Time
 	CorrectionSeconds int
+}
+
+// LastTimeCorrection возвращает последнюю подтверждённую коррекцию конкретного
+// прибора. Нужна runtime-монитору после перезапуска процесса: история уже
+// хранится в SQLite, поэтому состояние «срабатываний не было» не должно
+// ошибочно появляться только из-за рестарта МодбасШлюза.
+func (r *Repo) LastTimeCorrection(ctx context.Context, deviceID string) (TimeCorrectionRecord, bool, error) {
+	var rec TimeCorrectionRecord
+	err := r.db.QueryRowContext(ctx, `
+SELECT id, device_id, corrected_at, correction_seconds
+FROM device_time_corrections
+WHERE device_id = ?
+ORDER BY corrected_at DESC, id DESC
+LIMIT 1
+`, deviceID).Scan(&rec.ID, &rec.DeviceID, &rec.CorrectedAt, &rec.CorrectionSeconds)
+	if err == sql.ErrNoRows {
+		return TimeCorrectionRecord{}, false, nil
+	}
+	if err != nil {
+		return TimeCorrectionRecord{}, false, fmt.Errorf("last device time correction: %w", err)
+	}
+	return rec, true, nil
 }
 
 // ListTimeCorrections returns the newest correction events first.

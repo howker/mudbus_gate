@@ -4,7 +4,7 @@ meta:
   profile_version: "1.0.0"
   protocol: "modbus"
   firmware_compat: ["*"]
-  description: "IVK-TER: basic current values (vertical slice, no composite types yet)."
+  description: "ИВК-ТЭР: текущие значения, часы, заводской номер и часовой архив."
 transport:
   supported: ["tcp", "rtu", "tcp-serial"]
   defaults:
@@ -22,21 +22,22 @@ codec:
 session:
   type: "none"
 points:
-  - name: "Current flow rate"
+  - name: "serial_number"
     space: "IR"
-    addr: 100
-    type: "float"
-    unit: "m3/h"
+    addr: 32770
+    type: "uint32"
     access: "read"
-    group: "current"
+    group: "identity"
+    note: "IR 0x8002 (32770): серийный номер вторичного вычислителя ИВК-ТЭР."
 
-  - name: "Temperature"
+  - name: "Текущий расход"
     space: "IR"
-    addr: 102
+    addr: 49204
     type: "float"
-    unit: "C"
+    unit: "л/мин"
     access: "read"
     group: "current"
+    note: "IR 0xC034 (49204): текущий расход, л/мин; регистр ввода типа вещественное значение по карте Modbus ИВК-ТЭР."
 
   - name: "current_time"
     space: "IR"
@@ -45,7 +46,7 @@ points:
     epoch: "1970-01-01"
     access: "read"
     group: "time"
-    note: "IR 0x8000 (32768): device clock, read-only view. 4-byte Unix timestamp - same encoding as archive_time in this profiles own record_layout (already live-verified), per mb_reg_ivk_ter.pdf."
+    note: "IR 0x8000 (32768): часы прибора, чтение. 4-байтовая метка Unix, как archive_time в часовом архиве."
 
   - name: "time_set"
     space: "HR"
@@ -54,7 +55,7 @@ points:
     epoch: "1970-01-01"
     access: "write"
     group: "time"
-    note: "HR 0x8000 (32768): device clock, WRITE register (settable only in Service/Setup mode, per mb_reg_ivk_ter.pdf). Marked access:write so the normal poll cycle skips it - it is written by the set-time CLI command, never read back as a live value."
+    note: "HR 0x8000 (32768): установка часов разрешена только вручную в сервисном режиме прибора. Обычный цикл опроса этот регистр не записывает."
 
 archives:
   - id: "hourly"
@@ -63,15 +64,15 @@ archives:
     index_access: true
     params:
       archive_type: 0
-    note: "IVK-TER hourly archive (index 0), read via VZLET function 65 - the generic array-read mechanism shared by all VZLET devices (prtkl_Modbus_pril_1.pdf), not a bespoke indexed-binary read. No CRC on this record (str_arh_ivk_ter.pdf table 3: all 30 bytes are accounted for by the 10 fields below, no room for a trailing checksum) - unlike TSRV-024's archives."
+    note: "Часовой архив ИВК-ТЭР: функция Modbus 65, архив 0. Запись 30 байт; отдельного CRC внутри записи нет."
     record_layout:
       - { offset: 0, name: "archive_time", type: "uint32", epoch: "1970-01-01" }
-      - { offset: 4, name: "v_plus", type: "float", unit: "m3" }
-      - { offset: 8, name: "v_minus", type: "float", unit: "m3" }
-      - { offset: 12, name: "q_avg", type: "float", unit: "l/min" }
-      - { offset: 16, name: "resistance", type: "float", unit: "Ohm" }
+      - { offset: 4, name: "v_plus", type: "float", unit: "м³" }
+      - { offset: 8, name: "v_minus", type: "float", unit: "м³" }
+      - { offset: 12, name: "q_avg", type: "float", unit: "л/мин" }
+      - { offset: 16, name: "resistance", type: "float", unit: "Ом" }
       - { offset: 20, name: "errors", type: "bitfield" }
-      - { offset: 22, name: "comm_fail_time", type: "uint16", unit: "min" }
+      - { offset: 22, name: "comm_fail_time", type: "uint16", unit: "мин" }
       - { offset: 24, name: "flowmeter_type", type: "bitfield" }
-      - { offset: 26, name: "downtime", type: "uint16", unit: "min" }
-      - { offset: 28, name: "power_loss_time", type: "uint16", unit: "min" }
+      - { offset: 26, name: "downtime", type: "uint16", unit: "мин" }
+      - { offset: 28, name: "power_loss_time", type: "uint16", unit: "мин" }

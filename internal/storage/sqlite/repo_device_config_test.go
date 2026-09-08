@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func newTestRepoWithDeviceConfig(t *testing.T) *Repo {
@@ -251,5 +252,39 @@ func TestAkronNorthboundAddr_RoundTripAndNotFound(t *testing.T) {
 	}
 	if !found || addr != "127.0.0.1:15021" {
 		t.Fatalf("round-trip mismatch: found=%v addr=%q", found, addr)
+	}
+}
+
+func TestLastTimeCorrection(t *testing.T) {
+	repo := newTestRepoWithDeviceConfig(t)
+	ctx := context.Background()
+
+	if _, found, err := repo.LastTimeCorrection(ctx, "vkm1"); err != nil {
+		t.Fatalf("last correction before records: %v", err)
+	} else if found {
+		t.Fatal("expected no correction before records")
+	}
+
+	t1 := time.Date(2026, 9, 8, 8, 10, 0, 0, time.UTC)
+	t2 := t1.Add(20 * time.Minute)
+	if err := repo.RecordTimeCorrection(ctx, "vkm1", 4, t1); err != nil {
+		t.Fatalf("record first correction: %v", err)
+	}
+	if err := repo.RecordTimeCorrection(ctx, "vkm1", -3, t2); err != nil {
+		t.Fatalf("record second correction: %v", err)
+	}
+	if err := repo.RecordTimeCorrection(ctx, "other", 9, t2.Add(time.Minute)); err != nil {
+		t.Fatalf("record other correction: %v", err)
+	}
+
+	rec, found, err := repo.LastTimeCorrection(ctx, "vkm1")
+	if err != nil {
+		t.Fatalf("last correction: %v", err)
+	}
+	if !found {
+		t.Fatal("expected last correction to be found")
+	}
+	if rec.DeviceID != "vkm1" || rec.CorrectionSeconds != -3 || !rec.CorrectedAt.Equal(t2) {
+		t.Fatalf("unexpected last correction: %+v", rec)
 	}
 }

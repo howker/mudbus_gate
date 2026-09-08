@@ -109,6 +109,14 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 .poll-dot.active { background:#4caf50; border-color:#7bd17f; box-shadow:0 0 8px rgba(76,175,80,0.8); }
 .log-filter-btn { cursor:pointer; border:2px solid transparent; }
 .log-filter-btn.selected { border-color:#ffffff !important; opacity:1 !important; }
+.service-log { width:100%; border-collapse:collapse; }
+.service-log td { vertical-align:top; }
+.service-level-info { color:#cccccc; }
+.service-level-ok { color:#6fdc73; }
+.service-level-warn { color:#ffbf47; font-weight:bold; }
+.service-level-error { color:#ff6b6b; font-weight:bold; }
+.service-level-critical { color:#ff3b30; font-weight:bold; background:#3d1e1e; }
+.watchdog-box { padding:10px; margin:10px 0; border:1px solid #3e3e42; background:#1e1e1e; }
 </style>
 </head>
 <body>
@@ -128,7 +136,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 
 <div class="content">
 
-  <!-- ===================== РџР РР‘РћР Р« ===================== -->
+  <!-- ===================== ПРИБОРЫ ===================== -->
   <!-- ===================== ГЛАВНАЯ (ДАШБОРД) ===================== -->
   <div id="panel-dashboard" class="panel active">
     <div class="section">
@@ -147,15 +155,6 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         </tr></thead>
         <tbody id="dashboardTable"><tr><td colspan="7">Загрузка...</td></tr></tbody>
       </table>
-
-      <div style="margin-top:24px;">
-        <h3>История коррекции времени ВКМ</h3>
-        <p class="small-note">Показываются последние подтверждённые коррекции часов, сохранённые в БД шлюза. Положительное значение — часы прибора были сдвинуты вперёд, отрицательное — назад.</p>
-        <table>
-          <thead><tr><th>Прибор</th><th>Дата и время коррекции</th><th>Коррекция</th></tr></thead>
-          <tbody id="timeCorrectionsTable"><tr><td colspan="3">Загрузка...</td></tr></tbody>
-        </table>
-      </div>
 
       <!-- Всплывающий блок «Принудительная пересинхронизация с ЭС» —
            переехал сюда с вкладки «Подключение к ЭС» (2026-09-02,
@@ -207,6 +206,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <select id="d_kind" onchange="onKindChange()">
           <option value="vkm360">ВКМ-360</option>
           <option value="akron">Акрон</option>
+          <option value="ivk-ter">ИВК-ТЭР</option>
         </select>
       </div>
       <div class="form-row"><label>Путь к профилю</label>
@@ -244,7 +244,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <p class="small-note">Сколько часов назад искать и добирать пропуски при каждом запуске сервера. 0 — использовать значение по умолчанию (24ч для ВКМ). Если сервер может простаивать дольше суток (плановое обслуживание и т.п.) — увеличьте, например до 72-96, чтобы пропуски добирались автоматически при следующем старте, без ручного «Принудительного переопроса».</p>
         <p class="small-note">Как часто опрашивать мгновенные показания (не архив). Раз в час обычно достаточно — этот шлюз собирает архив, не ведёт непрерывную телеметрию.</p>
         <div class="form-row"><label>Опрос архива, минута после границы</label><input id="d_archive_at_minute" type="text" value="5"></div>
-        <p class="small-note">Через сколько минут ПОСЛЕ границы периода запрашивать архив (получасовки у ВКМ — в HH:05 и HH:35, часовки у Акрона — в HH:05, при значении по умолчанию 5). Прибору нужно время, чтобы закрыть период и подготовить данные — опрос точно на самой границе (0) обычно даёт ещё не готовый или неполный результат. Значение видно и настраивается здесь же; фактическое следующее время опроса показывается на вкладке «Монитор опроса».</p>
+        <p class="small-note">Через сколько минут ПОСЛЕ границы периода запрашивать архив (получасовки у ВКМ — в HH:05 и HH:35, часовки у Акрона и ИВК-ТЭР — в HH:05, при значении по умолчанию 5). Прибору нужно время, чтобы закрыть период и подготовить данные — опрос точно на самой границе (0) обычно даёт ещё не готовый или неполный результат. Значение видно и настраивается здесь же; фактическое следующее время опроса показывается на вкладке «Монитор опроса».</p>
 
         <div id="vkmTimeCorrectionFields" style="display:none;margin-top:18px;padding-top:12px;border-top:1px solid #3e3e42;">
           <p style="margin-top:0;color:#ffffff;font-size:13px;"><b>Коррекция времени ВКМ-360</b></p>
@@ -338,13 +338,14 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
           <th>Начало опроса</th>
           <th>Следующий опрос</th>
           <th>Статус последнего опроса</th>
+          <th>Время прибора</th>
         </tr></thead>
-        <tbody id="pollMonitorTable"><tr><td colspan="5">Загрузка...</td></tr></tbody>
+        <tbody id="pollMonitorTable"><tr><td colspan="6">Загрузка...</td></tr></tbody>
       </table>
     </div>
   </div>
 
-  <!-- ===================== РўР•РљРЈР©РР• Р”РђРќРќР«Р• ===================== -->
+  <!-- ===================== ТЕКУЩИЕ ДАННЫЕ ===================== -->
   <div id="panel-current" class="panel">
     <div class="section">
       <h3>Последний опрос</h3>
@@ -395,10 +396,26 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <h3>Служба</h3>
       <div id="serviceContent">Загрузка...</div>
       <div id="serviceMsg" class="msg"></div>
+      <div style="margin-top:18px;">
+        <h3>Журнал службы</h3>
+        <div style="margin-bottom:10px;">
+          <label style="margin-right:8px;">Показать</label>
+          <select id="serviceLogFilter" onchange="loadServiceLog()">
+            <option value="all">Все события</option>
+            <option value="lifecycle">Запуск и остановка</option>
+            <option value="watchdog">Контроль зависания</option>
+            <option value="problems">Предупреждения и ошибки</option>
+          </select>
+        </div>
+        <table class="service-log">
+          <thead><tr><th>Время</th><th>Уровень</th><th>Событие</th><th>Сообщение</th></tr></thead>
+          <tbody id="serviceLogTable"><tr><td colspan="4">Загрузка...</td></tr></tbody>
+        </table>
+      </div>
     </div>
   </div>
 
-  <!-- ===================== РђР РҐРР’ ===================== -->
+  <!-- ===================== АРХИВ ===================== -->
   <div id="panel-archive" class="panel">
     <div class="section">
       <h3>Архив по прибору</h3>
@@ -466,6 +483,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <p class="small-note" id="s_port_note"></p>
       <div class="form-row"><label>Отладочный лог (подробные байты)</label><input id="s_debug" type="checkbox"></div>
       <p class="small-note">Включает подробный вывод сырых байт обмена с приборами в лог-файл — полезно при диагностике, но создаёт много лишних записей при обычной работе.</p>
+      <div class="form-row"><label>Таймаут контроля зависания (мин)</label><input id="s_watchdog_timeout" type="text" value="10"></div>
+      <p class="small-note">Допустимо 2–120 минут. Ошибки связи с приборами не считаются зависанием. При запуске службой подтверждённое глобальное зависание приводит к аварийному перезапуску через Windows SCM; при ручном запуске процесс не завершается автоматически.</p>
       <p><button class="btn" onclick="saveSettings()">Сохранить</button></p>
       <div id="settingsMsg" class="msg"></div>
     </div>
@@ -493,7 +512,17 @@ function loadProfiles() {
     }
     if (html === '') { html = '<option value="">— папка profiles/ пуста или не найдена —</option>'; }
     sel.innerHTML = html;
-    if (current) { sel.value = current; } // preserve selection across a reload
+    if (current) {
+      sel.value = current; // сохранить выбор при повторной загрузке
+    } else {
+      // При первом открытии список профилей приходит асинхронно. Не даём
+      // браузеру молча выбрать первый файл по алфавиту, который может не
+      // соответствовать выбранному типу прибора.
+      var kind = document.getElementById('d_kind').value;
+      if (kind === 'vkm360') { sel.value = 'profiles/vkm360.yaml'; }
+      if (kind === 'akron') { sel.value = 'profiles/acron-01.yaml'; }
+      if (kind === 'ivk-ter') { sel.value = 'profiles/ivk-ter.yaml'; }
+    }
   };
   xhr.send();
 }
@@ -524,7 +553,7 @@ function showTab(name) {
   if (name === 'esconn') { loadESConnection(); }
   if (name === 'settings') { loadSettings(); }
   if (name === 'archive') { populateDeviceSelect('ar_device', null); setArchivePreset('week'); }
-  if (name === 'dashboard') { loadDashboard(); loadTimeCorrections(); }
+  if (name === 'dashboard') { loadDashboard(); }
   if (name === 'pollmonitor') { loadPollMonitor(); }
   if (name === 'service') { loadServiceStatus(); }
   if (name === 'log') { renderDeviceActivityStrip(); }
@@ -546,8 +575,8 @@ function onKindChange() {
   // совсем нового прибора (d_id ещё не отключено) терять нечего,
   // подтверждение не нужно.
   if (idField.disabled && editingOriginalKind && kind !== editingOriginalKind) {
-    var ok = confirm('Вы редактируете существующий прибор и меняете его тип с "' + editingOriginalKind +
-      '" на "' + kind + '". Это изменит СУЩЕСТВУЮЩИЙ прибор, а не создаст новый. Продолжить?');
+    var ok = confirm('Вы редактируете существующий прибор и меняете его тип с "' + deviceKindLabel(editingOriginalKind) +
+      '" на "' + deviceKindLabel(kind) + '". Это изменит СУЩЕСТВУЮЩИЙ прибор, а не создаст новый. Продолжить?');
     if (!ok) {
       document.getElementById('d_kind').value = editingOriginalKind;
       return;
@@ -557,11 +586,17 @@ function onKindChange() {
   var profileEl = document.getElementById('d_profile');
   if (kind === 'vkm360') {
     tk.value = 'modbus_tcp';
-    if (!profileEl.value) { profileEl.value = 'profiles/vkm360.yaml'; }
+    profileEl.value = 'profiles/vkm360.yaml';
   }
   if (kind === 'akron') {
     tk.value = 'rtu_serial';
-    if (!profileEl.value) { profileEl.value = 'profiles/acron-01.yaml'; }
+    profileEl.value = 'profiles/acron-01.yaml';
+  }
+  if (kind === 'ivk-ter') {
+    // ИВК-ТЭР часто подключается по RS-485; оператор при необходимости
+    // может переключить тип связи на Modbus TCP или TCP-конвертер.
+    tk.value = 'rtu_serial';
+    profileEl.value = 'profiles/ivk-ter.yaml';
   }
   onTransportKindChange();
   updateVKMTimeCorrectionVisibility();
@@ -678,6 +713,21 @@ function onArchiveDeviceChange() {
   // верхнюю границу задать нельзя)
   var isVKM = !!(d && d.kind === 'vkm360');
   document.getElementById('rl_to_row').style.display = isVKM ? 'block' : 'none';
+
+  // Для ИВК-ТЭР пока показываем архив строго в исходной часовой
+  // дискретности. Суммировать/усреднять служебные поля архива до
+  // live-проверки их семантики на реальном приборе небезопасно.
+  var gran = document.getElementById('ar_granularity');
+  var isIVK = !!(d && d.kind === 'ivk-ter');
+  if (isIVK) {
+    gran.value = 'raw';
+    gran.disabled = true;
+    showMsg('archiveMsg', true, 'Для ИВК-ТЭР архив показывается подробно, без суточной и месячной агрегации.');
+  } else {
+    gran.disabled = false;
+    document.getElementById('archiveMsg').innerHTML = '';
+    document.getElementById('archiveMsg').className = 'msg';
+  }
 
   // Смена прибора в списке — сбрасываем отображение прежнего переопроса
   // немедленно, НЕ дожидаясь ответа сети. Без этого старое сообщение
@@ -1425,6 +1475,37 @@ function pollKindLabel(kind) {
   return kind || 'опрос';
 }
 
+function correctionText(st) {
+  if (st.correction_mode === 'vkm_enabled') {
+    if (st.last_correction_known) {
+      var step = st.last_correction_seconds;
+      var signed = (step > 0 ? '+' : '') + step + ' с';
+      return 'Коррекция: включена<br/><span class="small-note">Последняя коррекция: ' + signed + ', ' + (st.last_correction_at || '—') + '</span>';
+    }
+    return 'Коррекция: включена, срабатываний не было';
+  }
+  if (st.correction_mode === 'vkm_disabled') { return 'Коррекция: отключена'; }
+  if (st.correction_mode === 'manual_service') { return 'Коррекция: только вручную, в сервисном режиме прибора'; }
+  if (st.correction_mode === 'not_implemented') { return 'Коррекция: не реализована'; }
+  return 'Коррекция: нет данных';
+}
+
+function deviceTimeText(st) {
+  var drift = 'Расхождение: нет данных';
+  if (st.time_drift_known) {
+    if (st.time_drift_reliable) {
+      var v = Number(st.time_drift_seconds || 0);
+      drift = 'Расхождение: ' + (v > 0 ? '+' : '') + v.toFixed(1) + ' с';
+    } else {
+      drift = 'Расхождение: нет надёжных данных';
+    }
+    if (st.time_drift_note) {
+      drift += '<br/><span class="small-note">' + escapeHtmlForLog(st.time_drift_note) + '</span>';
+    }
+  }
+  return drift + '<br/>' + correctionText(st);
+}
+
 function loadPollMonitor() {
   var panel = document.getElementById('panel-pollmonitor');
   if (!panel || panel.className.indexOf('active') === -1) { return; }
@@ -1436,13 +1517,13 @@ function loadPollMonitor() {
     var body = document.getElementById('pollMonitorTable');
     if (!body) { return; }
     if (xhr.status !== 200) {
-      body.innerHTML = '<tr><td colspan="5" class="status-bad">Не удалось получить состояние опроса</td></tr>';
+      body.innerHTML = '<tr><td colspan="6" class="status-bad">Не удалось получить состояние опроса</td></tr>';
       return;
     }
 
     var runtime;
     try { runtime = JSON.parse(xhr.responseText) || []; } catch (e) {
-      body.innerHTML = '<tr><td colspan="5" class="status-bad">Ошибка ответа сервера</td></tr>';
+      body.innerHTML = '<tr><td colspan="6" class="status-bad">Ошибка ответа сервера</td></tr>';
       return;
     }
 
@@ -1479,10 +1560,10 @@ function loadPollMonitor() {
       }
 
       html += '<tr><td style="text-align:center;">' + dot + '</td><td>' +
-        escapeHtmlForLog(d.name || d.id) + '</td><td>' + started + '</td><td>' + next + '</td><td>' + last + '</td></tr>';
+        escapeHtmlForLog(d.name || d.id) + '</td><td>' + started + '</td><td>' + next + '</td><td>' + last + '</td><td>' + deviceTimeText(st) + '</td></tr>';
     }
     if (html === '') {
-      html = '<tr><td colspan="5">Приборов пока нет</td></tr>';
+      html = '<tr><td colspan="6">Приборов пока нет</td></tr>';
     }
     body.innerHTML = html;
   };
@@ -1490,65 +1571,110 @@ function loadPollMonitor() {
 }
 
 // ===================== СЛУЖБА =====================
-// Добавлено 2026-08-30 по прямому запросу оператора: "автоматизировать
-// в юай" статус и остановку службы Windows, плюс защиту от двойного
-// запуска (та часть — целиком на сервере, single_instance_windows.go,
-// здесь показывать нечего). Опрос статуса — ТОЛЬКО при открытии
-// вкладки (не по таймеру, в отличие от Главной/Лога) — состояние
-// службы меняется редко, а если процесс вот-вот остановится, лишний
-// фоновый опрос всё равно ничего полезного не покажет.
 function loadServiceStatus() {
+  var panel = document.getElementById('panel-service');
+  if (!panel || panel.className.indexOf('active') === -1) { return; }
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/api/service/status', true);
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
     if (xhr.status !== 200) {
-      document.getElementById('serviceContent').innerHTML = '<p class="small-note">Не удалось получить статус.</p>';
+      document.getElementById('serviceContent').innerHTML = '<p class="status-bad">Не удалось получить состояние службы.</p>';
       return;
     }
     var data;
     try { data = JSON.parse(xhr.responseText); } catch (e) { return; }
     renderServiceContent(data);
+    loadServiceLog();
   };
   xhr.send();
 }
 
 function renderServiceContent(data) {
   var html = '';
-
   if (data.goos !== 'windows') {
-    // Управление службой реализовано только для Windows — единственной
-    // реальной платформы развёртывания этого проекта. Отдельная
-    // Linux-вкладка с реальным функционалом (например, через systemd)
-    // не сделана намеренно: нет ни одного подтверждённого сценария
-    // развёртывания на Linux, добавлять код "на будущее" без
-    // подтверждённой необходимости — то, чего этот проект старается
-    // избегать (см. общий принцип в IMPLEMENTATION_BACKLOG.md).
-    html += '<p class="small-note">Управление службой пока реализовано только для Windows. Этот процесс сейчас работает на другой ОС (' + data.goos + ') — здесь пока нечего показывать; если появится реальная потребность в управлении на Linux, функционал для неё стоит добавить отдельно, когда она возникнет.</p>';
-    document.getElementById('serviceContent').innerHTML = html;
-    return;
-  }
-
-  html += '<p class="small-note">Режим запуска сейчас: <b>' + (data.running_as_service ? 'служба Windows' : 'обычный ручной запуск (консоль)') + '</b>.</p>';
-
-  if (!data.service_installed) {
-    html += '<p class="small-note">Служба mbgw_service ещё не установлена. Установка делается один раз на сервере, из PowerShell от имени администратора:</p>';
-    html += '<pre style="background:#0c0c0c;color:#cccccc;padding:10px;border:1px solid #3e3e42;">mbgw.exe install-service --port 8080</pre>';
+    html += '<p class="small-note">Управление службой реализовано для Windows.</p>';
   } else {
-    var stateClass = (data.service_state === 'работает') ? 'status-good' : 'status-bad';
-    html += '<p>Состояние службы: <span class="' + stateClass + '">' + data.service_state + '</span></p>';
-    html += '<p><button class="btn secondary" onclick="stopService()">Остановить</button></p>';
-    // Кнопки «Запустить» здесь нет НАМЕРЕННО, не забыли — см. подробное
-    // объяснение прямо в тексте ниже, оно же и для оператора, который
-    // будет читать этот экран, а не только для будущих читателей кода.
-    html += '<p class="small-note"><b>Кнопки «Запустить» здесь намеренно нет:</b> этот веб-интерфейс обслуживается ТЕМ ЖЕ процессом, который пришлось бы запускать — если он уже остановлен, обслуживать нажатие кнопки просто некому. Запустить снова: команда <code>sc start mbgw_service</code> (полный путь <code>C:\\Windows\\System32\\sc.exe</code>, НЕ просто <code>sc</code> — в PowerShell это алиас для Set-Content, а не вызов настоящего sc.exe!), через «Службы Windows» (services.msc), либо служба сама поднимется при следующей перезагрузке сервера — автозапуск уже настроен командой install-service выше.</p>';
+    html += '<p>Режим запуска: <b>' + (data.running_as_service ? 'служба Windows' : 'ручной запуск') + '</b>.</p>';
+    if (!data.service_installed) {
+      html += '<p class="small-note">Служба mbgw_service не установлена. Установка из PowerShell администратора:</p>';
+      html += '<pre style="background:#0c0c0c;color:#cccccc;padding:10px;border:1px solid #3e3e42;">mbgw.exe install-service --port 8080</pre>';
+    } else {
+      var stateClass = (data.service_state === 'работает') ? 'status-good' : 'status-bad';
+      html += '<p>Состояние службы: <span class="' + stateClass + '">' + escapeHtmlForLog(data.service_state || 'неизвестно') + '</span></p>';
+      html += '<p><button class="btn secondary" onclick="stopService()">Остановить</button></p>';
+      html += '<p class="small-note">Запуск остановленной службы выполняется через «Службы Windows» или командой C:\\Windows\\System32\\sc.exe start mbgw_service. При аварийном завершении действует настроенная политика автоматического восстановления.</p>';
+    }
   }
 
+  var wd = data.watchdog || {};
+  var wdClass = 'status-good';
+  if (wd.state === 'предупреждение') { wdClass = 'log-warn'; }
+  if (wd.state === 'зависание') { wdClass = 'status-bad'; }
+  html += '<div class="watchdog-box"><b>Контроль зависания опроса</b>';
+  html += '<p>Состояние: <span class="' + wdClass + '">' + escapeHtmlForLog(wd.state || 'нет данных') + '</span></p>';
+  html += '<p>Таймаут: ' + (wd.timeout_minutes || '—') + ' мин.</p>';
+  html += '<p>Последняя активность: ' + escapeHtmlForLog(wd.last_activity || 'нет данных') + '</p>';
+  html += '<p class="small-note">' + escapeHtmlForLog(wd.message || '') + '</p>';
+  if (wd.stuck_devices && wd.stuck_devices.length) {
+    html += '<p class="log-warn">Возможно завис опрос приборов: ' + escapeHtmlForLog(wd.stuck_devices.join(', ')) + '</p>';
+  }
+  if (!data.running_as_service) {
+    html += '<p class="small-note">При ручном запуске контроль зависания только показывает аварийное состояние и пишет журнал — процесс автоматически не завершается.</p>';
+  }
+  html += '</div>';
   document.getElementById('serviceContent').innerHTML = html;
 }
 
+function serviceLevelLabel(level) {
+  if (level === 'успешно') { return 'Успешно'; }
+  if (level === 'предупреждение') { return 'Предупреждение'; }
+  if (level === 'ошибка') { return 'Ошибка'; }
+  if (level === 'критично') { return 'Критично'; }
+  return 'Информация';
+}
+
+function serviceLevelClass(level) {
+  if (level === 'успешно') { return 'service-level-ok'; }
+  if (level === 'предупреждение') { return 'service-level-warn'; }
+  if (level === 'ошибка') { return 'service-level-error'; }
+  if (level === 'критично') { return 'service-level-critical'; }
+  return 'service-level-info';
+}
+
+function loadServiceLog() {
+  var panel = document.getElementById('panel-service');
+  if (!panel || panel.className.indexOf('active') === -1) { return; }
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/service/log?limit=300', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    var body = document.getElementById('serviceLogTable');
+    if (!body) { return; }
+    if (xhr.status !== 200) {
+      body.innerHTML = '<tr><td colspan="4" class="status-bad">Журнал службы недоступен</td></tr>';
+      return;
+    }
+    var rows;
+    try { rows = JSON.parse(xhr.responseText) || []; } catch (e) { rows = []; }
+    var filter = document.getElementById('serviceLogFilter').value;
+    var html = '';
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      if (filter === 'lifecycle' && r.category !== 'запуск и остановка') { continue; }
+      if (filter === 'watchdog' && r.category !== 'контроль зависания') { continue; }
+      if (filter === 'problems' && r.level !== 'предупреждение' && r.level !== 'ошибка' && r.level !== 'критично') { continue; }
+      var cls = serviceLevelClass(r.level);
+      html += '<tr class="' + cls + '"><td>' + escapeHtmlForLog(r.time || '') + '</td><td>' + serviceLevelLabel(r.level) + '</td><td>' + escapeHtmlForLog(r.category || 'служба') + '</td><td>' + escapeHtmlForLog(r.message || '') + '</td></tr>';
+    }
+    if (!html) { html = '<tr><td colspan="4">Нет событий для выбранного фильтра</td></tr>'; }
+    body.innerHTML = html;
+  };
+  xhr.send();
+}
+
 function stopService() {
-  if (!confirm('Остановить mbgw? Опрос приборов и приём данных прекратится до следующего запуска.')) { return; }
+  if (!confirm('Остановить МодбасШлюз? Опрос приборов прекратится до следующего запуска.')) { return; }
   document.getElementById('serviceMsg').className = 'msg';
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/service/stop', true);
@@ -1557,7 +1683,7 @@ function stopService() {
     var data;
     try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('serviceMsg', false, 'Ошибка ответа сервера'); return; }
     if (data.ok) {
-      showMsg('serviceMsg', true, 'Остановка запрошена. Через несколько секунд процесс завершится — эта страница перестанет отвечать, это ожидаемо, а не поломка.');
+      showMsg('serviceMsg', true, 'Остановка запрошена. Служба дождётся завершения активных операций и только затем перейдёт в состояние «остановлена».');
     } else {
       showMsg('serviceMsg', false, 'Ошибка: ' + (data.error || 'неизвестная'));
     }
@@ -1652,6 +1778,7 @@ function dashboardSortValue(row, key) {
 function deviceKindLabel(kind) {
   if (kind === 'vkm360') { return 'ВКМ-360'; }
   if (kind === 'akron') { return 'Акрон'; }
+  if (kind === 'ivk-ter') { return 'ИВК-ТЭР'; }
   return kind || '—';
 }
 
@@ -1984,6 +2111,7 @@ function probeDevice() {
       if (data.pressure) { text += ' Давление: ' + data.pressure + '.'; }
       if (data.temperature) { text += ' Температура: ' + data.temperature + '.'; }
       if (data.mass_flow) { text += ' Массовый расход: ' + data.mass_flow + '.'; }
+      if (data.current_flow) { text += ' Текущий расход: ' + data.current_flow + '.'; }
       showMsg('probeMsg', true, text);
     } else {
       showMsg('probeMsg', false, data.error || 'Не удалось опросить прибор');
@@ -2270,7 +2398,20 @@ var pointLabels = {
   'hour': 'Час (часы прибора)',
   'date': 'День (часы прибора)',
   'month': 'Месяц (часы прибора)',
-  'year': 'Год (часы прибора)'
+  'year': 'Год (часы прибора)',
+  'serial_number': 'Заводской номер',
+  'Current flow rate': 'Текущий расход',
+  'Temperature': 'Температура',
+  'current_time': 'Время прибора',
+  'v_plus': 'Объём в прямом направлении',
+  'v_minus': 'Объём в обратном направлении',
+  'q_avg': 'Средний расход',
+  'resistance': 'Сопротивление',
+  'errors': 'Ошибки прибора',
+  'comm_fail_time': 'Время отсутствия связи',
+  'flowmeter_type': 'Тип расходомера',
+  'downtime': 'Время простоя',
+  'power_loss_time': 'Время отсутствия питания'
 };
 
 function loadCurrentData() {
@@ -2307,6 +2448,7 @@ function loadSettings() {
     var s = JSON.parse(xhr.responseText);
     document.getElementById('s_port').value = s.configured_port || '';
     document.getElementById('s_debug').checked = !!s.debug_log_enabled;
+    document.getElementById('s_watchdog_timeout').value = s.watchdog_timeout_minutes || 10;
 
     var conflictBox = document.getElementById('s_port_conflict');
     if (s.actual_port && s.actual_port !== s.configured_port) {
@@ -2318,7 +2460,7 @@ function loadSettings() {
       conflictBox.style.display = 'none';
     }
 
-    var note = 'Смена порта применяется сразу, без перезапуска. Отладочный лог тоже применяется сразу.';
+    var note = 'Смена порта, отладочный лог и таймаут контроля зависания применяются сразу, без перезапуска.';
     document.getElementById('s_port_note').innerText = note;
   };
   xhr.send();
@@ -2333,7 +2475,9 @@ function adoptActualPort() {
 function saveSettings() {
   var port = intOrZero(document.getElementById('s_port').value);
   if (port <= 0 || port > 65535) { showMsg('settingsMsg', false, 'Укажите порт в диапазоне 1-65535'); return; }
-  var body = { configured_port: port, debug_log_enabled: document.getElementById('s_debug').checked };
+  var watchdogTimeout = intOrZero(document.getElementById('s_watchdog_timeout').value);
+  if (watchdogTimeout < 2 || watchdogTimeout > 120) { showMsg('settingsMsg', false, 'Таймаут контроля зависания должен быть от 2 до 120 минут'); return; }
+  var body = { configured_port: port, debug_log_enabled: document.getElementById('s_debug').checked, watchdog_timeout_minutes: watchdogTimeout };
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/settings', true);
   xhr.setRequestHeader('Content-Type', 'application/json');
@@ -2589,7 +2733,6 @@ loadDevices();
 loadProfiles();
 resetDeviceForm();
 loadDashboard();
-loadTimeCorrections();
 loadPollMonitor();
 // Автообновление вкладки «Главная» — раз в 30с, независимо от того,
 // какая вкладка сейчас открыта (дёшево: один маленький GET-запрос), так
@@ -2598,10 +2741,11 @@ loadPollMonitor();
 // дашборда на / (см. handleDashboard в server.go, setInterval(loadData,
 // 30000)) — уже проверенное на практике значение для этого проекта.
 setInterval(loadDashboard, 30000);
-setInterval(loadTimeCorrections, 30000);
 // Монитор обновляется раз в секунду, но запрос выполняется только когда
 // вкладка открыта. Endpoint читает только память процесса и не трогает SQLite.
 setInterval(loadPollMonitor, 1000);
+// Состояние службы и её отдельный журнал обновляются только при открытой вкладке.
+setInterval(loadServiceStatus, 5000);
 
 loadLog();
 // Опрос новых строк лога каждые 2с — независимо от того, какая вкладка

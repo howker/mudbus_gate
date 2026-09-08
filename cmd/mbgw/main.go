@@ -31,25 +31,22 @@ func main() {
 	case "--help", "-h", "help":
 		printHelp()
 	default:
-		fmt.Printf("Unknown command: %s\n", cmd)
+		fmt.Printf("Неизвестная команда: %s\n", cmd)
 		printHelp()
 		os.Exit(1)
 	}
 }
 
 func printHelp() {
-	fmt.Println("Modbus-Shlyuz (mbgw)")
-	fmt.Println("Usage: mbgw <command> [args]")
-	fmt.Println("Commands:")
-	fmt.Println("  run              Start the gateway server (southbound only)")
-	fmt.Println("  serve            Start southbound + northbound Akron carrier in one process")
-	fmt.Println("                   (needs northbound_akron: section in --config; see config.akron_real.yaml)")
-	fmt.Println("  server           Single-process server, device list + ES channels from the DB")
-	fmt.Println("                   (mbgw server --db mbgw_server.db) — replaces the 4-window setup")
-	fmt.Println("  cli              Run CLI command")
-	fmt.Println("  simulate         Run device simulator")
-	fmt.Println("  northbound       Start the northbound Modbus TCP slave")
-	fmt.Println("  es-sync          Push heat/mass/temp/pressure straight into the Энергосфера DB")
-	fmt.Println("                   (bypasses ЭС device drivers; see 'mbgw es-sync --help')")
-	fmt.Println("  install-service  Install as OS service")
+	fmt.Println("МодбасШлюз (mbgw)")
+	fmt.Println("Использование: mbgw <команда> [параметры]")
+	fmt.Println("Команды:")
+	fmt.Println("  run              Запустить опрос приборов")
+	fmt.Println("  serve            Запустить опрос + северный интерфейс Акрона в одном процессе")
+	fmt.Println("  server           Основной единый сервер: приборы и точки ЭС берутся из БД")
+	fmt.Println("  cli              Выполнить служебную CLI-команду")
+	fmt.Println("  simulate         Запустить симулятор прибора")
+	fmt.Println("  northbound       Запустить северный Modbus TCP интерфейс")
+	fmt.Println("  es-sync          Запустить прямую передачу данных в БД Энергосферы")
+	fmt.Println("  install-service  Создать или обновить службу Windows «МодбасШлюз»")
 }

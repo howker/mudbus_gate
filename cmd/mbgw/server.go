@@ -15,8 +15,10 @@ import (
 	"syscall"
 	"time"
 
+	"mbgw/internal/codec"
 	"mbgw/internal/dbg"
 	"mbgw/internal/device"
+	"mbgw/internal/devicestatus"
 	"mbgw/internal/health"
 	"mbgw/internal/integration"
 	"mbgw/internal/lease"
@@ -27,6 +29,7 @@ import (
 	"mbgw/internal/profile"
 	"mbgw/internal/protocol/akron"
 	"mbgw/internal/scheduler"
+	"mbgw/internal/servicelog"
 	"mbgw/internal/session"
 	"mbgw/internal/storage"
 	sqliterepo "mbgw/internal/storage/sqlite"
@@ -83,6 +86,45 @@ func collectAkronPassport(ctx context.Context, repo *sqliterepo.Repo, deviceID s
 	log.Printf("[OK] прибор %s: паспорт собран (заводской №%d, тип=%d, прошивка=%s)\n", deviceID, serial, devType, firmware)
 }
 
+// collectProfileSerialPassport читает заводской номер из профильной точки
+// serial_number. Для ИВК-ТЭР это безопасный read-only IR 0x8002; никакого
+// перехода прибора в сервисный режим для чтения номера не требуется.
+func collectProfileSerialPassport(ctx context.Context, repo *sqliterepo.Repo, deviceID string, p *profile.Profile, reader *pollcore.Reader) {
+	if p == nil {
+		return
+	}
+	var serialPoint *profile.Point
+	for i := range p.Points {
+		pt := &p.Points[i]
+		if pt.Name == "serial_number" && pt.Access != "write" && pt.Type == "uint32" {
+			serialPoint = pt
+			break
+		}
+	}
+	if serialPoint == nil {
+		return
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	raw, err := reader.ReadRaw(probeCtx, serialPoint.Space, serialPoint.AddrOrZero(), serialPoint.Type)
+	if err != nil {
+		log.Printf("[ОШИБКА] прибор %s: не удалось прочитать заводской номер: %v\n", deviceID, err)
+		return
+	}
+	serial, err := codec.DecodeUint32(raw, p.Codec.WordOrder32)
+	if err != nil || serial == 0 || serial == 0xFFFFFFFF {
+		log.Printf("[ОШИБКА] прибор %s: некорректный заводской номер: %v, значение=%d\n", deviceID, err, serial)
+		return
+	}
+	if err := repo.SaveDevicePassport(ctx, storage.DevicePassport{
+		DeviceID: deviceID, Serial: serial, UpdatedAt: time.Now(),
+	}); err != nil {
+		log.Printf("[ОШИБКА] прибор %s: не удалось сохранить заводской номер: %v\n", deviceID, err)
+		return
+	}
+	log.Printf("[ОК] прибор %s: заводской номер прочитан и сохранён: %d\n", deviceID, serial)
+}
+
 // nextToExe resolves a bare filename (e.g. "mbgw_server.db") to a path
 // next to the running executable, so every file this process creates
 // (database, log, web-address marker) lands in whatever folder the
@@ -100,21 +142,6 @@ func collectAkronPassport(ctx context.Context, repo *sqliterepo.Repo, deviceID s
 // files in C:\, no extra flags to remember, regardless of how the
 // process is launched (double-click, PowerShell from any directory, or
 // as a Windows Service).
-var (
-	serviceReadyOnce            sync.Once
-	serviceReadyCh              = make(chan struct{})
-	serviceShutdownCompleteOnce sync.Once
-	serviceShutdownCompleteCh   = make(chan struct{})
-)
-
-func notifyServiceReady() {
-	serviceReadyOnce.Do(func() { close(serviceReadyCh) })
-}
-
-func notifyServiceShutdownComplete() {
-	serviceShutdownCompleteOnce.Do(func() { close(serviceShutdownCompleteCh) })
-}
-
 // profilePathNextToExe resolves every RELATIVE device-profile path from
 // the executable directory, not from the process working directory.
 // This is essential for Windows Service mode: SCM commonly starts a
@@ -188,6 +215,22 @@ func nextToExe(name string) string {
 // and every file this process creates appears right there, regardless of
 // how it's launched.
 func runServer() {
+	core := serverCoreFunc(runServerCore)
+	handled, err := runServerAsWindowsServiceIfApplicable(core)
+	if handled {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Ошибка Windows-службы: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if err := runServerCore(context.Background(), nil, false); err != nil {
+		fmt.Fprintf(os.Stderr, "Ошибка МодбасШлюза: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runServerCore(parentCtx context.Context, onReady func(), runningAsService bool) error {
 	// Файл лога открываем ПЕРВЫМ делом, даже раньше проверки на двойной
 	// запуск ниже (переставлено 2026-08-30, найдено оператором живьём):
 	// если отказ в запуске случится у СЛУЖБЫ (без консоли, вывод в
@@ -212,7 +255,7 @@ func runServer() {
 	// долгой непрерывной работе без перезапуска.
 	logWriter, err := newRotatingFile(nextToExe("mbgw_server.log"), 20*1024*1024, 10)
 	if err != nil {
-		log.Fatalf("[FATAL] не удалось открыть файл лога: %v", err)
+		return fmt.Errorf("не удалось открыть файл лога: %w", err)
 	}
 	defer logWriter.Close()
 	// logbuf.Writer{} — третий получатель лога, наравне с os.Stdout и
@@ -259,36 +302,28 @@ func runServer() {
 	// автоматическом перезапуске без присмотра (например, после
 	// планового обновления Windows).
 	if ok, err := acquireSingleInstanceLock(); err != nil {
-		log.Printf("[FATAL] не удалось проверить, не запущен ли уже другой экземпляр mbgw: %v\n", err)
-		log.Println("        Это защита от конфликта двух процессов — раз проверить не удалось, безопаснее отказать в запуске, чем рискнуть двойным опросом приборов и порчей данных в ЭС.")
-		os.Exit(1)
+		log.Printf("[КРИТИЧНО] не удалось проверить, не запущен ли уже другой экземпляр mbgw: %v\n", err)
+		return fmt.Errorf("защита от двойного запуска: %w", err)
 	} else if !ok {
-		log.Println("[FATAL] mbgw.exe уже запущен (службой или вручную) — второй экземпляр не может стартовать одновременно с первым.")
-		log.Println("        Остановите уже работающий процесс (вкладка «Служба» в /admin, либо sc stop mbgw_service, либо Ctrl+C в его консоли), прежде чем запускать снова.")
-		os.Exit(1)
+		log.Println("[КРИТИЧНО] mbgw.exe уже запущен (службой или вручную) — второй экземпляр не запускается.")
+		return fmt.Errorf("уже запущен другой экземпляр mbgw")
 	}
 
-	// Проверка/регистрация в диспетчере управления службами Windows —
-	// ДОЛЖНА идти до открытия БД и уж тем более до регистрации
-	// приборов (добавлено 2026-08-30, найдено оператором живьём: без
-	// этого "sc start mbgw_service" падал с ошибкой 1053, "служба не
-	// ответила на запрос своевременно" — SCM ждёт подтверждение "я
-	// запущен" в течение ограниченного времени, а регистрация приборов,
-	// как мы уже видели на живом примере с прибором osmos, может идти
-	// очень долго). Если процесс запущен НЕ как служба (обычный ручной
-	// запуск) — serviceStop будет nil, и весь код ниже ведёт себя ровно
-	// как раньше, без единого изменения.
-	serviceStop := runServerAsWindowsServiceIfApplicable()
+	// В режиме Windows-службы жизненным циклом этого ядра уже владеет
+	// Service Handler: он держит SCM в StartPending до вызова onReady и
+	// в StopPending до полного возврата этой функции. При ручном запуске
+	// используется тот же код, но context принадлежит обычному процессу.
 
 	// webStop закрывается кнопкой «Остановить» на вкладке «Служба» в
 	// /admin, КОГДА процесс запущен НЕ как служба Windows (обычный
 	// ручной запуск) — добавлено 2026-08-30. Для случая "мы запущены
 	// службой" веб-кнопка идёт другим, более правильным путём — через
 	// SCM (см. stopSelfAsWindowsService в service_run_windows.go),
-	// который в итоге закрывает serviceStop выше, а не webStop; этот
+	// который отменяет общий context через Service Handler; этот
 	// канал нужен именно для случая, когда никакого SCM вообще нет и
 	// закрывать больше нечего, кроме как напрямую.
 	webStop := make(chan struct{})
+	var webStopOnce sync.Once
 
 	dbPath := "mbgw_server.db"
 	// portFlagGiven distinguishes "--port was explicitly typed" from "not
@@ -316,24 +351,43 @@ func runServer() {
 
 	dbPath = nextToExe(dbPath)
 
+	// Отдельный диагностический журнал службы намеренно не хранится в
+	// mbgw_server.db: если основная SQLite БД заблокирована или повреждена,
+	// причина сбоя должна остаться доступной оператору. Ошибка открытия
+	// этого журнала не запрещает основной опрос.
+	serviceLog, serviceLogErr := servicelog.Open(nextToExe("mbgw_service_log.db"))
+	if serviceLogErr != nil {
+		log.Printf("[ПРЕДУПРЕЖДЕНИЕ] отдельный журнал службы недоступен: %v\n", serviceLogErr)
+	} else {
+		defer serviceLog.Close()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := serviceLog.Cleanup(cleanupCtx, time.Now().AddDate(0, 0, -30)); err != nil {
+			log.Printf("[ПРЕДУПРЕЖДЕНИЕ] не удалось очистить старые записи журнала службы: %v\n", err)
+		}
+		cleanupCancel()
+		writeServiceEvent(serviceLog, "информация", "запуск и остановка", "Запуск процесса МодбасШлюза.")
+	}
+
 	repo, err := sqliterepo.New(dbPath)
 	if err != nil {
-		log.Fatalf("[FATAL] ошибка хранилища: %v", err)
+		writeServiceEvent(serviceLog, "ошибка", "запуск и остановка", "Не удалось открыть основную БД МодбасШлюза: "+err.Error())
+		return fmt.Errorf("ошибка хранилища: %w", err)
 	}
+	defer repo.Close()
 	if err := repo.InitSchema(context.Background()); err != nil {
-		log.Fatalf("[FATAL] ошибка инициализации схемы: %v", err)
+		return fmt.Errorf("ошибка инициализации схемы: %w", err)
 	}
 	if err := repo.InitArchiveSchema(context.Background()); err != nil {
-		log.Fatalf("[FATAL] ошибка инициализации схемы архива: %v", err)
+		return fmt.Errorf("ошибка инициализации схемы архива: %w", err)
 	}
 	if err := repo.InitDeviceConfigSchema(context.Background()); err != nil {
-		log.Fatalf("[FATAL] ошибка инициализации схемы конфигурации приборов: %v", err)
+		return fmt.Errorf("ошибка инициализации схемы конфигурации приборов: %w", err)
 	}
 	if err := repo.InitAppSettingsSchema(context.Background()); err != nil {
-		log.Fatalf("[FATAL] ошибка инициализации схемы настроек: %v", err)
+		return fmt.Errorf("ошибка инициализации схемы настроек: %w", err)
 	}
 	if err := repo.InitESForceResyncAuditSchema(context.Background()); err != nil {
-		log.Fatalf("[FATAL] ошибка инициализации журнала аудита принудительной пересинхронизации ЭС: %v", err)
+		return fmt.Errorf("ошибка инициализации журнала аудита принудительной пересинхронизации ЭС: %w", err)
 	}
 	log.Printf("[OK] Хранилище инициализировано (%s)\n", dbPath)
 
@@ -351,6 +405,7 @@ func runServer() {
 	// installed --port value on every restart.
 	settings, found, err := repo.GetAppSettings(context.Background())
 	var configuredPort int
+	watchdogTimeoutMinutes := 10
 	if !found {
 		configuredPort = 8080
 		if portFlagGiven {
@@ -367,6 +422,9 @@ func runServer() {
 				portFlagValue, configuredPort)
 		}
 		dbg.Enabled = settings.DebugLogEnabled
+		if settings.WatchdogTimeoutMinutes >= 2 {
+			watchdogTimeoutMinutes = settings.WatchdogTimeoutMinutes
+		}
 	}
 	if err != nil {
 		log.Printf("[ERROR] не удалось прочитать настройки: %v\n", err)
@@ -408,8 +466,28 @@ func runServer() {
 		log.Printf("[INFO] адрес веб-интерфейса записан в %s (рядом с exe)\n", addrFile)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(parentCtx)
 	defer cancel()
+
+	if serviceLog != nil {
+		go func() {
+			ticker := time.NewTicker(24 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 3*time.Second)
+					err := serviceLog.Cleanup(cleanupCtx, time.Now().AddDate(0, 0, -30))
+					cleanupCancel()
+					if err != nil {
+						log.Printf("[ПРЕДУПРЕЖДЕНИЕ] не удалось очистить старые записи журнала службы: %v\n", err)
+					}
+				}
+			}
+		}()
+	}
 
 	// SQLite health heartbeat: one immediate check, then every 10 seconds.
 	// This is an actual DB Ping, not "the process is alive", so the
@@ -501,7 +579,7 @@ func runServer() {
 	// ahead of a confirmed need).
 	deviceRecords, err := repo.ListDevices(context.Background())
 	if err != nil {
-		log.Fatalf("[FATAL] не удалось прочитать список приборов из БД: %v", err)
+		return fmt.Errorf("не удалось прочитать список приборов из БД: %w", err)
 	}
 	if len(deviceRecords) == 0 {
 		log.Println("[INFO] в БД не настроено ни одного прибора — сервер запущен, но опрашивать нечего")
@@ -547,6 +625,26 @@ func runServer() {
 		}()
 	}
 	wg.Wait()
+
+	// Watchdog использует только фактически зарегистрированные приборы.
+	// Недоступный при старте прибор не превращается в ложное «зависание»:
+	// ошибки связи диагностируются отдельно, а watchdog следит за жизнью
+	// механизма опроса.
+	activeDeviceIDs := func() []string {
+		devicesMu.Lock()
+		ids := make([]string, 0, len(devices))
+		for id := range devices {
+			ids = append(ids, id)
+		}
+		devicesMu.Unlock()
+		return ids
+	}
+	wd := newServiceWatchdog(watchdogTimeoutMinutes, runningAsService, serviceLog, activeDeviceIDs)
+	webServer.SetWatchdogStatus(wd.Status)
+	webServer.SetWatchdogTimeout(wd.SetTimeoutMinutes)
+	webServer.SetServiceLog(func(limit int) ([]web.ServiceLogEntry, error) {
+		return serviceLogEntries(serviceLog, limit)
+	})
 
 	webServer.SetManualPoll(func() {
 		// Снимок карты под мьютексом, а не итерация по ней напрямую —
@@ -739,7 +837,7 @@ func runServer() {
 	// сейчас запущены: если службой — команда идёт через SCM (тот же
 	// путь, что и "sc stop mbgw_service", попадает в уже проверенный
 	// обработчик mbgwServiceHandler.Execute, который закрывает
-	// serviceStop выше); если обычным ручным запуском — закрываем
+	// общий context службы; если обычным ручным запуском — закрываем
 	// webStop напрямую, тем же путём, что и Ctrl+C.
 	webServer.SetServiceStop(func() {
 		if isRunningAsWindowsService() {
@@ -748,7 +846,7 @@ func runServer() {
 			}
 			return
 		}
-		close(webStop)
+		webStopOnce.Do(func() { close(webStop) })
 	})
 
 	pl := poller.New(sched, devices, 1*time.Second)
@@ -757,24 +855,35 @@ func runServer() {
 		defer close(pollerDone)
 		pl.Run(ctx)
 	}()
+	go wd.Run(ctx)
+	writeServiceEvent(serviceLog, "успешно", "запуск и остановка", "Основной цикл опроса запущен.")
 
 	// До этой точки дошли только после открытия БД, запуска web UI,
 	// регистрации доступных приборов и фактического запуска poller.
 	// Только теперь Windows Service может честно перейти из StartPending
 	// в Running. При обычном консольном запуске закрытие этого канала
 	// никому не мешает.
-	notifyServiceReady()
-	log.Println("[OK] основной цикл опроса запущен")
+	if onReady != nil {
+		onReady()
+	}
+	log.Println("[ОК] основной цикл опроса запущен")
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	select {
-	case <-sigChan:
-		log.Println("=== получен сигнал завершения (Ctrl+C). остановка... ===")
-	case <-serviceStop:
-		log.Println("=== получен запрос на остановку от диспетчера служб Windows. остановка... ===")
-	case <-webStop:
-		log.Println("=== получен запрос на остановку через веб-интерфейс. остановка... ===")
+	if runningAsService {
+		<-ctx.Done()
+		log.Println("=== получена команда остановки от диспетчера служб Windows. остановка... ===")
+		writeServiceEvent(serviceLog, "информация", "запуск и остановка", "Получена команда остановки от диспетчера служб Windows.")
+	} else {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		select {
+		case <-sigChan:
+			log.Println("=== получен сигнал завершения (Ctrl+C). остановка... ===")
+		case <-webStop:
+			log.Println("=== получен запрос на остановку через веб-интерфейс. остановка... ===")
+		case <-ctx.Done():
+			log.Println("=== получена команда остановки. остановка... ===")
+		}
+		signal.Stop(sigChan)
 	}
 
 	// Сначала реально останавливаем рабочие циклы, и только после этого
@@ -783,19 +892,15 @@ func runServer() {
 	// только начинал завершение.
 	cancel()
 
-	select {
-	case <-pollerDone:
-	case <-time.After(3 * time.Second):
-		log.Println("[WARN] цикл опроса не завершился за 3 секунды — продолжаю остановку")
-	}
-	select {
-	case <-webDone:
-	case <-time.After(3 * time.Second):
-		log.Println("[WARN] веб-сервер не завершился за 3 секунды — продолжаю остановку")
-	}
+	// Poller.Run теперь сам ждёт все per-device worker'ы. Для службы это
+	// принципиально: SCM не увидит «остановлена», пока активный обмен с
+	// прибором реально не закончен/не отменён context.
+	<-pollerDone
+	<-webDone
 
-	notifyServiceShutdownComplete()
-	log.Println("=== mbgw остановлен ===")
+	writeServiceEvent(serviceLog, "успешно", "запуск и остановка", "МодбасШлюз штатно остановлен; активные операции завершены.")
+	log.Println("=== МодбасШлюз остановлен ===")
+	return nil
 }
 
 // registerOneDevice делает всё, что раньше было одной итерацией
@@ -817,6 +922,8 @@ func deviceKindLabelRU(kind string) string {
 		return "ВКМ-360"
 	case "akron":
 		return "Акрон"
+	case "ivk-ter", "ivk_ter":
+		return "ИВК-ТЭР"
 	default:
 		return kind
 	}
@@ -901,6 +1008,8 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	// подключения.
 	if devRec.Kind == "akron" {
 		collectAkronPassport(ctx, repo, devRec.ID, reader)
+	} else {
+		collectProfileSerialPassport(ctx, repo, devRec.ID, p, reader)
 	}
 
 	dev := device.New(devRec.ID, p, reader, sess, repo, leaseMgr)
@@ -917,6 +1026,22 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 		dev.TimeCorrectionDeadbandSeconds = devRec.TimeCorrectionDeadbandSeconds
 		dev.TimeCorrectionMaxStepSeconds = devRec.TimeCorrectionMaxStepSeconds
 		dev.TimeCorrectionDailyLimitSeconds = devRec.TimeCorrectionDailyLimitSeconds
+		if devRec.TimeCorrectionMaxStepSeconds > 0 && devRec.TimeCorrectionDailyLimitSeconds > 0 {
+			devicestatus.SetCorrectionMode(devRec.ID, "vkm_enabled")
+		} else {
+			devicestatus.SetCorrectionMode(devRec.ID, "vkm_disabled")
+		}
+		// Последняя успешная коррекция хранится в основной SQLite БД.
+		// Восстанавливаем её в runtime-монитор после каждого рестарта.
+		if rec, found, corrErr := repo.LastTimeCorrection(ctx, devRec.ID); corrErr != nil {
+			log.Printf("[ПРЕДУПРЕЖДЕНИЕ] прибор %s: не удалось восстановить последнюю коррекцию времени: %v\n", devRec.ID, corrErr)
+		} else if found {
+			devicestatus.MarkCorrectionApplied(devRec.ID, rec.CorrectionSeconds, rec.CorrectedAt)
+		}
+	} else if devRec.Kind == "ivk-ter" || devRec.Kind == "ivk_ter" || p.Meta.Model == "IVK-TER" {
+		devicestatus.SetCorrectionMode(devRec.ID, "manual_service")
+	} else {
+		devicestatus.SetCorrectionMode(devRec.ID, "not_implemented")
 	}
 
 	devicesMu.Lock()

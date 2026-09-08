@@ -415,6 +415,7 @@ func (d *Device) backfillVKMHourly(ctx context.Context, a profile.Archive, opts 
 		if saved > 0 {
 			periodsFilled++
 		}
+		health.MarkPollProgress(d.ID, time.Now())
 		// Построчный прогресс дозабора (до полусотни строк за один запуск)
 		// — это диагностическая детализация, не нужна при обычной работе,
 		// только итоговая сводка ниже. Полный построчный вывод доступен

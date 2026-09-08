@@ -7,30 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 )
 
-// installService registers mbgw as a Windows Service that launches
-// `mbgw.exe server` (the single-process, DB-driven mode — see
-// cmd/mbgw/server.go) automatically on every Windows boot, with no
-// console window and no manually-typed command ever again. This is the
-// intended production launch method — `mbgw server --db ... --port ...`
-// typed by hand in PowerShell is for development/testing only.
-//
-// --db and --port (same flags cmd/mbgw/server.go itself accepts) can be
-// passed to `mbgw install-service` and are baked into the service
-// definition ONCE, at install time — e.g.:
-//
-//	mbgw.exe install-service --port 9090
-//
-// If omitted, server's own defaults apply (mbgw_server.db, port 8080).
-// Re-running install-service after uninstalling replaces the service
-// with a new binPath, so changing the port later just means uninstall +
-// reinstall with a new flag, not editing a config file by hand.
-//
-// Must be run from an elevated (Administrator) command prompt — sc.exe
-// create requires it; a clear message below explains this if it fails.
+// installService создаёт ИЛИ обновляет службу mbgw_service. Команду можно
+// безопасно запускать повторно после замены exe: она не требует ручного
+// удаления уже существующей службы.
 func installService() {
-	fmt.Println("=== установка службы Windows ===")
+	fmt.Println("=== настройка службы Windows «МодбасШлюз» ===")
 
 	dbPath := "mbgw_server.db"
 	port := "8080"
@@ -51,36 +35,57 @@ func installService() {
 
 	exePath, err := os.Executable()
 	if err != nil {
-		fmt.Printf("ошибка получения пути к файлу: %v\n", err)
+		fmt.Printf("ОШИБКА: не удалось определить путь к mbgw.exe: %v\n", err)
 		return
 	}
 	exePath, err = filepath.Abs(exePath)
 	if err != nil {
-		fmt.Printf("ошибка формирования абсолютного пути: %v\n", err)
+		fmt.Printf("ОШИБКА: не удалось получить абсолютный путь к mbgw.exe: %v\n", err)
 		return
 	}
-
-	// Full command line, baked into the service definition once — this is
-	// what makes "mbgw server --db mbgw_server.db --port 8080" something
-	// nobody ever has to type by hand again after this install step.
 	binPath := fmt.Sprintf(`"%s" server --db "%s" --port %s`, exePath, dbPath, port)
 
-	// sc.exe create mbgw_service, auto-start on boot, no console window
-	// (Windows Services never show one regardless).
-	cmd := exec.Command("sc", "create", "mbgw_service", "binPath=", binPath, "start=", "auto", "DisplayName=", "Modbus Gateway (mbgw)")
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		fmt.Printf("ошибка регистрации службы: %v\nвывод системы: %s\n", err, string(output))
-		fmt.Println("\nПодсказка: для установки службы командную строку нужно запускать от имени администратора!")
+	exists := serviceExists()
+	var args []string
+	if exists {
+		args = []string{"config", mbgwServiceName, "binPath=", binPath, "start=", "auto", "DisplayName=", "МодбасШлюз"}
+		fmt.Println("Служба уже существует — обновляю параметры запуска.")
+	} else {
+		args = []string{"create", mbgwServiceName, "binPath=", binPath, "start=", "auto", "DisplayName=", "МодбасШлюз"}
+	}
+	if out, err := exec.Command("sc.exe", args...).CombinedOutput(); err != nil {
+		fmt.Printf("ОШИБКА: не удалось настроить службу: %v\n%s\n", err, strings.TrimSpace(string(out)))
+		fmt.Println("Запустите PowerShell или командную строку от имени администратора.")
 		return
 	}
 
-	fmt.Println("[OK] Служба 'mbgw_service' успешно создана.")
-	fmt.Printf("[INFO] Команда запуска: %s\n", binPath)
-	fmt.Println("[INFO] Запустить сейчас: sc start mbgw_service")
-	fmt.Println("[INFO] Или через 'Службы' Windows (services.msc) — там же можно посмотреть статус, остановить, настроить автозапуск.")
-	fmt.Println("[INFO] После запуска адрес веб-интерфейса появится в файле mbgw_web_address.txt рядом с exe")
-	fmt.Println("[INFO]   (на случай, если настроенный порт окажется занят — сервер сам подберёт свободный и запишет реальный адрес туда).")
-	fmt.Println("[INFO] Логи службы пишутся в mbgw_server.log рядом с exe (тот же файл, что и при обычном запуске).")
+	// Описание не влияет на работоспособность, но делает services.msc
+	// понятнее оператору.
+	_, _ = exec.Command("sc.exe", "description", mbgwServiceName,
+		"МодбасШлюз: опрос приборов и передача данных в Энергосферу").CombinedOutput()
+
+	// Recovery: три последовательных аварийных отказа -> рестарт через
+	// 1, 2 и 5 минут; счётчик сбрасывается через сутки. Watchdog завершает
+	// процесс с ошибкой только когда он действительно запущен службой.
+	if out, err := exec.Command("sc.exe", "failure", mbgwServiceName,
+		"reset=", "86400", "actions=", "restart/60000/restart/120000/restart/300000").CombinedOutput(); err != nil {
+		fmt.Printf("ПРЕДУПРЕЖДЕНИЕ: служба настроена, но политику автоматического восстановления задать не удалось: %v\n%s\n",
+			err, strings.TrimSpace(string(out)))
+	} else {
+		fmt.Println("ОК: автоматическое восстановление настроено (1, 2 и 5 минут).")
+	}
+	// На поддерживаемых версиях Windows это просит применять Recovery и
+	// к ненулевому коду завершения процесса. Если команда недоступна на
+	// конкретной старой системе, основная конфигурация службы остаётся рабочей.
+	_, _ = exec.Command("sc.exe", "failureflag", mbgwServiceName, "1").CombinedOutput()
+
+	fmt.Println("ОК: служба «МодбасШлюз» настроена на автоматический запуск.")
+	fmt.Printf("Команда процесса: %s\n", binPath)
+	fmt.Println("Запустить сейчас: C:\\Windows\\System32\\sc.exe start mbgw_service")
+	fmt.Println("Основной лог: mbgw_server.log; журнал службы: mbgw_service_log.db — рядом с mbgw.exe.")
+}
+
+func serviceExists() bool {
+	cmd := exec.Command("sc.exe", "query", mbgwServiceName)
+	return cmd.Run() == nil
 }

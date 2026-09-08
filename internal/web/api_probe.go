@@ -46,7 +46,7 @@ import (
 
 type probeRequest struct {
 	ID            string `json:"id"`
-	Kind          string `json:"kind"` // "vkm360" | "akron"
+	Kind          string `json:"kind"` // "vkm360" | "akron" | "ivk-ter"
 	TransportKind string `json:"transport_kind"`
 	Host          string `json:"host"`
 	Port          int    `json:"port"`
@@ -65,7 +65,8 @@ type probeResponse struct {
 	FirmwareInfo string `json:"firmware_info,omitempty"`
 	DeviceTime   string `json:"device_time,omitempty"`
 
-	// Поля ниже заполняются ТОЛЬКО probeVKM (у Akron нет прямого
+	// Поля ниже — дополнительные мгновенные значения. ВКМ заполняет три
+	// своих поля, ИВК-ТЭР — CurrentFlow; у Akron нет прямого
 	// Modbus-аналога этих мгновенных показаний в самом пробнике —
 	// он читает их из архивной команды 102, не отдельными регистрами).
 	// Не обязательные (omitempty) — пустая строка означает "этот
@@ -74,6 +75,7 @@ type probeResponse struct {
 	Pressure    string `json:"pressure,omitempty"`
 	Temperature string `json:"temperature,omitempty"`
 	MassFlow    string `json:"mass_flow,omitempty"`
+	CurrentFlow string `json:"current_flow,omitempty"`
 }
 
 func (s *Server) handleDeviceProbe(w http.ResponseWriter, r *http.Request) {
@@ -88,12 +90,26 @@ func (s *Server) handleDeviceProbe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch req.Kind {
+	case "akron", "vkm360", "ivk-ter":
+		// допустимый тип; ниже запускается физическая операция
+	default:
+		writeError(w, http.StatusBadRequest, `поле kind должно быть "vkm360", "akron" или "ivk-ter"`)
+		return
+	}
+
+	if !s.beginPhysicalOperation() {
+		writeError(w, http.StatusServiceUnavailable, "МодбасШлюз останавливается — проверка прибора не запускается")
+		return
+	}
+	defer s.endPhysicalOperation()
+
+	switch req.Kind {
 	case "akron":
 		writeJSON(w, http.StatusOK, probeAkron(r.Context(), req))
 	case "vkm360":
 		writeJSON(w, http.StatusOK, probeVKM(r.Context(), req))
-	default:
-		writeError(w, http.StatusBadRequest, `поле kind должно быть "vkm360" или "akron"`)
+	case "ivk-ter":
+		writeJSON(w, http.StatusOK, probeIVKTER(r.Context(), req))
 	}
 }
 
@@ -109,7 +125,7 @@ func probeAkron(ctx context.Context, req probeRequest) probeResponse {
 		timeoutMs = 1000
 	}
 
-	tr, err := transport.New(transport.Params{
+	trParams := transport.Params{
 		Kind:            transport.Kind(req.TransportKind),
 		Host:            req.Host,
 		Port:            req.Port,
@@ -128,7 +144,8 @@ func probeAkron(ctx context.Context, req probeRequest) probeResponse {
 		// small fixed value here is simply "give it a fair chance to
 		// respond," not a setting worth exposing in the probe UI.
 		Retries: 3,
-	})
+	}
+	tr, err := transport.New(trParams)
 	if err != nil {
 		return probeResponse{OK: false, Error: "не удалось создать транспорт: " + err.Error()}
 	}
@@ -146,7 +163,7 @@ func probeAkron(ctx context.Context, req probeRequest) probeResponse {
 	if unitID == 0 {
 		unitID = 1
 	}
-	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), req.ID)
+	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), pollcore.PhysicalIOLockKey(trParams, req.ID))
 
 	resp := probeResponse{OK: true}
 
@@ -324,6 +341,75 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 		resp.Error = firstNonEmpty(resp.Error, "сессия открыта, но ни часы, ни измерительные регистры не прочитались — проверьте unit id")
 	}
 
+	return resp
+}
+
+// probeIVKTER выполняет безопасную проверку ИВК-ТЭР без записи в прибор:
+// читает серийный номер вторичного вычислителя (IR 0x8002), текущие часы
+// (IR 0x8000, uint32 Unix) и текущий расход (IR 0xC034, float).
+// Все три регистра доступны на чтение в рабочем режиме; установка времени
+// здесь намеренно отсутствует — HR 0x8000 требует сервисного режима прибора.
+func probeIVKTER(ctx context.Context, req probeRequest) probeResponse {
+	timeoutMs := req.TimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = 1000
+	}
+	trParams := transport.Params{
+		Kind: transport.Kind(req.TransportKind), Host: req.Host, Port: req.Port, COM: req.COM,
+		Baudrate: req.Baudrate, Parity: req.Parity, StopBits: req.StopBits,
+		ResponseTimeout: time.Duration(timeoutMs) * time.Millisecond, Retries: 3,
+	}
+	tr, err := transport.New(trParams)
+	if err != nil {
+		return probeResponse{OK: false, Error: "не удалось создать транспорт: " + err.Error()}
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	if err := tr.Open(probeCtx); err != nil {
+		return probeResponse{OK: false, Error: "не удалось открыть соединение: " + err.Error()}
+	}
+	defer tr.Close()
+
+	isTCP := req.TransportKind == "modbus_tcp"
+	unitID := req.UnitID
+	if unitID == 0 {
+		unitID = 1
+	}
+	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), pollcore.PhysicalIOLockKey(trParams, req.ID))
+	resp := probeResponse{OK: true}
+
+	if raw, err := reader.ReadRaw(probeCtx, "IR", 32770, "uint32"); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "серийный номер (IR 0x8002): "+err.Error())
+	} else if serial, err := codec.DecodeUint32(raw, "0123"); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "разбор серийного номера: "+err.Error())
+	} else if serial == 0 || serial == 0xFFFFFFFF {
+		resp.Error = firstNonEmpty(resp.Error, fmt.Sprintf("некорректный серийный номер: %d", serial))
+	} else {
+		resp.SerialNumber = fmt.Sprintf("%d", serial)
+	}
+
+	if raw, err := reader.ReadRaw(probeCtx, "IR", 32768, "uint32"); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "время прибора (IR 0x8000): "+err.Error())
+	} else if seconds, err := codec.DecodeUint32(raw, "0123"); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "разбор времени прибора: "+err.Error())
+	} else if seconds == 0 || seconds == 0xFFFFFFFF {
+		resp.Error = firstNonEmpty(resp.Error, "прибор вернул некорректное значение времени")
+	} else {
+		resp.DeviceTime = time.Unix(int64(seconds), 0).Local().Format("02.01.2006 15:04:05")
+	}
+
+	if raw, err := reader.ReadRaw(probeCtx, "IR", 49204, "float"); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "текущий расход (IR 0xC034): "+err.Error())
+	} else if flow, err := codec.DecodeFloat32(raw, "0123"); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "разбор текущего расхода: "+err.Error())
+	} else {
+		resp.CurrentFlow = fmt.Sprintf("%.3f л/мин", flow)
+	}
+
+	if resp.SerialNumber == "" && resp.DeviceTime == "" && resp.CurrentFlow == "" {
+		resp.OK = false
+		resp.Error = firstNonEmpty(resp.Error, "соединение открыто, но ни один контрольный регистр ИВК-ТЭР не прочитан")
+	}
 	return resp
 }
 

@@ -66,8 +66,11 @@ type Server struct {
 	// SetServiceStatus/SetServiceStop, api_service.go. nil означает, что
 	// режим запуска не поддерживает (например, старый диагностический
 	// дашборд).
-	onServiceStatus ServiceStatusFunc
-	onServiceStop   ServiceStopFunc
+	onServiceStatus   ServiceStatusFunc
+	onServiceStop     ServiceStopFunc
+	onServiceLog      ServiceLogFunc
+	onWatchdogStatus  WatchdogStatusFunc
+	onWatchdogTimeout func(minutes int)
 
 	// baseCtx — долгоживущий контекст всего процесса (тот же, что
 	// передан в Start), от которого выводятся ОТМЕНЯЕМЫЕ дочерние
@@ -86,6 +89,17 @@ type Server struct {
 	// увидит finished=true.
 	reloadJobsMu sync.Mutex
 	reloadJobs   map[string]*reloadJob
+
+	// physicalOps tracks HTTP-triggered operations that actually use a
+	// device transport outside the poller's own worker lifecycle: live
+	// device probes and background forced archive rereads. A Windows
+	// Service must not report Stopped while one of these operations still
+	// owns a COM port / converter. The small gate prevents WaitGroup.Add
+	// from racing with shutdown: once stopping=true, no new physical
+	// operation is admitted, then shutdown can safely Wait().
+	physicalOpsMu       sync.Mutex
+	physicalOpsWG       sync.WaitGroup
+	physicalOpsStopping bool
 
 	// mu protects httpSrv/mux/port for Rebind — called from an HTTP
 	// handler goroutine (settings save), while Start's own goroutine also
@@ -163,6 +177,36 @@ func (s *Server) SetServiceStatus(fn ServiceStatusFunc) {
 func (s *Server) SetServiceStop(fn ServiceStopFunc) {
 	s.onServiceStop = fn
 }
+func (s *Server) SetServiceLog(fn ServiceLogFunc)         { s.onServiceLog = fn }
+func (s *Server) SetWatchdogStatus(fn WatchdogStatusFunc) { s.onWatchdogStatus = fn }
+func (s *Server) SetWatchdogTimeout(fn func(minutes int)) { s.onWatchdogTimeout = fn }
+
+// beginPhysicalOperation registers an HTTP-triggered operation that can
+// touch a real device. During shutdown new operations are rejected; all
+// operations admitted before shutdown are waited for by Start().
+func (s *Server) beginPhysicalOperation() bool {
+	s.physicalOpsMu.Lock()
+	defer s.physicalOpsMu.Unlock()
+	if s.physicalOpsStopping {
+		return false
+	}
+	s.physicalOpsWG.Add(1)
+	return true
+}
+
+func (s *Server) endPhysicalOperation() {
+	s.physicalOpsWG.Done()
+}
+
+func (s *Server) stopAcceptingPhysicalOperations() {
+	s.physicalOpsMu.Lock()
+	s.physicalOpsStopping = true
+	s.physicalOpsMu.Unlock()
+}
+
+func (s *Server) waitPhysicalOperations() {
+	s.physicalOpsWG.Wait()
+}
 
 func (s *Server) Start(ctx context.Context) {
 	s.baseCtx = ctx
@@ -205,7 +249,9 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/log", s.handleLog)
 	mux.HandleFunc("/api/log/download", s.handleLogDownload)
 	mux.HandleFunc("/api/service/status", s.handleServiceStatus)
+	mux.HandleFunc("/api/service/log", s.handleServiceLog)
 	mux.HandleFunc("/api/service/stop", s.handleServiceStop)
+	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/admin", s.handleAdminUI)
 
 	mux.HandleFunc("/", s.handleDashboard)
@@ -225,12 +271,23 @@ func (s *Server) Start(ctx context.Context) {
 	}()
 
 	<-ctx.Done()
+
+	// Сначала запрещаем запуск новых операций с физическими приборами.
+	// Уже начатые probe/reload получают отмену через общий ctx и должны
+	// полностью завершиться до возврата Start(): именно возврат Start()
+	// позволяет server core завершиться, а Windows Service — перейти из
+	// StopPending в Stopped.
+	s.stopAcceptingPhysicalOperations()
+
 	s.mu.Lock()
 	current := s.httpSrv
 	s.mu.Unlock()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = current.Shutdown(shutdownCtx)
+	if current != nil {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = current.Shutdown(shutdownCtx)
+		cancel()
+	}
+	s.waitPhysicalOperations()
 }
 
 // Rebind РїРµСЂРµРєР»СЋС‡Р°РµС‚ РІРµР±-СЃРµСЂРІРµСЂ РЅР° РЅРѕРІС‹Р№ РїРѕСЂС‚ Р’РќРЈРўР Р СЂР°Р±РѕС‚Р°СЋС‰РµРіРѕ
@@ -328,7 +385,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 <html>
 <head>
 <meta charset="utf-8">
-<title>mbgw Diagnostic</title>
+<title>МодбасШлюз — диагностика</title>
 <style>
 body {
 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -346,16 +403,16 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 </style>
 </head>
 <body>
-<h2>MBGW Diagnostic Dashboard</h2>
+<h2>МодбасШлюз — диагностика</h2>
 <p>
 <button id="pollBtn" onclick="pollNow()" style="font-size:14px;padding:8px 16px;background:#0e639c;color:#fff;border:none;cursor:pointer;">Опросить сейчас (архив + текущие)</button>
 <span id="pollStatus" style="margin-left:12px;color:#858585;"></span>
 </p>
 <table>
-<thead><tr><th>Device ID</th><th>Point ID</th><th>Instance</th><th>Value</th><th>Unit</th><th>Quality</th><th>Time</th></tr></thead>
+<thead><tr><th>Прибор</th><th>Точка</th><th>Экземпляр</th><th>Значение</th><th>Единица</th><th>Качество</th><th>Время</th></tr></thead>
 <tbody id="data"><tr><td colspan="7" style="text-align: center; padding: 20px;">Загрузка данных...</td></tr></tbody>
 </table>
-<p class="time-text">Last Update: <span id="time">-</span></p>
+<p class="time-text">Последнее обновление: <span id="time">-</span></p>
 
 <script>
 function loadData() {
@@ -364,14 +421,14 @@ function loadData() {
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
     if (xhr.status !== 200) {
-      if (window.console) { console.log('Fetch error: HTTP ' + xhr.status); }
+      if (window.console) { console.log('Ошибка загрузки: HTTP ' + xhr.status); }
       return;
     }
     var data;
     try {
       data = JSON.parse(xhr.responseText);
     } catch (e) {
-      if (window.console) { console.log('Parse error: ' + e); }
+      if (window.console) { console.log('Ошибка разбора ответа: ' + e); }
       return;
     }
     if (!data || !data.length) { return; }
@@ -386,7 +443,7 @@ function loadData() {
       rows += '<tr><td><b>' + r.DeviceID + '</b></td><td>' + r.PointID + '</td><td>' +
         r.Instance + '</td><td style="font-family: monospace; font-size: 15px;">' +
         value + '</td><td>' + r.Unit + '</td><td class="' + qClass + '">' +
-        r.Quality + '</td><td>' + t + '</td></tr>';
+        (r.Quality === 'VALID' ? 'Достоверно' : 'Недостоверно') + '</td><td>' + t + '</td></tr>';
     }
     document.getElementById('data').innerHTML = rows;
 

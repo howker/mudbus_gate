@@ -5,13 +5,10 @@ import (
 	"sort"
 	"time"
 
+	"mbgw/internal/devicestatus"
 	"mbgw/internal/health"
 )
 
-// pollMonitorRow — лёгкий runtime-снимок для вкладки «Монитор опроса».
-// Здесь намеренно нет обращений к SQLite: вкладка обновляется часто, а
-// имена/список приборов браузер уже получает через /api/devices. Это не
-// создаёт лишнюю конкуренцию с записью архива в локальную БД.
 type pollMonitorRow struct {
 	ID string `json:"id"`
 
@@ -25,6 +22,17 @@ type pollMonitorRow struct {
 	LastPollKnown      bool   `json:"last_poll_known"`
 	LastPollKind       string `json:"last_poll_kind,omitempty"`
 	LastPollError      string `json:"last_poll_error,omitempty"`
+
+	TimeDriftKnown     bool    `json:"time_drift_known"`
+	TimeDriftReliable  bool    `json:"time_drift_reliable"`
+	TimeDriftSeconds   float64 `json:"time_drift_seconds"`
+	TimeDriftCheckedAt string  `json:"time_drift_checked_at,omitempty"`
+	TimeDriftNote      string  `json:"time_drift_note,omitempty"`
+
+	CorrectionMode        string `json:"correction_mode"`
+	LastCorrectionKnown   bool   `json:"last_correction_known"`
+	LastCorrectionAt      string `json:"last_correction_at,omitempty"`
+	LastCorrectionSeconds int    `json:"last_correction_seconds"`
 }
 
 func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
@@ -34,12 +42,9 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 	}
 
 	snapshot := health.Get()
+	drifts := devicestatus.All()
+	corrections := devicestatus.AllCorrections()
 
-	// Принудительный переопрос идёт напрямую из web-job, минуя poller,
-	// поэтому накладываем его состояние отдельно. Для завершённых задач
-	// также учитываем результат, если этот переопрос новее последнего
-	// планового current/archive — тогда колонка «Статус последнего опроса»
-	// показывает действительно последнюю операторскую операцию.
 	type reloadSnapshot struct {
 		startedAt  time.Time
 		finishedAt time.Time
@@ -52,12 +57,7 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 		if job == nil {
 			continue
 		}
-		reloads[id] = reloadSnapshot{
-			startedAt:  job.StartedAt,
-			finishedAt: job.FinishedAt,
-			finished:   job.Finished,
-			errorText:  job.Error,
-		}
+		reloads[id] = reloadSnapshot{job.StartedAt, job.FinishedAt, job.Finished, job.Error}
 	}
 	s.reloadJobsMu.Unlock()
 
@@ -66,6 +66,12 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 		idSet[id] = true
 	}
 	for id := range reloads {
+		idSet[id] = true
+	}
+	for id := range drifts {
+		idSet[id] = true
+	}
+	for id := range corrections {
 		idSet[id] = true
 	}
 	ids := make([]string, 0, len(idSet))
@@ -78,13 +84,9 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 	for _, id := range ids {
 		st := snapshot.Devices[id]
 		row := pollMonitorRow{
-			ID:             id,
-			PollInProgress: st.PollInProgress,
-			PollKind:       st.PollKind,
-			LastPollOK:     st.LastPollOK,
-			LastPollKnown:  st.LastPollKnown,
-			LastPollKind:   st.LastPollKind,
-			LastPollError:  st.LastPollError,
+			ID: id, PollInProgress: st.PollInProgress, PollKind: st.PollKind,
+			LastPollOK: st.LastPollOK, LastPollKnown: st.LastPollKnown,
+			LastPollKind: st.LastPollKind, LastPollError: st.LastPollError,
 		}
 		if !st.PollStartedAt.IsZero() {
 			row.PollStartedAt = st.PollStartedAt.Format("02.01.2006 15:04:05")
@@ -96,6 +98,24 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 			row.LastPollFinishedAt = st.LastPollFinishedAt.Format("02.01.2006 15:04:05")
 		}
 
+		if d, ok := drifts[id]; ok {
+			row.TimeDriftKnown = true
+			row.TimeDriftReliable = d.Reliable
+			row.TimeDriftSeconds = d.DriftSeconds
+			row.TimeDriftNote = d.Note
+			if !d.CheckedAt.IsZero() {
+				row.TimeDriftCheckedAt = d.CheckedAt.Format("02.01.2006 15:04:05")
+			}
+		}
+		if c, ok := corrections[id]; ok {
+			row.CorrectionMode = c.Mode
+			row.LastCorrectionKnown = c.LastAppliedKnown
+			row.LastCorrectionSeconds = c.LastAppliedSeconds
+			if c.LastAppliedKnown && !c.LastAppliedAt.IsZero() {
+				row.LastCorrectionAt = c.LastAppliedAt.Format("02.01.2006 15:04:05")
+			}
+		}
+
 		if reload, ok := reloads[id]; ok {
 			if !reload.finished {
 				row.PollInProgress = true
@@ -103,8 +123,7 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 				if !reload.startedAt.IsZero() {
 					row.PollStartedAt = reload.startedAt.Format("02.01.2006 15:04:05")
 				}
-			} else if !reload.finishedAt.IsZero() &&
-				(st.LastPollFinishedAt.IsZero() || reload.finishedAt.After(st.LastPollFinishedAt)) {
+			} else if !reload.finishedAt.IsZero() && (st.LastPollFinishedAt.IsZero() || reload.finishedAt.After(st.LastPollFinishedAt)) {
 				row.LastPollKnown = true
 				row.LastPollKind = "manual_reload"
 				row.LastPollOK = reload.errorText == ""
@@ -114,6 +133,5 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, row)
 	}
-
 	writeJSON(w, http.StatusOK, out)
 }

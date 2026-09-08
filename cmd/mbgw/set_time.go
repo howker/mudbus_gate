@@ -15,6 +15,7 @@ import (
 	"mbgw/internal/pollcore"
 	"mbgw/internal/profile"
 	"mbgw/internal/protocol/modbus"
+	sqliterepo "mbgw/internal/storage/sqlite"
 	"mbgw/internal/transport"
 )
 
@@ -32,12 +33,88 @@ const setTimeVerifyTolerance = 2 * time.Second
 // the new Unix timestamp, validates the function-16 acknowledgement, then
 // reads the clock back and refuses to report success unless the result is
 // actually close to server time.
+type setTimeTarget struct {
+	ProfilePath   string
+	TransportKind string
+	Host          string
+	Port          int
+	COM           string
+	Baudrate      int
+	Parity        string
+	StopBits      int
+	TimeoutMs     int
+	UnitID        int
+}
+
+// loadSetTimeTarget сначала ищет прибор в production-БД mbgw_server.db,
+// потому что `mbgw server` и веб-интерфейс используют её как источник
+// конфигурации. Если production-БД существует, она является единственным
+// источником для опасной операции записи времени: при неизвестном deviceID
+// fail closed, без отката на потенциально устаревший config.yaml. Legacy-
+// fallback используется только когда mbgw_server.db рядом с exe отсутствует.
+func loadSetTimeTarget(deviceID string) (setTimeTarget, error) {
+	dbPath := nextToExe("mbgw_server.db")
+	_, statErr := os.Stat(dbPath)
+	if statErr == nil {
+		repo, err := sqliterepo.New(dbPath)
+		if err != nil {
+			return setTimeTarget{}, fmt.Errorf("не удалось открыть production-БД МодбасШлюза: %w", err)
+		}
+		rec, found, getErr := repo.GetDevice(context.Background(), deviceID)
+		_ = repo.Close()
+		if getErr != nil {
+			return setTimeTarget{}, fmt.Errorf("не удалось прочитать прибор из БД МодбасШлюза: %w", getErr)
+		}
+		if !found {
+			return setTimeTarget{}, fmt.Errorf("прибор %q не найден в production-БД mbgw_server.db; legacy config.yaml намеренно не используется для записи времени", deviceID)
+		}
+		return setTimeTarget{
+			ProfilePath: profilePathNextToExe(rec.Profile), TransportKind: rec.TransportKind,
+			Host: rec.Host, Port: rec.Port, COM: rec.COM, Baudrate: rec.Baudrate,
+			Parity: rec.Parity, StopBits: rec.StopBits, TimeoutMs: rec.TimeoutMs, UnitID: rec.UnitID,
+		}, nil
+	}
+	if !os.IsNotExist(statErr) {
+		return setTimeTarget{}, fmt.Errorf("не удалось проверить production-БД mbgw_server.db: %w", statErr)
+	}
+
+	cfg, err := config.Load("config.yaml")
+	if err != nil {
+		return setTimeTarget{}, fmt.Errorf("production-БД mbgw_server.db отсутствует; не удалось загрузить legacy config.yaml для прибора %q: %w", deviceID, err)
+	}
+	for i := range cfg.Devices {
+		if cfg.Devices[i].ID != deviceID {
+			continue
+		}
+		d := &cfg.Devices[i]
+		return setTimeTarget{
+			ProfilePath: d.Profile, TransportKind: d.Transport.Kind, Host: d.Transport.Host, Port: d.Transport.Port,
+			COM: d.Transport.COM, Baudrate: d.Transport.Baudrate, Parity: d.Transport.Parity, StopBits: d.Transport.StopBits,
+			TimeoutMs: d.Transport.TimeoutMs, UnitID: int(d.Transport.UnitID),
+		}, nil
+	}
+	return setTimeTarget{}, fmt.Errorf("прибор %q не найден в legacy config.yaml (production-БД mbgw_server.db отсутствует)", deviceID)
+}
+
 func setTime() {
 	if len(os.Args) < 4 {
-		fmt.Println("Usage: mbgw cli set-time <device_id> [--yes]")
+		fmt.Println("Использование: mbgw cli set-time <идентификатор_прибора> [--yes]")
 		os.Exit(1)
 	}
 	deviceID := os.Args[3]
+
+	// Полная установка времени не должна пересекаться с работающим server.
+	// Используем ту же межпроцессную защиту, что и сам сервер: если служба
+	// или ручной mbgw.exe server ещё живы, оператор сначала обязан их
+	// штатно остановить.
+	if ok, err := acquireSingleInstanceLock(); err != nil {
+		fmt.Printf("Не удалось проверить, остановлен ли основной опрос: %v\n", err)
+		os.Exit(1)
+	} else if !ok {
+		fmt.Println("Установка времени не выполнена: МодбасШлюз сейчас запущен. Сначала остановите службу или ручной сервер, дождитесь полной остановки и повторите команду.")
+		os.Exit(1)
+	}
+
 	autoYes := false
 	for _, a := range os.Args[4:] {
 		if a == "--yes" || a == "-y" {
@@ -45,31 +122,19 @@ func setTime() {
 		}
 	}
 
-	cfg, err := config.Load("config.yaml")
+	target, err := loadSetTimeTarget(deviceID)
 	if err != nil {
-		fmt.Printf("Ошибка загрузки конфигурации: %v\n", err)
+		fmt.Printf("Ошибка загрузки параметров прибора: %v\n", err)
 		os.Exit(1)
 	}
 
-	var devCfg *config.DeviceConfig
-	for i := range cfg.Devices {
-		if cfg.Devices[i].ID == deviceID {
-			devCfg = &cfg.Devices[i]
-			break
-		}
-	}
-	if devCfg == nil {
-		fmt.Printf("Прибор %q не найден в config.yaml\n", deviceID)
-		os.Exit(1)
-	}
-
-	p, err := profile.Parse(devCfg.Profile)
+	p, err := profile.Parse(target.ProfilePath)
 	if err != nil {
 		fmt.Printf("Ошибка загрузки профиля: %v\n", err)
 		os.Exit(1)
 	}
 	if p.Meta.Protocol != "modbus" {
-		fmt.Printf("set-time поддержана только для приборов базового Modbus (протокол профиля: %q). Для Меркурия используйте correct-time.\n", p.Meta.Protocol)
+		fmt.Printf("Команда set-time поддерживается только для приборов базового Modbus (протокол профиля: %q). Для Меркурия используйте команду correct-time.\n", p.Meta.Protocol)
 		os.Exit(1)
 	}
 
@@ -83,7 +148,7 @@ func setTime() {
 		}
 	}
 	if readPt == nil || writePt == nil {
-		fmt.Println("В профиле не найдены точки \"current_time\" (чтение) и/или \"time_set\" (запись) - set-time для этого прибора не настроена.")
+		fmt.Println("В профиле не найдены точки \"current_time\" (чтение) и/или \"time_set\" (запись) - команда set-time для этого прибора не настроена.")
 		os.Exit(1)
 	}
 	if readPt.Type != "uint32" || writePt.Type != "uint32" {
@@ -91,16 +156,16 @@ func setTime() {
 		os.Exit(1)
 	}
 
-	isTCP := devCfg.Transport.Kind == "modbus_tcp"
+	isTCP := target.TransportKind == "modbus_tcp"
 	trParams := transport.Params{
-		Kind:            transport.Kind(devCfg.Transport.Kind),
-		Host:            devCfg.Transport.Host,
-		Port:            devCfg.Transport.Port,
-		COM:             devCfg.Transport.COM,
-		Baudrate:        devCfg.Transport.Baudrate,
-		Parity:          devCfg.Transport.Parity,
-		StopBits:        devCfg.Transport.StopBits,
-		ResponseTimeout: time.Duration(devCfg.Transport.TimeoutMs) * time.Millisecond,
+		Kind:            transport.Kind(target.TransportKind),
+		Host:            target.Host,
+		Port:            target.Port,
+		COM:             target.COM,
+		Baudrate:        target.Baudrate,
+		Parity:          target.Parity,
+		StopBits:        target.StopBits,
+		ResponseTimeout: time.Duration(target.TimeoutMs) * time.Millisecond,
 	}
 	tr, err := transport.New(trParams)
 	if err != nil {
@@ -115,11 +180,15 @@ func setTime() {
 	}
 	defer tr.Close()
 
-	unitID := devCfg.Transport.UnitID
+	unitID := target.UnitID
 	if unitID == 0 {
 		unitID = 1
 	}
-	reader := pollcore.New(tr, isTCP, unitID)
+	if unitID < 1 || unitID > 247 {
+		fmt.Printf("Некорректный адрес Modbus (Unit ID): %d; допустимый диапазон 1..247.\n", unitID)
+		os.Exit(1)
+	}
+	reader := pollcore.New(tr, isTCP, uint8(unitID))
 
 	deviceTime, midpoint, err := readVZLETClockForSetTime(ctx, reader, readPt, p.Codec.WordOrder32)
 	if err != nil {
@@ -129,7 +198,7 @@ func setTime() {
 	drift := deviceTime.Sub(midpoint)
 
 	fmt.Printf("Прибор:         %s\n", deviceID)
-	fmt.Printf("Modbus Unit ID: %d\n", unitID)
+	fmt.Printf("Адрес Modbus (Unit ID): %d\n", unitID)
 	fmt.Printf("Время прибора:  %s\n", deviceTime.Local().Format("2006-01-02 15:04:05"))
 	fmt.Printf("Время системы:  %s\n", midpoint.Local().Format("2006-01-02 15:04:05"))
 	fmt.Printf("Расхождение (прибор - система): %.3f сек\n", drift.Seconds())
@@ -139,8 +208,8 @@ func setTime() {
 		return
 	}
 
-	fmt.Println("\nВНИМАНИЕ: это полная установка часов VZLET. Для ИВК-ТЭР прибор должен находиться в Service/Setup mode.")
-	fmt.Println("Не выполняйте set-time параллельно с работающим опросом этого же физического прибора; на время команды остановите службу/опросчик.")
+	fmt.Println("\nВНИМАНИЕ: это полная установка часов ВЗЛЁТ. Для ИВК-ТЭР прибор должен находиться в сервисном режиме (Service/Setup).")
+	fmt.Println("Основной МодбасШлюз должен быть остановлен на время этой команды; проверка двойного запуска выполнена автоматически.")
 	if !autoYes {
 		fmt.Print("Выполнить установку времени прибора? [y/N]: ")
 		stdin := bufio.NewReader(os.Stdin)
@@ -175,7 +244,7 @@ func setTime() {
 	respPDU, err := reader.Transact(ctx, reqPDU)
 	if err != nil {
 		fmt.Printf("Ошибка записи времени: %v\n", err)
-		fmt.Println("Для ИВК-ТЭР проверьте, что прибор переведён в Service/Setup mode.")
+		fmt.Println("Для ИВК-ТЭР проверьте, что прибор переведён в сервисный режим (Service/Setup).")
 		os.Exit(1)
 	}
 	if !sameWriteMultipleRegistersAck(respPDU, writePt.AddrOrZero(), len(regs)) {

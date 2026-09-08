@@ -60,6 +60,10 @@ type Poller struct {
 	// добавляются сюда, а не превращаются в отдельные горутины, висящие на
 	// mutex. Для разных приборов worker'ы независимы и работают параллельно.
 	deviceQueues sync.Map
+
+	// workerWG позволяет штатной остановке службы дождаться завершения
+	// уже начатого I/O, прежде чем SCM получит состояние «остановлена».
+	workerWG sync.WaitGroup
 }
 
 // New creates a Poller. devices maps device ID -> already-constructed
@@ -85,10 +89,20 @@ func (p *Poller) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("[опрос] остановка")
+			log.Println("[опрос] получена команда остановки — жду завершения активных операций")
+			p.workerWG.Wait()
+			log.Println("[опрос] все активные операции завершены")
 			return
 		case <-ticker.C:
 			now := time.Now()
+
+			// Tick и drainAsync выполняются в той же горутине, что и heartbeat.
+			// Поэтому отдельный критерий «просрочен nextDue, но ничего не
+			// передано» здесь не нужен и даже опасен: Tick штатно переносит
+			// nextDue вперёд, а задания занятого прибора могут долго ждать в
+			// его FIFO. Если scheduler/drainAsync реально зависнут, этот цикл
+			// перестанет доходить до MarkPollerCycle и watchdog увидит
+			// остановку центрального механизма без ложных перезапусков.
 			p.scheduler.Tick(now)
 			for deviceID := range p.devices {
 				if next, ok := p.scheduler.NextPollAt(deviceID); ok {
@@ -109,13 +123,18 @@ func (p *Poller) Run(ctx context.Context) {
 // Важное отличие от схемы "go dispatchLocked(...) на каждую задачу":
 // здесь порядок задач одного прибора сохраняется, и на занятом приборе
 // не накапливаются горутины, ожидающие mutex.
-func (p *Poller) drainAsync(ctx context.Context) {
+func (p *Poller) drainAsync(ctx context.Context) int {
+	dispatched := 0
 	for {
 		task, ok := p.scheduler.Next()
 		if !ok {
-			return
+			return dispatched
 		}
+		now := time.Now()
+		health.MarkPollerDispatch(now)
+		health.MarkPollQueued(task.DeviceID, now)
 		p.enqueueAsync(ctx, task)
+		dispatched++
 	}
 }
 
@@ -136,7 +155,11 @@ func (p *Poller) enqueueAsync(ctx context.Context, task scheduler.Task) {
 	q.running = true
 	q.mu.Unlock()
 
-	go p.runDeviceQueue(ctx, q)
+	p.workerWG.Add(1)
+	go func() {
+		defer p.workerWG.Done()
+		p.runDeviceQueue(ctx, q)
+	}()
 }
 
 func (p *Poller) runDeviceQueue(ctx context.Context, q *deviceTaskQueue) {
@@ -148,9 +171,13 @@ func (p *Poller) runDeviceQueue(ctx context.Context, q *deviceTaskQueue) {
 		select {
 		case <-ctx.Done():
 			q.mu.Lock()
+			dropped := append([]scheduler.Task(nil), q.tasks...)
 			q.tasks = nil
 			q.running = false
 			q.mu.Unlock()
+			for _, task := range dropped {
+				health.MarkPollDequeued(task.DeviceID, time.Now())
+			}
 			return
 		default:
 		}
@@ -164,6 +191,7 @@ func (p *Poller) runDeviceQueue(ctx context.Context, q *deviceTaskQueue) {
 		task := q.tasks[0]
 		q.tasks = q.tasks[1:]
 		q.mu.Unlock()
+		health.MarkPollDequeued(task.DeviceID, time.Now())
 
 		p.dispatchLocked(ctx, task)
 	}

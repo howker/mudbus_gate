@@ -8,19 +8,11 @@ import (
 	"mbgw/internal/dbg"
 )
 
-// api_settings.go implements GET/POST /api/settings — process-wide
-// operator settings (web port, debug logging) backed by the
-// app_settings table (see repo_app_settings.go). Порт переключается
-// живьём (Server.Rebind), без перезапуска процесса — исправлено
-// 2026-08-23 после жалобы, что оператор не может/не должен знать
-// команду перезапуска mbgw server вручную. debug_log_enabled применяется
-// сразу же (dbg.Enabled — простой пакетный флаг, без гонок при обычном
-// использовании из одного HTTP-запроса).
-
 type settingsJSON struct {
-	ConfiguredPort  int  `json:"configured_port"`
-	ActualPort      int  `json:"actual_port"`
-	DebugLogEnabled bool `json:"debug_log_enabled"`
+	ConfiguredPort         int  `json:"configured_port"`
+	ActualPort             int  `json:"actual_port"`
+	DebugLogEnabled        bool `json:"debug_log_enabled"`
+	WatchdogTimeoutMinutes int  `json:"watchdog_timeout_minutes"`
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -32,19 +24,19 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !found {
-			writeJSON(w, http.StatusOK, settingsJSON{ConfiguredPort: 8080})
+			writeJSON(w, http.StatusOK, settingsJSON{ConfiguredPort: 8080, WatchdogTimeoutMinutes: 10})
 			return
 		}
 		writeJSON(w, http.StatusOK, settingsJSON{
-			ConfiguredPort:  settings.ConfiguredPort,
-			ActualPort:      settings.ActualPort,
-			DebugLogEnabled: settings.DebugLogEnabled,
+			ConfiguredPort: settings.ConfiguredPort, ActualPort: settings.ActualPort,
+			DebugLogEnabled: settings.DebugLogEnabled, WatchdogTimeoutMinutes: settings.WatchdogTimeoutMinutes,
 		})
 
 	case http.MethodPost:
 		var body struct {
-			ConfiguredPort  *int  `json:"configured_port"`
-			DebugLogEnabled *bool `json:"debug_log_enabled"`
+			ConfiguredPort         *int  `json:"configured_port"`
+			DebugLogEnabled        *bool `json:"debug_log_enabled"`
+			WatchdogTimeoutMinutes *int  `json:"watchdog_timeout_minutes"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeError(w, http.StatusBadRequest, "некорректный JSON: "+err.Error())
@@ -69,23 +61,28 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			dbg.Enabled = *body.DebugLogEnabled
 		}
+		if body.WatchdogTimeoutMinutes != nil {
+			if *body.WatchdogTimeoutMinutes < 2 || *body.WatchdogTimeoutMinutes > 120 {
+				writeError(w, http.StatusBadRequest, "таймаут контроля зависания должен быть от 2 до 120 минут")
+				return
+			}
+			if err := s.repo.SetWatchdogTimeoutMinutes(r.Context(), *body.WatchdogTimeoutMinutes); err != nil {
+				writeError(w, http.StatusInternalServerError, "не удалось сохранить таймаут контроля зависания: "+err.Error())
+				return
+			}
+			if s.onWatchdogTimeout != nil {
+				s.onWatchdogTimeout(*body.WatchdogTimeoutMinutes)
+			}
+		}
 
-		// Порт переключается ЖИВЬЁМ, без перезапуска процесса (см.
-		// Server.Rebind в server.go) — фикс на 2026-08-23: раньше UI
-		// требовал от оператора вручную перезапускать mbgw server,
-		// хотя штатный способ запуска — служба Windows, и оператор
-		// физически не может (и не должен) знать команду перезапуска.
-		note := "Сохранено."
+		note := "Сохранено и применено."
 		if portChanged {
 			if err := s.Rebind(*body.ConfiguredPort); err != nil {
-				writeJSON(w, http.StatusOK, map[string]string{
-					"status": "ok",
-					"note":   "Порт сохранён, но переключиться на него сейчас не удалось: " + err.Error() + ". Перезапустите mbgw server вручную.",
-				})
+				writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "note": "Порт сохранён, но переключиться на него сейчас не удалось: " + err.Error() + ". Перезапустите МодбасШлюз."})
 				return
 			}
 			if err := s.repo.SetActualPort(r.Context(), *body.ConfiguredPort); err != nil {
-				log.Printf("[WEB] не удалось обновить фактический порт после переключения: %v\n", err)
+				log.Printf("[ВЕБ] не удалось обновить фактический порт после переключения: %v\n", err)
 			}
 			note = "Сохранено и применено — сервер уже работает на новом порту, откройте эту страницу заново по новому адресу."
 		}

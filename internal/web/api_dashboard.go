@@ -180,6 +180,8 @@ func archivePeriodAndParamForKind(kind string) (time.Duration, string) {
 		return 30 * time.Minute, "S"
 	case "akron":
 		return time.Hour, "V"
+	case "ivk-ter", "ivk_ter":
+		return time.Hour, "v_plus"
 	default:
 		return 0, ""
 	}

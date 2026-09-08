@@ -50,16 +50,29 @@ import (
 var devicesParams = map[string][]string{
 	"vkm360": {"S", "ST", "T", "Pi"},
 	"akron":  {"V"},
+	"ivk-ter": {
+		"v_plus", "v_minus", "q_avg", "resistance", "errors",
+		"comm_fail_time", "flowmeter_type", "downtime", "power_loss_time",
+	},
 }
 
 // paramLabels gives each raw param code a Russian display name for the
 // table header (уже с учётом единиц ПОСЛЕ пересчёта — см. paramDisplayFactor).
 var paramLabels = map[string]string{
-	"S":  "Масса, т",
-	"ST": "Тепловая энергия, Гкал",
-	"T":  "Температура, °C",
-	"Pi": "Давление, Па",
-	"V":  "Расход за период, м³",
+	"S":               "Масса, т",
+	"ST":              "Тепловая энергия, Гкал",
+	"T":               "Температура, °C",
+	"Pi":              "Давление, Па",
+	"V":               "Расход за период, м³",
+	"v_plus":          "Объём вперёд, м³",
+	"v_minus":         "Объём обратно, м³",
+	"q_avg":           "Средний расход, л/мин",
+	"resistance":      "Сопротивление, Ом",
+	"errors":          "Код ошибок",
+	"comm_fail_time":  "Нет связи, мин",
+	"flowmeter_type":  "Тип расходомера (код)",
+	"downtime":        "Простой, мин",
+	"power_loss_time": "Нет питания, мин",
 }
 
 // paramDisplayFactor — множитель, который переводит СЫРОЕ хранимое
@@ -161,6 +174,14 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 	}
 	if !found {
 		return archiveResponse{}, fmt.Errorf("прибор %q не найден", deviceID)
+	}
+
+	// Для ИВК-ТЭР в этом пакете выводим только исходные часовые записи.
+	// Семантика суточной/месячной агрегации полей архива (особенно кодов
+	// ошибок и типа расходомера) не должна выдумываться до live-проверки
+	// реального прибора. Обычный опрос и дозабор при этом полностью работают.
+	if dev.Kind == "ivk-ter" && granularity != "raw" {
+		return archiveResponse{}, fmt.Errorf("для ИВК-ТЭР пока доступен только режим «Подробно (как хранится)»; группировка будет добавлена после live-проверки семантики архивных полей")
 	}
 
 	params := devicesParams[dev.Kind]

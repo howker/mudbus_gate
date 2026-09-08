@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"mbgw/internal/archive"
+	"mbgw/internal/health"
 	"mbgw/internal/profile"
 )
 
@@ -62,6 +63,8 @@ func (d *Device) BackfillArchives(ctx context.Context, opts BackfillOptions) {
 			d.backfillAkronHourly(ctx, a, effective)
 		case "mb_request_poll_string":
 			d.backfillVKMHourly(ctx, a, effective)
+		case "mb_func65":
+			d.backfillFunc65Hourly(ctx, a, effective)
 		default:
 			continue // strategy has no backfill path (yet)
 		}
@@ -165,6 +168,7 @@ func (d *Device) backfillAkronHourly(ctx context.Context, a profile.Archive, opt
 
 		saved := persistAkronHourly(ctx, d.Repo, d.ID, a, records)
 		totalSaved += saved
+		health.MarkPollProgress(d.ID, time.Now())
 		log.Printf("[%s] дозабор %s: страница i=%d..%d: получено %d, сохранено %d\n",
 			d.ID, a.ID, from+1, to+1, len(records), saved)
 
@@ -215,13 +219,13 @@ func (d *Device) GapScan(ctx context.Context, windowHours int) {
 
 	missing, err := d.Repo.MissingHours(ctx, d.ID, "", "V", fromHour, toHour)
 	if err != nil {
-		log.Printf("[%s] gap-scan: ошибка поиска пропусков: %v\n", d.ID, err)
+		log.Printf("[%s] проверка пропусков: ошибка поиска пропусков: %v\n", d.ID, err)
 		return
 	}
 	if len(missing) == 0 {
 		return // nothing to patch, stay quiet
 	}
-	log.Printf("[%s] gap-scan: найдено пропущенных часов в последних %dч: %d — латаю\n",
+	log.Printf("[%s] проверка пропусков: найдено пропущенных часов в последних %dч: %d — латаю\n",
 		d.ID, windowHours, len(missing))
 
 	// Re-sweep just the window depth; upsert fills the holes, overlap is

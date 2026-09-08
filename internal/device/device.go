@@ -196,7 +196,7 @@ func (d *Device) detectFirmwareVariant(ctx context.Context) {
 	req := modbus.BuildReportSlaveIDPDU()
 	respPDU, err := d.Client.Transact(ctx, req)
 	if err != nil {
-		log.Printf("[%s] функция 17 (report slave id) недоступна: %v\n", d.ID, err)
+		log.Printf("[%s] функция 17 (идентификация Modbus) недоступна: %v\n", d.ID, err)
 		return
 	}
 
@@ -206,7 +206,7 @@ func (d *Device) detectFirmwareVariant(ctx context.Context) {
 		return
 	}
 
-	log.Printf("[%s] диагностика (func17): run_status=0x%02X raw_data=%q\n", d.ID, resp.RunStatus, string(resp.RawData))
+	log.Printf("[%s] диагностика (функция 17): состояние=0x%02X данные=%q\n", d.ID, resp.RunStatus, string(resp.RawData))
 }
 
 // Poll reads every current-value point declared in the device profile
@@ -215,7 +215,7 @@ func (d *Device) detectFirmwareVariant(ctx context.Context) {
 func (d *Device) Poll(ctx context.Context) {
 	release, leaseErr := d.acquireLeaseWithRetry(ctx, "current", 30*time.Second)
 	if leaseErr != nil {
-		log.Printf("[%s] текущий опрос: не удалось занять lease прибора: %v\n", d.ID, leaseErr)
+		log.Printf("[%s] текущий опрос: не удалось получить блокировку прибора: %v\n", d.ID, leaseErr)
 		return
 	}
 	defer release()
@@ -233,6 +233,12 @@ func (d *Device) Poll(ctx context.Context) {
 		if pt.Access == "write" {
 			continue
 		}
+		// Статические паспортные точки (например, серийный номер ИВК-ТЭР)
+		// читаются один раз при регистрации прибора и сохраняются в паспорте.
+		// Не гоняем неизменяемый заводской номер при каждом текущем опросе.
+		if pt.Group == "identity" {
+			continue
+		}
 		if pt.Instance == "" {
 			d.pollOnePoint(ctx, pt, pt.AddrOrZero(), "", statusValues)
 			continue
@@ -240,24 +246,24 @@ func (d *Device) Poll(ctx context.Context) {
 
 		inst, ok := d.Profile.Instances[pt.Instance]
 		if !ok {
-			log.Printf("[%s] точка %s: instance %q не описан в профиле\n", d.ID, pt.Name, pt.Instance)
+			log.Printf("[%s] точка %s: экземпляр %q не описан в профиле\n", d.ID, pt.Name, pt.Instance)
 			continue
 		}
 
 		count := inst.Count
 		if inst.Enumerate != "fixed_count" {
-			log.Printf("[%s] точка %s: enumerate %q пока не поддерживается (только fixed_count) - см. backlog\n", d.ID, pt.Name, inst.Enumerate)
+			log.Printf("[%s] точка %s: режим перечисления %q пока не поддерживается (только fixed_count) — см. бэклог\n", d.ID, pt.Name, inst.Enumerate)
 			continue
 		}
 		if count <= 0 {
-			log.Printf("[%s] точка %s: instance %q имеет count<=0\n", d.ID, pt.Name, pt.Instance)
+			log.Printf("[%s] точка %s: экземпляр %q имеет count<=0\n", d.ID, pt.Name, pt.Instance)
 			continue
 		}
 
 		for i := 1; i <= count; i++ {
 			addr, err := pointresolver.Resolve(pt.AddrFormula, pt.Instance, i)
 			if err != nil {
-				log.Printf("[%s] точка %s (instance %d): ошибка формулы адреса: %v\n", d.ID, pt.Name, i, err)
+				log.Printf("[%s] точка %s (экземпляр %d): ошибка формулы адреса: %v\n", d.ID, pt.Name, i, err)
 				continue
 			}
 			d.pollOnePoint(ctx, pt, addr, fmt.Sprintf("%d", i), statusValues)
@@ -501,6 +507,7 @@ func (d *Device) updateVKMTimeDrift(ctx context.Context) {
 
 	log.Printf("[%s] [ВРЕМЯ] часы ВКМ скорректированы на %+d сек (лимит за 24ч: было использовано %d, после этой коррекции зарезервировано %d из %d сек)\n",
 		d.ID, step, used, used+absInt(step), d.TimeCorrectionDailyLimitSeconds)
+	devicestatus.MarkCorrectionApplied(d.ID, step, time.Now())
 
 	// The live probe showed the clock settles immediately but we give the
 	// device a short moment before the verification read. This happens only
@@ -725,12 +732,12 @@ func (d *Device) collectStatusValues(ctx context.Context) quality.StatusValues {
 	readOne := func(pt profile.Point, addr int, instance string) {
 		dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, addr, pt.Type)
 		if err != nil {
-			log.Printf("[%s] ошибка чтения статуса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+			log.Printf("[%s] ошибка чтения статуса %s (экземпляр=%s): %v\n", d.ID, pt.Name, instance, err)
 			return
 		}
 		val, err := d.decodePoint(pt, dataBytes)
 		if err != nil {
-			log.Printf("[%s] ошибка декодирования статуса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+			log.Printf("[%s] ошибка декодирования статуса %s (экземпляр=%s): %v\n", d.ID, pt.Name, instance, err)
 			return
 		}
 		intVal, ok := val.(int64)
@@ -756,13 +763,13 @@ func (d *Device) collectStatusValues(ctx context.Context) quality.StatusValues {
 
 		inst, ok := d.Profile.Instances[pt.Instance]
 		if !ok || inst.Enumerate != "fixed_count" || inst.Count <= 0 {
-			log.Printf("[%s] статус %s: instance %q не поддерживается для сбора статуса\n", d.ID, pt.Name, pt.Instance)
+			log.Printf("[%s] статус %s: экземпляр %q не поддерживается для сбора статуса\n", d.ID, pt.Name, pt.Instance)
 			continue
 		}
 		for i := 1; i <= inst.Count; i++ {
 			addr, err := pointresolver.Resolve(pt.AddrFormula, pt.Instance, i)
 			if err != nil {
-				log.Printf("[%s] статус %s (instance %d): ошибка формулы адреса: %v\n", d.ID, pt.Name, i, err)
+				log.Printf("[%s] статус %s (экземпляр %d): ошибка формулы адреса: %v\n", d.ID, pt.Name, i, err)
 				continue
 			}
 			readOne(pt, addr, fmt.Sprintf("%d", i))
@@ -774,13 +781,13 @@ func (d *Device) collectStatusValues(ctx context.Context) quality.StatusValues {
 func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, instance string, statusValues quality.StatusValues) {
 	dataBytes, err := d.Client.ReadRaw(ctx, pt.Space, addr, pt.Type)
 	if err != nil {
-		log.Printf("[%s] ошибка опроса %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+		log.Printf("[%s] ошибка опроса %s (экземпляр=%s): %v\n", d.ID, pt.Name, instance, err)
 		return
 	}
 
 	val, err := d.decodePoint(pt, dataBytes)
 	if err != nil {
-		log.Printf("[%s] ошибка декодирования %s (instance=%s): %v\n", d.ID, pt.Name, instance, err)
+		log.Printf("[%s] ошибка декодирования %s (экземпляр=%s): %v\n", d.ID, pt.Name, instance, err)
 		return
 	}
 
@@ -839,6 +846,35 @@ func (d *Device) PollArchives(ctx context.Context) {
 
 		layout := layoutFromProfile(a)
 
+		// VZLET/ИВК-ТЭР function 65 умеет адресацию и по времени, и по
+		// индексу. Для регулярного опроса нужен именно индекс 0 — вершина
+		// архива. Старый общий From=now-24h ошибочно заставлял эту стратегию
+		// читать запись суточной давности.
+		if a.Strategy == "mb_func65" {
+			release, leaseErr := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
+			if leaseErr != nil {
+				log.Printf("[%s] архив %s: не удалось занять прибор: %v\n", d.ID, a.ID, leaseErr)
+				continue
+			}
+			records, readErr := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, func65LatestQuery(d, a))
+			release()
+			if readErr != nil {
+				log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: ошибка чтения: %v\n", d.ID, a.ID, readErr)
+				continue
+			}
+			for _, rec := range records {
+				if err := validateFunc65Record(rec); err != nil {
+					log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: некорректная запись: %v\n", d.ID, a.ID, err)
+				}
+			}
+			saved := persistFunc65Hourly(ctx, d.Repo, d.ID, a, records)
+			if saved > 0 {
+				health.MarkArchiveSuccess(d.ID, time.Now())
+			}
+			log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: получено записей %d, сохранено полей %d\n", d.ID, a.ID, len(records), saved)
+			continue
+		}
+
 		// CONFIRMED BUG (2026-08-22): index-based strategies (currently
 		// only akron_archive) read ONLY FromIndex/ToIndex — From/To
 		// (time-based) are irrelevant to them, since the device itself
@@ -880,7 +916,7 @@ func (d *Device) PollArchives(ctx context.Context) {
 
 		release, leaseErr := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
 		if leaseErr != nil {
-			log.Printf("[%s] архив %s: не удалось занять lease: %v\n", d.ID, a.ID, leaseErr)
+			log.Printf("[%s] архив %s: не удалось получить блокировку прибора: %v\n", d.ID, a.ID, leaseErr)
 			continue
 		}
 

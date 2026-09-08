@@ -90,12 +90,18 @@ func (s *Server) handleForceReload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "для этого прибора уже идёт переопрос — дождитесь завершения или нажмите «Отменить»")
 		return
 	}
+	if !s.beginPhysicalOperation() {
+		s.reloadJobsMu.Unlock()
+		writeError(w, http.StatusServiceUnavailable, "МодбасШлюз останавливается — новый переопрос не запускается")
+		return
+	}
 	jobCtx, cancel := context.WithCancel(s.baseCtx)
 	job := &reloadJob{Done: 0, Total: 0, Saved: 0, Finished: false, StartedAt: time.Now(), cancel: cancel}
 	s.reloadJobs[body.DeviceID] = job
 	s.reloadJobsMu.Unlock()
 
 	go func() {
+		defer s.endPhysicalOperation()
 		defer cancel() // освобождаем ресурсы контекста, даже если переопрос завершился сам, без отмены
 
 		saved, err := s.onForceReload(jobCtx, body.DeviceID, from, to, func(done, total int) {

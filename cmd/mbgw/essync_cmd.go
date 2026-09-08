@@ -16,7 +16,7 @@ import (
 // for the SQL Server client (the only place that imports the mssql
 // driver, per LLD.md's dependency rules).
 //
-// Usage:
+// Использование:
 //
 //	mbgw es-sync --db mbgw_vkm.db [--config es_sync.txt] [--dry-run]
 //
@@ -50,7 +50,7 @@ func runESSync() {
 
 	cfg, err := integration.LoadConfig(configPath)
 	if err != nil {
-		log.Fatalf("[FATAL] es-sync: %v", err)
+		log.Fatalf("[КРИТИЧНО] синхронизация с ЭС: %v", err)
 	}
 	if dryRun {
 		cfg.DryRun = true
@@ -58,9 +58,9 @@ func runESSync() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	waitForShutdownSignal(cancel, "es-sync")
+	waitForShutdownSignal(cancel, "синхронизация с ЭС")
 
-	log.Printf("es-sync: старт, исходная БД %s, конфиг %s\n", dbPath, configPath)
+	log.Printf("синхронизация с ЭС: старт, исходная БД %s, конфигурация %s\n", dbPath, configPath)
 	// nil — в этом отдельном режиме запуска (устаревшая схема "четыре
 	// окна", без единого веб-сервера) нет ни кнопки "Синхронизировать
 	// сейчас", ни принудительного переопроса, которые могли бы попросить
@@ -68,12 +68,12 @@ func runESSync() {
 	// безопасен: select на nil-канале никогда не срабатывает, обычный
 	// тикер и ctx.Done() продолжают работать как раньше.
 	if err := integration.RunEnergosphereSync(ctx, dbPath, cfg, nil); err != nil {
-		log.Fatalf("[FATAL] es-sync: %v", err)
+		log.Fatalf("[КРИТИЧНО] синхронизация с ЭС: %v", err)
 	}
 }
 
 func printESSyncUsage() {
-	fmt.Println("Usage:")
+	fmt.Println("Использование:")
 	fmt.Println("  mbgw es-sync --db <mbgw_vkm.db> [--config <es_sync.txt>] [--dry-run]")
 	fmt.Println()
 	fmt.Println("  Пишет 4 величины (тепло, масса, температура, давление) из архива")

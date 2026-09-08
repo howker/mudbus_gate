@@ -29,7 +29,7 @@ const correctTimeMaxDrift = 4 * time.Minute
 
 func correctTime() {
 	if len(os.Args) < 4 {
-		fmt.Println("Usage: mbgw cli correct-time <device_id> [--yes]")
+		fmt.Println("Использование: mbgw cli correct-time <идентификатор_прибора> [--yes]")
 		os.Exit(1)
 	}
 	deviceID := os.Args[3]

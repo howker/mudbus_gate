@@ -12,9 +12,17 @@ type DeviceStatus struct {
 	LastArchiveSuccess time.Time
 	LastESWriteSuccess time.Time
 
-	PollInProgress bool
-	PollStartedAt  time.Time
-	PollKind       string
+	PollInProgress     bool
+	PollStartedAt      time.Time
+	PollLastProgressAt time.Time
+	PollKind           string
+
+	// PollQueueDepth/PollQueuedAt показывают задания, уже переданные
+	// диспетчером в FIFO прибора, но ещё не начавшие фактический опрос.
+	// Это позволяет watchdog отличить нормальное ожидание расписания от
+	// зависшей очереди worker-а.
+	PollQueueDepth int
+	PollQueuedAt   time.Time
 
 	LastPollFinishedAt time.Time
 	LastPollOK         bool
@@ -27,8 +35,10 @@ type DeviceStatus struct {
 
 // Snapshot is a point-in-time copy safe for the Web/API layer.
 type Snapshot struct {
-	PollerLastCycle time.Time
-	Devices         map[string]DeviceStatus
+	PollerLastCycle        time.Time
+	PollerLastDispatch     time.Time
+	SchedulerDueStallSince time.Time
+	Devices                map[string]DeviceStatus
 
 	SQLiteCheckedAt time.Time
 	SQLiteOK        bool
@@ -38,8 +48,10 @@ type Snapshot struct {
 var state struct {
 	sync.RWMutex
 
-	pollerLastCycle time.Time
-	devices         map[string]DeviceStatus
+	pollerLastCycle        time.Time
+	pollerLastDispatch     time.Time
+	schedulerDueStallSince time.Time
+	devices                map[string]DeviceStatus
 
 	sqliteCheckedAt time.Time
 	sqliteOK        bool
@@ -56,6 +68,62 @@ func init() {
 func MarkPollerCycle(at time.Time) {
 	state.Lock()
 	state.pollerLastCycle = at
+	state.Unlock()
+}
+
+// MarkPollerDispatch отмечает, что диспетчер действительно забрал задание
+// из scheduler и передал его в FIFO прибора. Это более сильный признак
+// жизни, чем один только тик центрального цикла.
+func MarkPollerDispatch(at time.Time) {
+	state.Lock()
+	state.pollerLastDispatch = at
+	state.Unlock()
+}
+
+// MarkSchedulerDueStall фиксирует момент, когда планировщик уже видел
+// просроченную плановую работу, но после Tick не отдал ни одного задания.
+// Повторные вызовы не сдвигают начало — watchdog должен видеть длительность.
+func MarkSchedulerDueStall(at time.Time) {
+	state.Lock()
+	if state.schedulerDueStallSince.IsZero() {
+		state.schedulerDueStallSince = at
+	}
+	state.Unlock()
+}
+
+func ClearSchedulerDueStall() {
+	state.Lock()
+	state.schedulerDueStallSince = time.Time{}
+	state.Unlock()
+}
+
+// MarkPollQueued/MarkPollDequeued ведут минимальное состояние FIFO прибора.
+// Время первой ожидающей задачи не сдвигается при добавлении следующих.
+func MarkPollQueued(deviceID string, at time.Time) {
+	state.Lock()
+	st := state.devices[deviceID]
+	if st.PollQueueDepth == 0 {
+		st.PollQueuedAt = at
+	}
+	st.PollQueueDepth++
+	state.devices[deviceID] = st
+	state.Unlock()
+}
+
+func MarkPollDequeued(deviceID string, at time.Time) {
+	state.Lock()
+	st := state.devices[deviceID]
+	if st.PollQueueDepth > 0 {
+		st.PollQueueDepth--
+	}
+	if st.PollQueueDepth == 0 {
+		st.PollQueuedAt = time.Time{}
+	} else {
+		// Точный возраст следующей задачи нам не известен; at — безопасная
+		// нижняя граница, исключающая ложное объявление зависания.
+		st.PollQueuedAt = at
+	}
+	state.devices[deviceID] = st
 	state.Unlock()
 }
 
@@ -97,8 +165,22 @@ func MarkPollStarted(deviceID, kind string, at time.Time) {
 	st := state.devices[deviceID]
 	st.PollInProgress = true
 	st.PollStartedAt = at
+	st.PollLastProgressAt = at
 	st.PollKind = kind
 	state.devices[deviceID] = st
+	state.Unlock()
+}
+
+// MarkPollProgress отмечает продвижение уже начатой длительной операции.
+// Дозабор архива вызывает её после каждой реально обработанной записи/страницы,
+// чтобы watchdog не принял долгую, но живую работу за зависание.
+func MarkPollProgress(deviceID string, at time.Time) {
+	state.Lock()
+	st := state.devices[deviceID]
+	if st.PollInProgress {
+		st.PollLastProgressAt = at
+		state.devices[deviceID] = st
+	}
 	state.Unlock()
 }
 
@@ -110,6 +192,7 @@ func MarkPollFinished(deviceID, kind string, at time.Time, ok bool, errText stri
 	state.Lock()
 	st := state.devices[deviceID]
 	st.PollInProgress = false
+	st.PollLastProgressAt = at
 	if recordResult {
 		st.LastPollFinishedAt = at
 		st.LastPollOK = ok
@@ -155,10 +238,12 @@ func Get() Snapshot {
 	}
 
 	return Snapshot{
-		PollerLastCycle: state.pollerLastCycle,
-		Devices:         devices,
-		SQLiteCheckedAt: state.sqliteCheckedAt,
-		SQLiteOK:        state.sqliteOK,
-		SQLiteError:     state.sqliteError,
+		PollerLastCycle:        state.pollerLastCycle,
+		PollerLastDispatch:     state.pollerLastDispatch,
+		SchedulerDueStallSince: state.schedulerDueStallSince,
+		Devices:                devices,
+		SQLiteCheckedAt:        state.sqliteCheckedAt,
+		SQLiteOK:               state.sqliteOK,
+		SQLiteError:            state.sqliteError,
 	}
 }

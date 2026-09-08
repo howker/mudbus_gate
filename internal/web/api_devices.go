@@ -39,7 +39,7 @@ import (
 type deviceJSON struct {
 	ID                              string `json:"id"`
 	Name                            string `json:"name"`
-	Kind                            string `json:"kind"` // "vkm360" | "akron"
+	Kind                            string `json:"kind"` // "vkm360" | "akron" | "ivk-ter"
 	Profile                         string `json:"profile"`
 	TransportKind                   string `json:"transport_kind"`
 	Host                            string `json:"host"`
@@ -149,8 +149,8 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "поле id обязательно")
 			return
 		}
-		if j.Kind != "vkm360" && j.Kind != "akron" {
-			writeError(w, http.StatusBadRequest, `поле kind должно быть "vkm360" или "akron"`)
+		if j.Kind != "vkm360" && j.Kind != "akron" && j.Kind != "ivk-ter" {
+			writeError(w, http.StatusBadRequest, `поле kind должно быть "vkm360", "akron" или "ivk-ter"`)
 			return
 		}
 		if j.TimeCorrectionDeadbandSeconds < 0 {
@@ -167,7 +167,7 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 		}
 		if j.Kind != "vkm360" {
 			// Эти настройки относятся только к ВКМ-360. При смене типа
-			// прибора на Akron не оставляем скрытые значения, которые
+			// прибора на другой тип не оставляем скрытые значения, которые
 			// могут неожиданно сработать при последующей смене типа обратно.
 			j.TimeCorrectionDeadbandSeconds = 0
 			j.TimeCorrectionMaxStepSeconds = 0

@@ -129,15 +129,15 @@ func runNorthbound() {
 func runServeMode(cfgPath, dbPath string) {
 	uspd, err := northbound.LoadUSPDConfig(cfgPath)
 	if err != nil {
-		log.Fatalf("[FATAL] northbound: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс: %v", err)
 	}
 
 	repo, err := sqliterepo.New(dbPath)
 	if err != nil {
-		log.Fatalf("[FATAL] northbound: ошибка хранилища: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс: ошибка хранилища: %v", err)
 	}
 	if err := repo.InitSchema(context.Background()); err != nil {
-		log.Fatalf("[FATAL] northbound: ошибка инициализации схемы: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс: ошибка инициализации схемы: %v", err)
 	}
 
 	eventBus := monitor.NewBus(nil)
@@ -145,20 +145,20 @@ func runServeMode(cfgPath, dbPath string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	waitForShutdownSignal(cancel, "northbound")
+	waitForShutdownSignal(cancel, "северный интерфейс")
 
-	log.Printf("northbound: слушаем %s как unit %d (устройство=%s, uspd=%s)\n",
+	log.Printf("северный интерфейс: слушаем %s как Unit ID %d (прибор=%s, УСПД=%s)\n",
 		uspd.Listen, uspd.UnitID, uspd.DeviceID, uspd.ID)
 
 	if err := srv.Listen(ctx); err != nil {
-		log.Fatalf("[FATAL] northbound: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс: %v", err)
 	}
-	log.Println("northbound: остановлен")
+	log.Println("северный интерфейс: остановлен")
 }
 
 func runDiscoveryMode(listenAddr, fixturePath, logPath string) {
 	if listenAddr == "" {
-		fmt.Println("northbound --discovery: --listen is required")
+		fmt.Println("northbound --discovery: обязательно укажите --listen")
 		os.Exit(1)
 	}
 	if logPath == "" {
@@ -169,14 +169,14 @@ func runDiscoveryMode(listenAddr, fixturePath, logPath string) {
 	if fixturePath != "" {
 		f, err := northbound.LoadDiscoveryFixture(fixturePath)
 		if err != nil {
-			log.Fatalf("[FATAL] northbound --discovery: %v", err)
+			log.Fatalf("[КРИТИЧНО] северный интерфейс --discovery: %v", err)
 		}
 		fixture = f
 	}
 
 	dlog, err := northbound.NewDiscoveryLog(logPath)
 	if err != nil {
-		log.Fatalf("[FATAL] northbound --discovery: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс --discovery: %v", err)
 	}
 	defer dlog.Close()
 
@@ -184,14 +184,14 @@ func runDiscoveryMode(listenAddr, fixturePath, logPath string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	waitForShutdownSignal(cancel, "northbound --discovery")
+	waitForShutdownSignal(cancel, "северный интерфейс --discovery")
 
-	log.Printf("northbound --discovery (MBAP): слушаем %s (лог: %s)\n", listenAddr, logPath)
+	log.Printf("северный интерфейс --discovery (MBAP): слушаем %s (лог: %s)\n", listenAddr, logPath)
 
 	if err := srv.Listen(ctx); err != nil {
-		log.Fatalf("[FATAL] northbound --discovery: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс --discovery: %v", err)
 	}
-	log.Println("northbound --discovery: остановлен")
+	log.Println("северный интерфейс --discovery: остановлен")
 }
 
 // runAkronLiveMode starts the PRODUCTION raw-RTU carrier: the discovery
@@ -209,17 +209,17 @@ func runAkronLiveMode(listenAddr, dbPath, deviceID, logPath string) {
 
 	repo, err := sqliterepo.New(dbPath)
 	if err != nil {
-		log.Fatalf("[FATAL] northbound --serve-akron: ошибка хранилища: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс --serve-akron: ошибка хранилища: %v", err)
 	}
 	// InitSchema is idempotent and also provisions the archive/passport
 	// tables — safe when sharing the DB file with a running gateway.
 	if err := repo.InitSchema(context.Background()); err != nil {
-		log.Fatalf("[FATAL] northbound --serve-akron: ошибка схемы: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс --serve-akron: ошибка схемы: %v", err)
 	}
 
 	dlog, err := northbound.NewDiscoveryLog(logPath)
 	if err != nil {
-		log.Fatalf("[FATAL] northbound --serve-akron: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс --serve-akron: %v", err)
 	}
 	defer dlog.Close()
 
@@ -227,15 +227,15 @@ func runAkronLiveMode(listenAddr, dbPath, deviceID, logPath string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	waitForShutdownSignal(cancel, "northbound --serve-akron")
+	waitForShutdownSignal(cancel, "северный интерфейс --serve-akron")
 
-	log.Printf("northbound --serve-akron: слушаем %s, прибор %s, база %s (лог: %s)\n",
+	log.Printf("северный интерфейс --serve-akron: слушаем %s, прибор %s, база %s (лог: %s)\n",
 		listenAddr, deviceID, dbPath, logPath)
 
 	if err := srv.Listen(ctx); err != nil {
-		log.Fatalf("[FATAL] northbound --serve-akron: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс --serve-akron: %v", err)
 	}
-	log.Println("northbound --serve-akron: остановлен")
+	log.Println("северный интерфейс --serve-akron: остановлен")
 }
 
 // runVKMLiveMode starts the MBAP (Modbus TCP) carrier that lets mbgw stand
@@ -268,7 +268,7 @@ func runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID string, vkm
 
 	dlog, err := northbound.NewDiscoveryLog(logPath)
 	if err != nil {
-		log.Fatalf("[FATAL] northbound --serve-vkm: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс --serve-vkm: %v", err)
 	}
 	defer dlog.Close()
 
@@ -276,25 +276,25 @@ func runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID string, vkm
 	if dbPath != "" && deviceID != "" {
 		repo, err := sqliterepo.New(dbPath)
 		if err != nil {
-			log.Fatalf("[FATAL] northbound --serve-vkm: открытие БД: %v", err)
+			log.Fatalf("[КРИТИЧНО] северный интерфейс --serve-vkm: открытие БД: %v", err)
 		}
 		defer repo.Close()
 		if err := repo.InitArchiveSchema(context.Background()); err != nil {
-			log.Fatalf("[FATAL] northbound --serve-vkm: инициализация схемы архива: %v", err)
+			log.Fatalf("[КРИТИЧНО] северный интерфейс --serve-vkm: инициализация схемы архива: %v", err)
 		}
 		src := northbound.NewDBVKMArchiveSource(repo, deviceID)
 		src.ProbeVariants = vkmProbe
 		src.NumFormatProbe = numProbe
 		src.NumProbeLogPath = numProbeLog
 		newSrc = func() northbound.VKMArchiveSource { return src }
-		log.Printf("northbound --serve-vkm: боевой режим — источник архива: БД %s, прибор %s\n", dbPath, deviceID)
+		log.Printf("северный интерфейс --serve-vkm: боевой режим — источник архива: БД %s, прибор %s\n", dbPath, deviceID)
 		if vkmProbe {
-			log.Println("northbound --serve-vkm: РЕЖИМ ПЕРЕБОРА ГИПОТЕЗ (--vkm-probe) включён:")
+			log.Println("северный интерфейс --serve-vkm: режим перебора гипотез (--vkm-probe) включён:")
 			log.Println("  пока ЭС повторяет запрос одного периода, каждая попытка получает СЛЕДУЮЩИЙ вариант строки;")
 			log.Println("  когда ЭС примет период и пойдёт дальше — в логе будет видно, на каком варианте это случилось.")
 		}
 		if numProbe {
-			log.Println("northbound --serve-vkm: РЕЖИМ ПЕРЕБОРА ФОРМАТА ЧИСЛА (--vkm-numprobe) включён:")
+			log.Println("северный интерфейс --serve-vkm: режим перебора формата числа (--vkm-numprobe) включён:")
 			log.Printf("  каждому экспоненциальному полю присвоен свой формат; карта пишется в %s\n", numProbeLog)
 			log.Println("  посмотри в ЭС, какие каналы стали ненулевыми, и сопоставь с форматом по этому файлу.")
 		}
@@ -306,7 +306,7 @@ func runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID string, vkm
 		newSrc = func() northbound.VKMArchiveSource {
 			return northbound.ConfigArchiveSource{Fallback: vkmString}
 		}
-		log.Println("northbound --serve-vkm: тестовый режим (нет --db/--device) — фиксированная/настраиваемая строка")
+		log.Println("северный интерфейс --serve-vkm: тестовый режим (нет --db/--device) — фиксированная/настраиваемая строка")
 	}
 
 	srv := northbound.NewVKMServer(listenAddr, newSrc)
@@ -314,18 +314,18 @@ func runVKMLiveMode(listenAddr, vkmString, logPath, dbPath, deviceID string, vkm
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	waitForShutdownSignal(cancel, "northbound --serve-vkm")
+	waitForShutdownSignal(cancel, "северный интерфейс --serve-vkm")
 
-	log.Printf("northbound --serve-vkm: слушаем %s (лог: %s)\n", listenAddr, logPath)
+	log.Printf("северный интерфейс --serve-vkm: слушаем %s (лог: %s)\n", listenAddr, logPath)
 	if err := srv.Listen(ctx); err != nil {
-		log.Fatalf("[FATAL] northbound --serve-vkm: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс --serve-vkm: %v", err)
 	}
-	log.Println("northbound --serve-vkm: остановлен")
+	log.Println("северный интерфейс --serve-vkm: остановлен")
 }
 
 func runRawDiscoveryMode(listenAddr, logPath, simPath, cmd110 string) {
 	if listenAddr == "" {
-		fmt.Println("northbound --discovery --raw: --listen is required")
+		fmt.Println("northbound --discovery --raw: обязательно укажите --listen")
 		os.Exit(1)
 	}
 	if logPath == "" {
@@ -338,7 +338,7 @@ func runRawDiscoveryMode(listenAddr, logPath, simPath, cmd110 string) {
 	if simPath != "" {
 		loaded, err := northbound.LoadAkronSimConfig(simPath)
 		if err != nil {
-			log.Fatalf("[FATAL] northbound --discovery --raw: %v", err)
+			log.Fatalf("[КРИТИЧНО] северный интерфейс --discovery --raw: %v", err)
 		}
 		cfg = loaded
 	}
@@ -349,7 +349,7 @@ func runRawDiscoveryMode(listenAddr, logPath, simPath, cmd110 string) {
 
 	dlog, err := northbound.NewDiscoveryLog(logPath)
 	if err != nil {
-		log.Fatalf("[FATAL] northbound --discovery --raw: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс --discovery --raw: %v", err)
 	}
 	defer dlog.Close()
 
@@ -357,15 +357,15 @@ func runRawDiscoveryMode(listenAddr, logPath, simPath, cmd110 string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	waitForShutdownSignal(cancel, "northbound --discovery --raw")
+	waitForShutdownSignal(cancel, "северный интерфейс --discovery --raw")
 
-	log.Printf("northbound --discovery --raw: слушаем %s (лог: %s) [%s]\n",
+	log.Printf("северный интерфейс --discovery --raw: слушаем %s (лог: %s) [%s]\n",
 		listenAddr, logPath, simulator.ActiveAkronSummary())
 
 	if err := srv.Listen(ctx); err != nil {
-		log.Fatalf("[FATAL] northbound --discovery --raw: %v", err)
+		log.Fatalf("[КРИТИЧНО] северный интерфейс --discovery --raw: %v", err)
 	}
-	log.Println("northbound --discovery --raw: остановлен")
+	log.Println("северный интерфейс --discovery --raw: остановлен")
 }
 
 func waitForShutdownSignal(cancel context.CancelFunc, label string) {
@@ -379,22 +379,22 @@ func waitForShutdownSignal(cancel context.CancelFunc, label string) {
 }
 
 func printNorthboundUsage() {
-	fmt.Println("Usage:")
+	fmt.Println("Использование:")
 	fmt.Println("  mbgw northbound --config <uspd.yaml> --db <path.sqlite>")
-	fmt.Println("      Serve current values upward as a Modbus TCP slave (M1).")
+	fmt.Println("      Отдаёт текущие значения наружу как ведомое устройство Modbus TCP (M1).")
 	fmt.Println()
 	fmt.Println("  mbgw northbound --discovery --listen <addr> [--fixture <f.yaml>] [--log <p.jsonl>]")
-	fmt.Println("      MBAP discovery: log every inbound Modbus TCP frame, reply with a stub (M3).")
+	fmt.Println("      Диагностика MBAP: журналирует каждый входящий кадр Modbus TCP и отвечает заглушкой (M3).")
 	fmt.Println()
 	fmt.Println("  mbgw northbound --discovery --raw --listen <addr> [--log <p.jsonl>] [--sim <s.yaml>] [--cmd110 <mode>]")
 	fmt.Println("  mbgw northbound --serve-akron --listen <addr> --db <path> --device <id> [--log <p.jsonl>]")
 	fmt.Println("  mbgw northbound --serve-vkm --listen <addr> --db <p> --device <id> [--log <p.jsonl>]   (боевой режим)")
 	fmt.Println("  mbgw northbound --serve-vkm --listen <addr> [--vkm-string <s>] [--log <p.jsonl>]        (тестовый режим, без --db/--device)")
-	fmt.Println("      Raw-TCP discovery: log bare Modbus RTU and answer as an Akron (M3).")
-	fmt.Println("      --sim <file>  YAML controlling responder behaviour (edit on server, no rebuild):")
-	fmt.Println("                    cmd110, live_clock, identity, per-command overrides.")
-	fmt.Println("      --cmd110 <m>  quick override of the command-110 reply: nil|empty|ready|zero|echo")
+	fmt.Println("      Диагностика Raw TCP: журналирует Modbus RTU без обёртки и отвечает как Акрон (M3).")
+	fmt.Println("      --sim <file>  YAML с настройками поведения ответчика (можно менять на сервере без пересборки):")
+	fmt.Println("                    cmd110, живые часы, идентификация, переопределения отдельных команд.")
+	fmt.Println("      --cmd110 <m>  быстрое переопределение ответа команды 110: nil|empty|ready|zero|echo")
 	fmt.Println()
-	fmt.Println("      Discovery modes never touch a device or the SQLite DB. Use an isolated")
-	fmt.Println("      --listen address, separate from any production УСПД port.")
+	fmt.Println("      Режимы диагностики не обращаются к прибору и базе SQLite. Используйте отдельный")
+	fmt.Println("      адрес --listen, не совпадающий с рабочим портом УСПД.")
 }
