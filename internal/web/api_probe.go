@@ -348,11 +348,13 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 	return resp
 }
 
-// probeIVKTER выполняет безопасную проверку ИВК-ТЭР без записи в прибор:
-// читает серийный номер вторичного вычислителя (IR 0x8002), текущие часы
-// (IR 0x8000, uint32 Unix) и текущий расход (IR 0xC034, float).
-// Все три регистра доступны на чтение в рабочем режиме; установка времени
-// здесь намеренно отсутствует — HR 0x8000 требует сервисного режима прибора.
+// probeIVKTER выполняет безопасную пошаговую проверку ИВК-ТЭР без
+// записи в прибор. Диагностика намеренно разделена на независимые этапы:
+// открытие транспорта -> IR 0x8002 -> IR 0x8000 -> архивная функция 65 ->
+// IR 0xC034 -> закрытие транспорта. Каждый этап попадает в Steps со своим
+// OK/ERROR и, где полезно, сырыми байтами. Для архивного шлюза общий OK
+// означает именно успешное чтение полноценной 30-байтовой записи F65;
+// ответы обычных IR-регистров не маскируют неработающий архив.
 func probeIVKTER(ctx context.Context, req probeRequest) (resp probeResponse) {
 	timeoutMs := req.TimeoutMs
 	if timeoutMs <= 0 {
@@ -363,27 +365,73 @@ func probeIVKTER(ctx context.Context, req probeRequest) (resp probeResponse) {
 		Baudrate: req.Baudrate, Parity: req.Parity, StopBits: req.StopBits,
 		ResponseTimeout: time.Duration(timeoutMs) * time.Millisecond, Retries: 3,
 	}
+
+	transportLabel := req.COM
+	if req.TransportKind == "modbus_tcp" {
+		transportLabel = fmt.Sprintf("%s:%d", req.Host, req.Port)
+	}
+	if transportLabel == "" {
+		transportLabel = "транспорт"
+	}
+
+	appendError := func(detail string) {
+		if detail == "" {
+			return
+		}
+		if resp.Error == "" {
+			resp.Error = detail
+			return
+		}
+		resp.Error += "; " + detail
+	}
+	probeStepOK := func(text string) {
+		resp.Steps = append(resp.Steps, text+" — OK")
+	}
+	probeStepError := func(text string, err error) {
+		detail := "неизвестная ошибка"
+		if err != nil {
+			detail = err.Error()
+		}
+		resp.Steps = append(resp.Steps, text+" — ERROR: "+detail)
+		appendError(text + ": " + detail)
+	}
+	probeStepErrorText := func(text, detail string) {
+		resp.Steps = append(resp.Steps, text+" — ERROR: "+detail)
+		appendError(text + ": " + detail)
+	}
+
 	resp.Steps = append(resp.Steps, "создаю транспорт")
 	tr, err := transport.New(trParams)
 	if err != nil {
-		resp.Error = "не удалось создать транспорт: " + err.Error()
+		probeStepError("создание транспорта", err)
 		return
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+	probeStepOK("транспорт создан")
+
+	// Четыре независимых диагностических запроса могут каждый исчерпать
+	// несколько transport retries. Общий budget специально больше обычного
+	// probe, чтобы первый timeout не лишал функцию 65 своей попытки.
+	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	if err := tr.Open(probeCtx); err != nil {
-		resp.Error = "не удалось открыть соединение: " + err.Error()
-		resp.Steps = append(resp.Steps, "порт/соединение не открыто")
+		probeStepError("открытие "+transportLabel, err)
 		return
 	}
-	resp.Steps = append(resp.Steps, "порт/соединение открыто")
-	defer func() {
-		if err := tr.Close(); err != nil {
-			resp.Steps = append(resp.Steps, "ошибка закрытия порта: "+err.Error())
-		} else {
-			resp.Steps = append(resp.Steps, "порт/соединение закрыто")
+	probeStepOK(transportLabel + " открыт")
+	transportClosed := false
+	closeTransport := func() {
+		if transportClosed {
+			return
 		}
-	}()
+		transportClosed = true
+		if err := tr.Close(); err != nil {
+			probeStepError("закрытие "+transportLabel, err)
+			resp.OK = false
+		} else {
+			probeStepOK(transportLabel + " закрыт")
+		}
+	}
+	defer closeTransport()
 
 	isTCP := req.TransportKind == "modbus_tcp"
 	unitID := req.UnitID
@@ -391,63 +439,99 @@ func probeIVKTER(ctx context.Context, req probeRequest) (resp probeResponse) {
 		unitID = 1
 	}
 	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), pollcore.PhysicalIOLockKey(trParams, req.ID))
-	resp.OK = true
 	resp.Steps = append(resp.Steps, fmt.Sprintf("начат опрос ИВК-ТЭР, Modbus-адрес %d", unitID))
 
-	if raw, err := reader.ReadRaw(probeCtx, "IR", 32770, "uint32"); err != nil {
-		resp.Error = firstNonEmpty(resp.Error, "серийный номер (IR 0x8002): "+err.Error())
-	} else if serial, err := codec.DecodeUint32(raw, "0123"); err != nil {
-		resp.Error = firstNonEmpty(resp.Error, "разбор серийного номера: "+err.Error())
+	// Каждый этап получает собственный timeout: ошибка одного регистра не
+	// должна съедать весь budget и скрывать результат главной проверки F65.
+	stageTimeout := 4 * time.Second
+	if candidate := time.Duration(timeoutMs)*time.Millisecond*4 + 500*time.Millisecond; candidate > stageTimeout {
+		stageTimeout = candidate
+	}
+	if stageTimeout > 8*time.Second {
+		stageTimeout = 8 * time.Second
+	}
+
+	stageCtx, stageCancel := context.WithTimeout(probeCtx, stageTimeout)
+	rawSerial, serialErr := reader.ReadRaw(stageCtx, "IR", 32770, "uint32")
+	stageCancel()
+	if serialErr != nil {
+		probeStepError("IR 0x8002 serial", serialErr)
+	} else if serial, err := codec.DecodeUint32(rawSerial, "0123"); err != nil {
+		probeStepError("IR 0x8002 serial decode", err)
 	} else if serial == 0 || serial == 0xFFFFFFFF {
-		resp.Error = firstNonEmpty(resp.Error, fmt.Sprintf("некорректный серийный номер: %d", serial))
+		probeStepErrorText("IR 0x8002 serial", fmt.Sprintf("некорректное значение %d, raw=% X", serial, rawSerial))
 	} else {
 		resp.SerialNumber = fmt.Sprintf("%d", serial)
-		resp.Steps = append(resp.Steps, "прибор ответил: серийный номер прочитан")
+		probeStepOK(fmt.Sprintf("IR 0x8002 serial = %d, raw=% X", serial, rawSerial))
 	}
 
-	if raw, err := reader.ReadRaw(probeCtx, "IR", 32768, "uint32"); err != nil {
-		resp.Error = firstNonEmpty(resp.Error, "время прибора (IR 0x8000): "+err.Error())
-	} else if seconds, err := codec.DecodeUint32(raw, "0123"); err != nil {
-		resp.Error = firstNonEmpty(resp.Error, "разбор времени прибора: "+err.Error())
+	stageCtx, stageCancel = context.WithTimeout(probeCtx, stageTimeout)
+	rawTime, timeErr := reader.ReadRaw(stageCtx, "IR", 32768, "uint32")
+	stageCancel()
+	if timeErr != nil {
+		probeStepError("IR 0x8000 time", timeErr)
+	} else if seconds, err := codec.DecodeUint32(rawTime, "0123"); err != nil {
+		probeStepError("IR 0x8000 time decode", err)
 	} else if seconds == 0 || seconds == 0xFFFFFFFF {
-		resp.Error = firstNonEmpty(resp.Error, "прибор вернул некорректное значение времени")
+		probeStepErrorText("IR 0x8000 time", fmt.Sprintf("некорректное значение %d, raw=% X", seconds, rawTime))
 	} else {
 		resp.DeviceTime = time.Unix(int64(seconds), 0).Local().Format("02.01.2006 15:04:05")
-		resp.Steps = append(resp.Steps, "часы прибора прочитаны")
+		probeStepOK(fmt.Sprintf("IR 0x8000 time = %s, raw=% X", resp.DeviceTime, rawTime))
 	}
 
-	// Критическая часть проверки ИВК-ТЭР: читаем вершину часового архива
-	// той же функцией 65 (0x41), которую использует боевой PollArchives.
-	resp.Steps = append(resp.Steps, "проверяю часовой архив функцией 65")
-	archiveResp, archiveErr := reader.Transact(probeCtx, modbus.BuildArchive65IndexPDU(0, 1, 0))
+	// Ключевой этап именно для архивного шлюза. Общий OK для ИВК-ТЭР
+	// выставляется только когда функция 65 вернула полноценную 30-байтовую
+	// запись с разумной меткой времени. Простые IR-регистры сами по себе
+	// больше не маскируют неработающий архив зелёным результатом.
+	archiveOK := false
+	archivePDU := modbus.BuildArchive65IndexPDU(0, 1, 0)
+	resp.Steps = append(resp.Steps, fmt.Sprintf("F65 запрос: % X", archivePDU))
+	stageCtx, stageCancel = context.WithTimeout(probeCtx, stageTimeout)
+	archiveResp, archiveErr := reader.Transact(stageCtx, archivePDU)
+	stageCancel()
 	if archiveErr != nil {
-		resp.Error = firstNonEmpty(resp.Error, "архив ИВК-ТЭР (функция 65): "+archiveErr.Error())
+		probeStepError("F65 часовой архив", archiveErr)
 	} else if payload, err := modbus.ParseArchive65Response(archiveResp); err != nil {
-		resp.Error = firstNonEmpty(resp.Error, "разбор архива ИВК-ТЭР (функция 65): "+err.Error())
+		probeStepErrorText("F65 разбор ответа", fmt.Sprintf("%v; raw response=% X", err, archiveResp))
 	} else if len(payload) < 30 {
-		resp.Error = firstNonEmpty(resp.Error, fmt.Sprintf("архив ИВК-ТЭР: короткая запись %d байт, ожидается 30", len(payload)))
+		probeStepErrorText("F65 часовой архив", fmt.Sprintf("короткая запись %d байт, ожидается 30; raw response=% X", len(payload), archiveResp))
 	} else {
 		ts := binary.BigEndian.Uint32(payload[:4])
 		if ts == 0 || ts == 0xFFFFFFFF {
-			resp.Error = firstNonEmpty(resp.Error, "архив ИВК-ТЭР: прибор вернул маркер отсутствующей записи")
+			probeStepErrorText("F65 часовой архив", fmt.Sprintf("маркер отсутствующей записи 0x%08X; raw response=% X", ts, archiveResp))
 		} else {
-			resp.ArchiveInfo = "функция 65 отвечает, последняя запись: " + time.Unix(int64(ts), 0).Local().Format("02.01.2006 15:04:05")
-			resp.Steps = append(resp.Steps, "часовой архив функцией 65 читается")
+			archiveTime := time.Unix(int64(ts), 0).Local().Format("02.01.2006 15:04:05")
+			resp.ArchiveInfo = "функция 65 отвечает, последняя запись: " + archiveTime
+			probeStepOK(fmt.Sprintf("F65 часовой архив = %s, payload=% X", archiveTime, payload[:30]))
+			archiveOK = true
 		}
 	}
 
-	// Мгновенный расход оставляем дополнительной диагностикой, но он не
-	// определяет успех архивного шлюза.
-	if raw, err := reader.ReadRaw(probeCtx, "IR", 49204, "float"); err == nil {
-		if flow, err := codec.DecodeFloat32(raw, "0123"); err == nil {
-			resp.CurrentFlow = fmt.Sprintf("%.3f л/мин", flow)
-		}
+	// Текущий расход — только дополнительный proof-of-life. Его ошибка
+	// видна отдельно, но не отменяет успешную архивную функцию 65.
+	stageCtx, stageCancel = context.WithTimeout(probeCtx, stageTimeout)
+	rawFlow, flowErr := reader.ReadRaw(stageCtx, "IR", 49204, "float")
+	stageCancel()
+	if flowErr != nil {
+		probeStepError("IR 0xC034 current flow", flowErr)
+	} else if flow, err := codec.DecodeFloat32(rawFlow, "0123"); err != nil {
+		probeStepError("IR 0xC034 current flow decode", err)
+	} else {
+		resp.CurrentFlow = fmt.Sprintf("%.3f л/мин", flow)
+		probeStepOK(fmt.Sprintf("IR 0xC034 current flow = %s, raw=% X", resp.CurrentFlow, rawFlow))
 	}
 
-	if resp.SerialNumber == "" && resp.DeviceTime == "" && resp.ArchiveInfo == "" {
-		resp.OK = false
-		resp.Steps = append(resp.Steps, "прибор не отвечает на контрольные запросы")
-		resp.Error = firstNonEmpty(resp.Error, "соединение открыто, но ИВК-ТЭР не ответил ни на контрольные регистры, ни на архивную функцию 65")
+	resp.OK = archiveOK
+	closeTransport()
+	if !archiveOK {
+		appendError("КРИТИЧЕСКИЙ ИТОГ: часовой архив ИВК-ТЭР функцией 65 не прочитан")
+		resp.Steps = append(resp.Steps, "ИТОГ — ERROR: функция 65 не подтверждена")
+	} else if !resp.OK {
+		resp.Steps = append(resp.Steps, "ИТОГ — ERROR: архив прочитан, но транспорт не удалось штатно закрыть")
+	} else if resp.Error != "" {
+		resp.Steps = append(resp.Steps, "ИТОГ — OK: архив читается; есть дополнительные диагностические замечания выше")
+	} else {
+		resp.Steps = append(resp.Steps, "ИТОГ — OK: ИВК-ТЭР и часовой архив функции 65 подтверждены")
 	}
 	return
 }

@@ -2144,7 +2144,8 @@ function probeDevice() {
     try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('probeMsg', false, 'Ошибка ответа сервера'); return; }
     if (data.ok) {
       var text = '';
-      if (data.steps && data.steps.length) { text = data.steps.join(' → ') + '. '; }
+      if (data.steps && data.steps.length) { text = data.steps.join('\n'); }
+      if (text) { text += '\n\n'; }
       text += 'Прибор отвечает.';
       if (data.serial_number) { text += ' Заводской №: ' + data.serial_number + '.'; }
       if (data.firmware_info) { text += ' ' + data.firmware_info + '.'; }
@@ -2158,10 +2159,12 @@ function probeDevice() {
       if (data.mass_flow) { text += ' Массовый расход: ' + data.mass_flow + '.'; }
       if (data.current_flow) { text += ' Текущий расход: ' + data.current_flow + '.'; }
       if (data.archive_info) { text += ' Архив: ' + data.archive_info + '.'; }
+      if (data.error) { text += '\n\nДиагностические замечания: ' + data.error; }
       showMsg('probeMsg', true, text);
     } else {
       var errText = '';
-      if (data.steps && data.steps.length) { errText = data.steps.join(' → ') + '. '; }
+      if (data.steps && data.steps.length) { errText = data.steps.join('\n'); }
+      if (errText) { errText += '\n\n'; }
       errText += (data.error || 'Не удалось опросить прибор');
       showMsg('probeMsg', false, errText);
     }
