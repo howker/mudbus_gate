@@ -3,6 +3,7 @@ meta:
   model: "IVK-TER"
   profile_version: "1.0.0"
   protocol: "modbus"
+  archive_period_minutes: 60
   firmware_compat: ["*"]
   description: "ИВК-ТЭР: текущие значения, часы, заводской номер и часовой архив."
 transport:

@@ -224,7 +224,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <div class="form-row"><label>Порт</label><input id="d_port" type="text" value="502"></div>
       </div>
       <div id="serialFields">
-        <div class="form-row"><label>COM-порт</label><input id="d_com" type="text" placeholder="COM105"></div>
+        <div class="form-row"><label>Номер COM-порта</label><input id="d_com" type="number" min="1" max="255" step="1" placeholder="1"></div>
         <div class="form-row"><label>Скорость (бод)</label><input id="d_baudrate" type="text" value="9600"></div>
         <div class="form-row"><label>Чётность</label>
           <select id="d_parity"><option value="none">нет</option><option value="even">чётная</option><option value="odd">нечётная</option></select>
@@ -239,12 +239,23 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 
       <p><a href="#" onclick="toggleAdvanced(); return false;" style="color:#0e639c;font-size:13px;" id="advancedToggle">▸ Дополнительные настройки</a></p>
       <div id="advancedFields" style="display:none;">
-        <div class="form-row"><label>Опрос текущих (сек)</label><input id="d_current_poll_seconds" type="text" value="3600"></div>
-        <div class="form-row"><label>Глубина дозабора при старте (часов)</label><input id="d_backfill_max_depth_hours" type="text" value="0"></div>
-        <p class="small-note">Сколько часов назад искать и добирать пропуски при каждом запуске сервера. 0 — использовать значение по умолчанию (24ч для ВКМ). Если сервер может простаивать дольше суток (плановое обслуживание и т.п.) — увеличьте, например до 72-96, чтобы пропуски добирались автоматически при следующем старте, без ручного «Принудительного переопроса».</p>
-        <p class="small-note">Как часто опрашивать мгновенные показания (не архив). Раз в час обычно достаточно — этот шлюз собирает архив, не ведёт непрерывную телеметрию.</p>
-        <div class="form-row"><label>Опрос архива, минута после границы</label><input id="d_archive_at_minute" type="text" value="5"></div>
-        <p class="small-note">Через сколько минут ПОСЛЕ границы периода запрашивать архив (получасовки у ВКМ — в HH:05 и HH:35, часовки у Акрона и ИВК-ТЭР — в HH:05, при значении по умолчанию 5). Прибору нужно время, чтобы закрыть период и подготовить данные — опрос точно на самой границе (0) обычно даёт ещё не готовый или неполный результат. Значение видно и настраивается здесь же; фактическое следующее время опроса показывается на вкладке «Монитор опроса».</p>
+        <div class="form-row"><label>Глубина дозабора при старте (часов)</label><input id="d_backfill_max_depth_hours" type="number" min="0" step="1" value="0"></div>
+        <p class="small-note">Сколько часов назад искать и добирать пропуски при запуске сервера. 0 — использовать максимально доступную глубину архива, указанную профилем данного прибора.</p>
+        <div class="form-row"><label>Опрос каждые N периодов</label><input id="d_archive_every_periods" type="number" min="1" step="1" value="1"></div>
+        <p class="small-note">1 — опрашивать каждый архивный период прибора; 2 — каждый второй и т.д. Сам период (например 30 или 60 минут) задаётся профилем прибора.</p>
+        <div class="form-row"><label>Дни опроса</label><div style="flex:1">
+          <label><input class="d_sched_day" type="checkbox" value="1" checked> Пн</label>
+          <label><input class="d_sched_day" type="checkbox" value="2" checked> Вт</label>
+          <label><input class="d_sched_day" type="checkbox" value="4" checked> Ср</label>
+          <label><input class="d_sched_day" type="checkbox" value="8" checked> Чт</label>
+          <label><input class="d_sched_day" type="checkbox" value="16" checked> Пт</label>
+          <label><input class="d_sched_day" type="checkbox" value="32" checked> Сб</label>
+          <label><input class="d_sched_day" type="checkbox" value="64" checked> Вс</label>
+        </div></div>
+        <div class="form-row"><label>Разрешённое время суток</label><div style="flex:1"><input id="d_archive_window_start" type="time"> — <input id="d_archive_window_end" type="time"></div></div>
+        <p class="small-note">Оставьте оба поля пустыми для круглосуточного опроса. Интервал может переходить через полночь.</p>
+        <div class="form-row"><label>Сдвиг от границы периода (мин)</label><input id="d_archive_at_minute" type="number" min="0" max="59" step="1" value="5"></div>
+        <p class="small-note">Через сколько минут после границы архивного периода начинать штатный опрос. По умолчанию +5 минут. Следующее фактическое время показывается в «Мониторе опроса».</p>
 
         <div id="vkmTimeCorrectionFields" style="display:none;margin-top:18px;padding-top:12px;border-top:1px solid #3e3e42;">
           <p style="margin-top:0;color:#ffffff;font-size:13px;"><b>Коррекция времени ВКМ-360</b></p>
@@ -679,11 +690,31 @@ function floatOrOne(v) { var n = parseFloat(v); return isNaN(n) ? 1.0 : n; }
 // значение по умолчанию (не просто подсказка), так что эта проверка
 // нужна только для двух полей, для которых разумного значения по
 // умолчанию в принципе не бывает.
+function scheduleDaysMask() {
+  var els = document.getElementsByClassName('d_sched_day');
+  var mask = 0;
+  for (var i = 0; i < els.length; i++) { if (els[i].checked) { mask += parseInt(els[i].value, 10); } }
+  return mask;
+}
+
+function setScheduleDays(mask) {
+  var els = document.getElementsByClassName('d_sched_day');
+  for (var i = 0; i < els.length; i++) { els[i].checked = (mask & parseInt(els[i].value, 10)) !== 0; }
+}
+
+function validateScheduleFields(body) {
+  if (body.archive_every_periods < 1) { return 'Поле "Опрос каждые N периодов" должно быть не меньше 1'; }
+  if (body.archive_days_mask < 1) { return 'Выберите хотя бы один день опроса'; }
+  if (body.archive_at_minute < 0 || body.archive_at_minute > 59) { return 'Сдвиг от границы периода должен быть от 0 до 59 минут'; }
+  if ((body.archive_window_start && !body.archive_window_end) || (!body.archive_window_start && body.archive_window_end)) { return 'Для временного окна задайте и начало, и конец либо оставьте оба поля пустыми'; }
+  return '';
+}
+
 function validateTransportFields(body) {
   if (body.transport_kind === 'modbus_tcp') {
     if (!body.host) { return 'Заполните поле "IP-адрес"'; }
   } else {
-    if (!body.com) { return 'Заполните поле "COM-порт"'; }
+    if (!/^COM[1-9][0-9]{0,2}$/.test(body.com)) { return 'Введите только номер COM-порта, например 1 или 105'; }
   }
   return '';
 }
@@ -1533,19 +1564,17 @@ function loadPollMonitor() {
     var html = '';
     for (var j = 0; j < allDevices.length; j++) {
       var d = allDevices[j];
+      if (!d.enabled) { continue; }
       var st = byId[d.id] || {};
-      var active = !!d.enabled && !!st.poll_in_progress;
-      var statusTitle = active ? ('Сейчас выполняется: ' + pollKindLabel(st.poll_kind)) :
-        (d.enabled ? 'Сейчас прибор не опрашивается' : 'Прибор отключён');
+      var active = !!st.poll_in_progress;
+      var statusTitle = active ? ('Сейчас выполняется: ' + pollKindLabel(st.poll_kind)) : 'Сейчас прибор не опрашивается';
       var dot = '<span class="poll-dot' + (active ? ' active' : '') + '" title="' + statusTitle + '"></span>';
 
       var started = st.poll_started_at || '—';
-      var next = d.enabled ? (st.next_poll_at || 'ожидание расписания') : 'отключён';
+      var next = st.next_poll_at || 'ожидание расписания';
 
       var last;
-      if (!d.enabled) {
-        last = '<span>прибор отключён</span>';
-      } else if (!st.last_poll_known) {
+      if (!st.last_poll_known) {
         last = '<span>ещё нет завершённого планового опроса</span>';
       } else {
         var kind = pollKindLabel(st.last_poll_kind);
@@ -1929,15 +1958,19 @@ function editDevice(id) {
   document.getElementById('d_transport_kind').value = d.transport_kind;
   document.getElementById('d_host').value = d.host;
   document.getElementById('d_port').value = d.port || '';
-  document.getElementById('d_com').value = d.com;
+  var comMatch = String(d.com || '').toUpperCase().match(/^COM([0-9]+)$/);
+  document.getElementById('d_com').value = comMatch ? comMatch[1] : '';
   document.getElementById('d_baudrate').value = d.baudrate || '';
   document.getElementById('d_parity').value = d.parity || 'none';
   document.getElementById('d_stopbits').value = d.stopbits || '';
   document.getElementById('d_unit_id').value = d.unit_id || '';
   document.getElementById('d_timeout_ms').value = d.timeout_ms || '';
   document.getElementById('d_retries').value = d.retries || '3';
-  document.getElementById('d_current_poll_seconds').value = d.current_poll_seconds || '';
   document.getElementById('d_backfill_max_depth_hours').value = d.backfill_max_depth_hours || '0';
+  document.getElementById('d_archive_every_periods').value = d.archive_every_periods || '1';
+  setScheduleDays(d.archive_days_mask || 127);
+  document.getElementById('d_archive_window_start').value = d.archive_window_start || '';
+  document.getElementById('d_archive_window_end').value = d.archive_window_end || '';
   // archive_at_minute: -1 в БД означает "не задано явно" (сентинел, см.
   // internal/web/api_devices.go) — показываем оператору сразу
   // реальное действующее значение (5), а не сырое "-1", чтобы не
@@ -1973,8 +2006,11 @@ function resetDeviceForm() {
   document.getElementById('d_unit_id').value = '1';
   document.getElementById('d_timeout_ms').value = '1000';
   document.getElementById('d_retries').value = '3';
-  document.getElementById('d_current_poll_seconds').value = '3600';
   document.getElementById('d_backfill_max_depth_hours').value = '0';
+  document.getElementById('d_archive_every_periods').value = '1';
+  setScheduleDays(127);
+  document.getElementById('d_archive_window_start').value = '';
+  document.getElementById('d_archive_window_end').value = '';
   document.getElementById('d_archive_at_minute').value = '5';
   document.getElementById('d_time_correction_deadband_seconds').value = '0';
   document.getElementById('d_time_correction_max_step_seconds').value = '0';
@@ -1996,14 +2032,14 @@ function currentDeviceFormAsJSON() {
     transport_kind: document.getElementById('d_transport_kind').value,
     host: document.getElementById('d_host').value,
     port: intOrZero(document.getElementById('d_port').value),
-    com: document.getElementById('d_com').value,
+    com: document.getElementById('d_transport_kind').value === 'modbus_tcp' ? '' : ('COM' + document.getElementById('d_com').value),
     baudrate: intOrZero(document.getElementById('d_baudrate').value),
     parity: document.getElementById('d_parity').value,
     stopbits: intOrZero(document.getElementById('d_stopbits').value),
     timeout_ms: intOrZero(document.getElementById('d_timeout_ms').value),
     unit_id: intOrZero(document.getElementById('d_unit_id').value),
     retries: intOrZero(document.getElementById('d_retries').value),
-    current_poll_seconds: intOrZero(document.getElementById('d_current_poll_seconds').value),
+    current_poll_seconds: 0,
     backfill_max_depth_hours: intOrZero(document.getElementById('d_backfill_max_depth_hours').value),
     // gap_scan_window_hours раньше было жёстко захардкожено в 0 —
     // означало, что ПОСТОЯННОЕ самозалечивание пропусков (после каждого
@@ -2030,6 +2066,10 @@ function currentDeviceFormAsJSON() {
     // (см. HTML value="5"), так что для типового случая оператору
     // ничего менять не нужно — то же самое поведение, что и раньше.
     archive_at_minute: intOrZero(document.getElementById('d_archive_at_minute').value),
+    archive_every_periods: intOrZero(document.getElementById('d_archive_every_periods').value) || 1,
+    archive_days_mask: scheduleDaysMask(),
+    archive_window_start: document.getElementById('d_archive_window_start').value,
+    archive_window_end: document.getElementById('d_archive_window_end').value,
     time_correction_deadband_seconds: isVKM ? intOrZero(document.getElementById('d_time_correction_deadband_seconds').value) : 0,
     time_correction_max_step_seconds: isVKM ? intOrZero(document.getElementById('d_time_correction_max_step_seconds').value) : 0,
     time_correction_daily_limit_seconds: isVKM ? intOrZero(document.getElementById('d_time_correction_daily_limit_seconds').value) : 0,
@@ -2056,6 +2096,8 @@ function saveDevice() {
   }
   var validationErr = validateTransportFields(body);
   if (validationErr) { showMsg('deviceMsg', false, validationErr); return; }
+  var scheduleErr = validateScheduleFields(body);
+  if (scheduleErr) { showMsg('deviceMsg', false, scheduleErr); return; }
   var timeCorrectionErr = validateTimeCorrectionFields(body);
   if (timeCorrectionErr) { showMsg('deviceMsg', false, timeCorrectionErr); return; }
   var xhr = new XMLHttpRequest();
@@ -2092,6 +2134,7 @@ function probeDevice() {
   document.getElementById('probeMsg').className = 'msg';
   var validationErr = validateTransportFields(body);
   if (validationErr) { showMsg('probeMsg', false, validationErr); return; }
+  showMsg('probeMsg', true, 'Открываю порт/соединение и начинаю опрос прибора...');
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/devices/probe', true);
   xhr.setRequestHeader('Content-Type', 'application/json');
@@ -2100,7 +2143,9 @@ function probeDevice() {
     var data;
     try { data = JSON.parse(xhr.responseText); } catch (e) { showMsg('probeMsg', false, 'Ошибка ответа сервера'); return; }
     if (data.ok) {
-      var text = 'Прибор отвечает.';
+      var text = '';
+      if (data.steps && data.steps.length) { text = data.steps.join(' → ') + '. '; }
+      text += 'Прибор отвечает.';
       if (data.serial_number) { text += ' Заводской №: ' + data.serial_number + '.'; }
       if (data.firmware_info) { text += ' ' + data.firmware_info + '.'; }
       if (data.device_time) { text += ' Время прибора: ' + data.device_time + '.'; }
@@ -2112,9 +2157,13 @@ function probeDevice() {
       if (data.temperature) { text += ' Температура: ' + data.temperature + '.'; }
       if (data.mass_flow) { text += ' Массовый расход: ' + data.mass_flow + '.'; }
       if (data.current_flow) { text += ' Текущий расход: ' + data.current_flow + '.'; }
+      if (data.archive_info) { text += ' Архив: ' + data.archive_info + '.'; }
       showMsg('probeMsg', true, text);
     } else {
-      showMsg('probeMsg', false, data.error || 'Не удалось опросить прибор');
+      var errText = '';
+      if (data.steps && data.steps.length) { errText = data.steps.join(' → ') + '. '; }
+      errText += (data.error || 'Не удалось опросить прибор');
+      showMsg('probeMsg', false, errText);
     }
   };
   xhr.send(JSON.stringify(body));

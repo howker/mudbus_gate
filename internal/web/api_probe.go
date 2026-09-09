@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"mbgw/internal/codec"
 	"mbgw/internal/pollcore"
 	"mbgw/internal/protocol/akron"
+	"mbgw/internal/protocol/modbus"
 	"mbgw/internal/session"
 	"mbgw/internal/transport"
 )
@@ -72,10 +74,12 @@ type probeResponse struct {
 	// Не обязательные (omitempty) — пустая строка означает "этот
 	// конкретный регистр не прочитался", а не ошибку всего пробника
 	// целиком (частичный успех допустим и полезен оператору).
-	Pressure    string `json:"pressure,omitempty"`
-	Temperature string `json:"temperature,omitempty"`
-	MassFlow    string `json:"mass_flow,omitempty"`
-	CurrentFlow string `json:"current_flow,omitempty"`
+	Pressure    string   `json:"pressure,omitempty"`
+	Temperature string   `json:"temperature,omitempty"`
+	MassFlow    string   `json:"mass_flow,omitempty"`
+	CurrentFlow string   `json:"current_flow,omitempty"`
+	ArchiveInfo string   `json:"archive_info,omitempty"`
+	Steps       []string `json:"steps,omitempty"`
 }
 
 func (s *Server) handleDeviceProbe(w http.ResponseWriter, r *http.Request) {
@@ -349,7 +353,7 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 // (IR 0x8000, uint32 Unix) и текущий расход (IR 0xC034, float).
 // Все три регистра доступны на чтение в рабочем режиме; установка времени
 // здесь намеренно отсутствует — HR 0x8000 требует сервисного режима прибора.
-func probeIVKTER(ctx context.Context, req probeRequest) probeResponse {
+func probeIVKTER(ctx context.Context, req probeRequest) (resp probeResponse) {
 	timeoutMs := req.TimeoutMs
 	if timeoutMs <= 0 {
 		timeoutMs = 1000
@@ -359,16 +363,27 @@ func probeIVKTER(ctx context.Context, req probeRequest) probeResponse {
 		Baudrate: req.Baudrate, Parity: req.Parity, StopBits: req.StopBits,
 		ResponseTimeout: time.Duration(timeoutMs) * time.Millisecond, Retries: 3,
 	}
+	resp.Steps = append(resp.Steps, "создаю транспорт")
 	tr, err := transport.New(trParams)
 	if err != nil {
-		return probeResponse{OK: false, Error: "не удалось создать транспорт: " + err.Error()}
+		resp.Error = "не удалось создать транспорт: " + err.Error()
+		return
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	probeCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	defer cancel()
 	if err := tr.Open(probeCtx); err != nil {
-		return probeResponse{OK: false, Error: "не удалось открыть соединение: " + err.Error()}
+		resp.Error = "не удалось открыть соединение: " + err.Error()
+		resp.Steps = append(resp.Steps, "порт/соединение не открыто")
+		return
 	}
-	defer tr.Close()
+	resp.Steps = append(resp.Steps, "порт/соединение открыто")
+	defer func() {
+		if err := tr.Close(); err != nil {
+			resp.Steps = append(resp.Steps, "ошибка закрытия порта: "+err.Error())
+		} else {
+			resp.Steps = append(resp.Steps, "порт/соединение закрыто")
+		}
+	}()
 
 	isTCP := req.TransportKind == "modbus_tcp"
 	unitID := req.UnitID
@@ -376,7 +391,8 @@ func probeIVKTER(ctx context.Context, req probeRequest) probeResponse {
 		unitID = 1
 	}
 	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), pollcore.PhysicalIOLockKey(trParams, req.ID))
-	resp := probeResponse{OK: true}
+	resp.OK = true
+	resp.Steps = append(resp.Steps, fmt.Sprintf("начат опрос ИВК-ТЭР, Modbus-адрес %d", unitID))
 
 	if raw, err := reader.ReadRaw(probeCtx, "IR", 32770, "uint32"); err != nil {
 		resp.Error = firstNonEmpty(resp.Error, "серийный номер (IR 0x8002): "+err.Error())
@@ -386,6 +402,7 @@ func probeIVKTER(ctx context.Context, req probeRequest) probeResponse {
 		resp.Error = firstNonEmpty(resp.Error, fmt.Sprintf("некорректный серийный номер: %d", serial))
 	} else {
 		resp.SerialNumber = fmt.Sprintf("%d", serial)
+		resp.Steps = append(resp.Steps, "прибор ответил: серийный номер прочитан")
 	}
 
 	if raw, err := reader.ReadRaw(probeCtx, "IR", 32768, "uint32"); err != nil {
@@ -396,21 +413,43 @@ func probeIVKTER(ctx context.Context, req probeRequest) probeResponse {
 		resp.Error = firstNonEmpty(resp.Error, "прибор вернул некорректное значение времени")
 	} else {
 		resp.DeviceTime = time.Unix(int64(seconds), 0).Local().Format("02.01.2006 15:04:05")
+		resp.Steps = append(resp.Steps, "часы прибора прочитаны")
 	}
 
-	if raw, err := reader.ReadRaw(probeCtx, "IR", 49204, "float"); err != nil {
-		resp.Error = firstNonEmpty(resp.Error, "текущий расход (IR 0xC034): "+err.Error())
-	} else if flow, err := codec.DecodeFloat32(raw, "0123"); err != nil {
-		resp.Error = firstNonEmpty(resp.Error, "разбор текущего расхода: "+err.Error())
+	// Критическая часть проверки ИВК-ТЭР: читаем вершину часового архива
+	// той же функцией 65 (0x41), которую использует боевой PollArchives.
+	resp.Steps = append(resp.Steps, "проверяю часовой архив функцией 65")
+	archiveResp, archiveErr := reader.Transact(probeCtx, modbus.BuildArchive65IndexPDU(0, 1, 0))
+	if archiveErr != nil {
+		resp.Error = firstNonEmpty(resp.Error, "архив ИВК-ТЭР (функция 65): "+archiveErr.Error())
+	} else if payload, err := modbus.ParseArchive65Response(archiveResp); err != nil {
+		resp.Error = firstNonEmpty(resp.Error, "разбор архива ИВК-ТЭР (функция 65): "+err.Error())
+	} else if len(payload) < 30 {
+		resp.Error = firstNonEmpty(resp.Error, fmt.Sprintf("архив ИВК-ТЭР: короткая запись %d байт, ожидается 30", len(payload)))
 	} else {
-		resp.CurrentFlow = fmt.Sprintf("%.3f л/мин", flow)
+		ts := binary.BigEndian.Uint32(payload[:4])
+		if ts == 0 || ts == 0xFFFFFFFF {
+			resp.Error = firstNonEmpty(resp.Error, "архив ИВК-ТЭР: прибор вернул маркер отсутствующей записи")
+		} else {
+			resp.ArchiveInfo = "функция 65 отвечает, последняя запись: " + time.Unix(int64(ts), 0).Local().Format("02.01.2006 15:04:05")
+			resp.Steps = append(resp.Steps, "часовой архив функцией 65 читается")
+		}
 	}
 
-	if resp.SerialNumber == "" && resp.DeviceTime == "" && resp.CurrentFlow == "" {
-		resp.OK = false
-		resp.Error = firstNonEmpty(resp.Error, "соединение открыто, но ни один контрольный регистр ИВК-ТЭР не прочитан")
+	// Мгновенный расход оставляем дополнительной диагностикой, но он не
+	// определяет успех архивного шлюза.
+	if raw, err := reader.ReadRaw(probeCtx, "IR", 49204, "float"); err == nil {
+		if flow, err := codec.DecodeFloat32(raw, "0123"); err == nil {
+			resp.CurrentFlow = fmt.Sprintf("%.3f л/мин", flow)
+		}
 	}
-	return resp
+
+	if resp.SerialNumber == "" && resp.DeviceTime == "" && resp.ArchiveInfo == "" {
+		resp.OK = false
+		resp.Steps = append(resp.Steps, "прибор не отвечает на контрольные запросы")
+		resp.Error = firstNonEmpty(resp.Error, "соединение открыто, но ИВК-ТЭР не ответил ни на контрольные регистры, ни на архивную функцию 65")
+	}
+	return
 }
 
 func decodeProbeVKMClockResponse(resp []byte, loc *time.Location) (time.Time, error) {

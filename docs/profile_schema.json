@@ -16,6 +16,7 @@
         "model": { "type": "string" },
         "profile_version": { "type": "string" },
         "protocol": { "type": "string", "enum": ["modbus", "merkuriy"] },
+        "archive_period_minutes": { "type": "integer", "minimum": 0, "maximum": 1440 },
         "firmware_compat": { "type": "array", "items": { "type": "string" } },
         "description": { "type": "string" }
       }

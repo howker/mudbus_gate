@@ -45,6 +45,21 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 	drifts := devicestatus.All()
 	corrections := devicestatus.AllCorrections()
 
+	// Показываем только реально включённые приборы. Runtime-кэши могут
+	// содержать старые статусы после отключения прибора, поэтому фильтр
+	// делается на сервере по конфигурационной БД, а не только в JavaScript.
+	configured, err := s.repo.ListDevices(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "не удалось прочитать список приборов: "+err.Error())
+		return
+	}
+	enabled := make(map[string]bool, len(configured))
+	for _, d := range configured {
+		if d.Enabled {
+			enabled[d.ID] = true
+		}
+	}
+
 	type reloadSnapshot struct {
 		startedAt  time.Time
 		finishedAt time.Time
@@ -62,17 +77,28 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 	s.reloadJobsMu.Unlock()
 
 	idSet := make(map[string]bool)
-	for id := range snapshot.Devices {
+	for id := range enabled {
 		idSet[id] = true
+	}
+	for id := range snapshot.Devices {
+		if enabled[id] {
+			idSet[id] = true
+		}
 	}
 	for id := range reloads {
-		idSet[id] = true
+		if enabled[id] {
+			idSet[id] = true
+		}
 	}
 	for id := range drifts {
-		idSet[id] = true
+		if enabled[id] {
+			idSet[id] = true
+		}
 	}
 	for id := range corrections {
-		idSet[id] = true
+		if enabled[id] {
+			idSet[id] = true
+		}
 	}
 	ids := make([]string, 0, len(idSet))
 	for id := range idSet {

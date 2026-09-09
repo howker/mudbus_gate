@@ -390,3 +390,67 @@ func TestManualCurrentQueuedBeforeBackfillKeepsFIFOOrder(t *testing.T) {
 		t.Fatalf("startup-backfill должен идти вторым, получено %+v (ok=%v)", second, ok)
 	}
 }
+
+func TestScheduler_ArchiveCalendar_WaitsForNextBoundaryAfterStartup(t *testing.T) {
+	s := New(nil)
+	s.RegisterArchiveCalendar("dev1", time.Hour, 1, 0x7f, nil, 5)
+
+	now := time.Date(2026, 9, 9, 12, 20, 0, 0, time.Local)
+	s.Tick(now)
+	if s.Len() != 0 {
+		t.Fatalf("regular archive poll must not run immediately at startup, queue=%d", s.Len())
+	}
+	next, ok := s.NextPollAt("dev1")
+	want := time.Date(2026, 9, 9, 13, 5, 0, 0, time.Local)
+	if !ok || !next.Equal(want) {
+		t.Fatalf("next=%v ok=%v, want %v", next, ok, want)
+	}
+
+	s.Tick(want)
+	task, ok := s.Next()
+	if !ok || task.Kind != KindArchive || task.DeviceID != "dev1" {
+		t.Fatalf("expected archive task at %v, got %+v ok=%v", want, task, ok)
+	}
+}
+
+func TestScheduler_ArchiveCalendar_HalfHourProfile(t *testing.T) {
+	s := New(nil)
+	s.RegisterArchiveCalendar("vkm", 30*time.Minute, 1, 0x7f, nil, 5)
+	now := time.Date(2026, 9, 9, 12, 20, 0, 0, time.Local)
+	s.Tick(now)
+	next, _ := s.NextPollAt("vkm")
+	want := time.Date(2026, 9, 9, 12, 35, 0, 0, time.Local)
+	if !next.Equal(want) {
+		t.Fatalf("next=%v, want %v", next, want)
+	}
+}
+
+func TestScheduler_ArchiveCalendar_EveryTwoPeriodsStableAcrossRestart(t *testing.T) {
+	for _, now := range []time.Time{
+		time.Date(2026, 9, 9, 12, 20, 0, 0, time.Local),
+		time.Date(2026, 9, 9, 13, 20, 0, 0, time.Local),
+	} {
+		s := New(nil)
+		s.RegisterArchiveCalendar("dev1", time.Hour, 2, 0x7f, nil, 5)
+		s.Tick(now)
+		next, _ := s.NextPollAt("dev1")
+		want := time.Date(2026, 9, 9, 14, 5, 0, 0, time.Local)
+		if !next.Equal(want) {
+			t.Fatalf("restart at %v shifted cadence: next=%v, want %v", now, next, want)
+		}
+	}
+}
+
+func TestScheduler_ArchiveCalendar_RespectsDaysAndWindow(t *testing.T) {
+	s := New(nil)
+	win := &Window{StartHour: 13, StartMinute: 0, EndHour: 15, EndMinute: 0}
+	const thursdayOnly = 1 << 3 // Monday bit0
+	s.RegisterArchiveCalendar("dev1", time.Hour, 1, thursdayOnly, win, 5)
+	now := time.Date(2026, 9, 9, 12, 20, 0, 0, time.Local) // Wednesday
+	s.Tick(now)
+	next, _ := s.NextPollAt("dev1")
+	want := time.Date(2026, 9, 10, 13, 5, 0, 0, time.Local)
+	if !next.Equal(want) {
+		t.Fatalf("next=%v, want %v", next, want)
+	}
+}

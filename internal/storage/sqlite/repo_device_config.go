@@ -57,7 +57,11 @@ CREATE TABLE IF NOT EXISTS devices (
     current_poll_seconds     INTEGER NOT NULL DEFAULT 0,   -- 0 -> config.CurrentPollDefault
     backfill_max_depth_hours INTEGER NOT NULL DEFAULT 0,   -- 0 -> "variant В" (fill everything missing)
     gap_scan_window_hours    INTEGER NOT NULL DEFAULT 0,   -- 0 -> config.GapScanDefault
-    archive_at_minute        INTEGER NOT NULL DEFAULT -1,  -- -1 sentinel = "unset" -> config.ArchiveAtMinuteDefault
+    archive_at_minute        INTEGER NOT NULL DEFAULT -1,  -- -1 sentinel = "unset" -> default +5 minutes
+    archive_every_periods    INTEGER NOT NULL DEFAULT 1,   -- 1 = every archive period from the profile
+    archive_days_mask        INTEGER NOT NULL DEFAULT 127, -- bit0=Mon ... bit6=Sun
+    archive_window_start     TEXT NOT NULL DEFAULT '',     -- HH:MM, empty = no daily window
+    archive_window_end       TEXT NOT NULL DEFAULT '',     -- HH:MM, empty = no daily window
     time_correction_deadband_seconds INTEGER NOT NULL DEFAULT 0, -- 0 = автокоррекция выключена
     time_correction_max_step_seconds INTEGER NOT NULL DEFAULT 0, -- 1..99 сек; 0 = автокоррекция выключена
     time_correction_daily_limit_seconds INTEGER NOT NULL DEFAULT 0, -- суммарный модуль коррекций за скользящие 24ч; 0 = автокоррекция выключена
@@ -138,6 +142,10 @@ CREATE TABLE IF NOT EXISTS es_akron_northbound (
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN time_correction_deadband_seconds INTEGER NOT NULL DEFAULT 0`)
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN time_correction_max_step_seconds INTEGER NOT NULL DEFAULT 0`)
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN time_correction_daily_limit_seconds INTEGER NOT NULL DEFAULT 0`)
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN archive_every_periods INTEGER NOT NULL DEFAULT 1`)
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN archive_days_mask INTEGER NOT NULL DEFAULT 127`)
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN archive_window_start TEXT NOT NULL DEFAULT ''`)
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN archive_window_end TEXT NOT NULL DEFAULT ''`)
 
 	// Та же лёгкая миграция для es_connection, добавленного позже
 	// (сдвиг времени при записи в Mains) — ошибка "duplicate column
@@ -176,7 +184,11 @@ type DeviceRecord struct {
 	CurrentPollSeconds    int
 	BackfillMaxDepthHours int
 	GapScanWindowHours    int
-	ArchiveAtMinute       int // -1 = unset, matches BackfillConfig.ArchiveAtMinute's *int nil sentinel
+	ArchiveAtMinute       int // offset in minutes from the archive-period boundary
+	ArchiveEveryPeriods   int
+	ArchiveDaysMask       int
+	ArchiveWindowStart    string // HH:MM; both window fields empty = all day
+	ArchiveWindowEnd      string
 	// VKM clock auto-correction safety settings. All three must be > 0
 	// for automatic correction to be enabled. MaxStepSeconds is additionally
 	// capped by the device/protocol limit of 99 seconds by the caller.
@@ -200,6 +212,21 @@ func (r *Repo) UpsertDevice(ctx context.Context, d DeviceRecord) error {
 	if d.TimeCorrectionDailyLimitSeconds < 0 {
 		return fmt.Errorf("лимит коррекции времени за 24 часа не может быть отрицательным")
 	}
+	if d.ArchiveAtMinute < -1 || d.ArchiveAtMinute > 59 {
+		return fmt.Errorf("сдвиг архивного опроса должен быть -1 (по умолчанию) либо 0..59 минут")
+	}
+	if d.ArchiveEveryPeriods <= 0 {
+		d.ArchiveEveryPeriods = 1
+	}
+	if d.ArchiveDaysMask == 0 {
+		d.ArchiveDaysMask = 127
+	}
+	if d.ArchiveDaysMask < 1 || d.ArchiveDaysMask > 127 {
+		return fmt.Errorf("маска дней архивного опроса должна быть в диапазоне 1..127")
+	}
+	if (d.ArchiveWindowStart == "") != (d.ArchiveWindowEnd == "") {
+		return fmt.Errorf("начало и конец окна архивного опроса должны быть заданы вместе")
+	}
 
 	now := time.Now()
 	enabled := 0
@@ -211,9 +238,10 @@ INSERT INTO devices (
     id, name, kind, profile, transport_kind, host, port, com, baudrate,
     parity, stopbits, timeout_ms, unit_id, retries, current_poll_seconds,
     backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
+    archive_every_periods, archive_days_mask, archive_window_start, archive_window_end,
     time_correction_deadband_seconds, time_correction_max_step_seconds,
     time_correction_daily_limit_seconds, enabled, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
     name = excluded.name,
     kind = excluded.kind,
@@ -232,6 +260,10 @@ ON CONFLICT(id) DO UPDATE SET
     backfill_max_depth_hours = excluded.backfill_max_depth_hours,
     gap_scan_window_hours = excluded.gap_scan_window_hours,
     archive_at_minute = excluded.archive_at_minute,
+    archive_every_periods = excluded.archive_every_periods,
+    archive_days_mask = excluded.archive_days_mask,
+    archive_window_start = excluded.archive_window_start,
+    archive_window_end = excluded.archive_window_end,
     time_correction_deadband_seconds = excluded.time_correction_deadband_seconds,
     time_correction_max_step_seconds = excluded.time_correction_max_step_seconds,
     time_correction_daily_limit_seconds = excluded.time_correction_daily_limit_seconds,
@@ -240,6 +272,7 @@ ON CONFLICT(id) DO UPDATE SET
 `, d.ID, d.Name, d.Kind, d.Profile, d.TransportKind, d.Host, d.Port, d.COM,
 		d.Baudrate, d.Parity, d.StopBits, d.TimeoutMs, d.UnitID, d.Retries, d.CurrentPollSeconds,
 		d.BackfillMaxDepthHours, d.GapScanWindowHours, d.ArchiveAtMinute,
+		d.ArchiveEveryPeriods, d.ArchiveDaysMask, d.ArchiveWindowStart, d.ArchiveWindowEnd,
 		d.TimeCorrectionDeadbandSeconds, d.TimeCorrectionMaxStepSeconds, d.TimeCorrectionDailyLimitSeconds,
 		enabled, now, now)
 	if err != nil {
@@ -257,6 +290,7 @@ func (r *Repo) ListDevices(ctx context.Context) ([]DeviceRecord, error) {
 SELECT id, name, kind, profile, transport_kind, host, port, com, baudrate,
        parity, stopbits, timeout_ms, unit_id, retries, current_poll_seconds,
        backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
+       archive_every_periods, archive_days_mask, archive_window_start, archive_window_end,
        time_correction_deadband_seconds, time_correction_max_step_seconds,
        time_correction_daily_limit_seconds, enabled
 FROM devices ORDER BY id
@@ -273,7 +307,8 @@ FROM devices ORDER BY id
 		if err := rows.Scan(&d.ID, &d.Name, &d.Kind, &d.Profile, &d.TransportKind,
 			&d.Host, &d.Port, &d.COM, &d.Baudrate, &d.Parity, &d.StopBits,
 			&d.TimeoutMs, &d.UnitID, &d.Retries, &d.CurrentPollSeconds, &d.BackfillMaxDepthHours,
-			&d.GapScanWindowHours, &d.ArchiveAtMinute, &d.TimeCorrectionDeadbandSeconds,
+			&d.GapScanWindowHours, &d.ArchiveAtMinute, &d.ArchiveEveryPeriods, &d.ArchiveDaysMask,
+			&d.ArchiveWindowStart, &d.ArchiveWindowEnd, &d.TimeCorrectionDeadbandSeconds,
 			&d.TimeCorrectionMaxStepSeconds, &d.TimeCorrectionDailyLimitSeconds, &enabled); err != nil {
 			return nil, fmt.Errorf("scan device: %w", err)
 		}
@@ -292,13 +327,15 @@ func (r *Repo) GetDevice(ctx context.Context, id string) (DeviceRecord, bool, er
 SELECT id, name, kind, profile, transport_kind, host, port, com, baudrate,
        parity, stopbits, timeout_ms, unit_id, retries, current_poll_seconds,
        backfill_max_depth_hours, gap_scan_window_hours, archive_at_minute,
+       archive_every_periods, archive_days_mask, archive_window_start, archive_window_end,
        time_correction_deadband_seconds, time_correction_max_step_seconds,
        time_correction_daily_limit_seconds, enabled
 FROM devices WHERE id = ?
 `, id).Scan(&d.ID, &d.Name, &d.Kind, &d.Profile, &d.TransportKind,
 		&d.Host, &d.Port, &d.COM, &d.Baudrate, &d.Parity, &d.StopBits,
 		&d.TimeoutMs, &d.UnitID, &d.Retries, &d.CurrentPollSeconds, &d.BackfillMaxDepthHours,
-		&d.GapScanWindowHours, &d.ArchiveAtMinute, &d.TimeCorrectionDeadbandSeconds,
+		&d.GapScanWindowHours, &d.ArchiveAtMinute, &d.ArchiveEveryPeriods, &d.ArchiveDaysMask,
+		&d.ArchiveWindowStart, &d.ArchiveWindowEnd, &d.TimeCorrectionDeadbandSeconds,
 		&d.TimeCorrectionMaxStepSeconds, &d.TimeCorrectionDailyLimitSeconds, &enabled)
 	if err == sql.ErrNoRows {
 		return DeviceRecord{}, false, nil

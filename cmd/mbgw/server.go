@@ -669,7 +669,6 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 
 		log.Printf("[WEB] ручной опрос запрошен для %d прибор(ов)\n", len(snapshot))
 		for id, d := range snapshot {
-			sched.RequestManualPoll(id, scheduler.KindCurrent)
 			if len(d.Profile.Archives) > 0 {
 				sched.RequestManualPoll(id, scheduler.KindBackfill)
 			}
@@ -943,6 +942,31 @@ func deviceKindLabelRU(kind string) string {
 	}
 }
 
+func archiveScheduleWindow(start, end string) (*scheduler.Window, error) {
+	if start == "" && end == "" {
+		return nil, nil
+	}
+	if start == "" || end == "" {
+		return nil, fmt.Errorf("начало и конец окна должны быть заданы вместе")
+	}
+	parse := func(v string) (int, int, error) {
+		t, err := time.Parse("15:04", v)
+		if err != nil {
+			return 0, 0, err
+		}
+		return t.Hour(), t.Minute(), nil
+	}
+	sh, sm, err := parse(start)
+	if err != nil {
+		return nil, fmt.Errorf("начало %q: %w", start, err)
+	}
+	eh, em, err := parse(end)
+	if err != nil {
+		return nil, fmt.Errorf("конец %q: %w", end, err)
+	}
+	return &scheduler.Window{StartHour: sh, StartMinute: sm, EndHour: eh, EndMinute: em}, nil
+}
+
 func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqliterepo.DeviceRecord, leaseMgr *lease.LocalLease, sched *scheduler.Scheduler, dbPath string, devicesMu *sync.Mutex, devices map[string]*device.Device, deviceKinds map[string]string, esSyncTriggers map[string]chan struct{}, transports *transportRegistry) {
 	profilePath := profilePathNextToExe(devRec.Profile)
 	p, err := profile.Parse(profilePath)
@@ -1072,54 +1096,42 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	deviceKinds[devRec.ID] = devRec.Kind
 	devicesMu.Unlock()
 
-	// Интервал опроса архива зависит от того, КАК прибор сам делит
-	// свой архив на записи — не универсальная константа. ВКМ360
-	// физически отдаёт получасовки (см. vkm_hourly.go, vkmArchivePeriod);
-	// опрос раз в час (как для Akron, у которого архив честно
-	// часовой) СИСТЕМАТИЧЕСКИ терял каждую вторую получасовку — на
-	// каждом часовом тике pollVKMHourlyLatest видит только ОДНУ,
-	// последнюю завершённую получасовку, а не обе, что успели
-	// закрыться с прошлого тика. Подтверждено живьём (2026-08-25):
-	// час опроса ловил стабильно только записи на ":30", записи на
-	// ":00" не собирались НИКОГДА обычным циклом (только дозабором
-	// при старте) — а прибор, судя по всему, копит показания между
-	// успешными опросами, из-за чего следующая пойманная получасовка
-	// выходила завышенной (несла в себе накопленное за оба
-	// пропущенных получаса), а не только за свои 30 минут.
-	archiveInterval := time.Duration(0)
+	// Базовый архивный период теперь является свойством ПРОФИЛЯ прибора,
+	// а не switch по kind. Это важно для зоопарка: новый профиль сам
+	// объявляет 15/30/60-минутный период и не требует правки server.go.
+	archivePeriod := time.Duration(0)
 	if len(p.Archives) > 0 {
-		if devRec.Kind == "vkm360" {
-			archiveInterval = 30 * time.Minute
-		} else {
-			archiveInterval = 1 * time.Hour
-		}
-	}
-	currentInterval := time.Duration(devRec.CurrentPollSeconds) * time.Second
-	if devRec.CurrentPollSeconds <= 0 {
-		currentInterval = 3600 * time.Second
+		archivePeriod = p.ArchivePeriod()
 	}
 	archiveAtMinute := devRec.ArchiveAtMinute
 	if archiveAtMinute < 0 {
 		archiveAtMinute = 5
 	}
-	sched.RegisterWithArchiveAnchor(devRec.ID, currentInterval, archiveInterval, nil, archiveAtMinute)
-	log.Printf("[OK] прибор %s (%s) зарегистрирован (текущие каждые %s, архив каждые %s в HH:%02d)\n",
-		devRec.ID, deviceKindLabelRU(devRec.Kind), currentInterval, archiveInterval, archiveAtMinute)
+	archiveEvery := devRec.ArchiveEveryPeriods
+	if archiveEvery <= 0 {
+		archiveEvery = 1
+	}
+	archiveDaysMask := uint8(devRec.ArchiveDaysMask)
+	if archiveDaysMask == 0 {
+		archiveDaysMask = 0x7f
+	}
+	archiveWindow, windowErr := archiveScheduleWindow(devRec.ArchiveWindowStart, devRec.ArchiveWindowEnd)
+	if windowErr != nil {
+		log.Printf("[ERROR] прибор %s: некорректное окно архивного опроса: %v\n", devRec.ID, windowErr)
+		return
+	}
+	if archivePeriod > 0 {
+		sched.RegisterArchiveCalendar(devRec.ID, archivePeriod, archiveEvery, archiveDaysMask, archiveWindow, archiveAtMinute)
+	}
+	log.Printf("[OK] прибор %s (%s) зарегистрирован (архив: период=%s, каждые %d период(а), сдвиг +%d мин, дни=0x%02X)\n",
+		devRec.ID, deviceKindLabelRU(devRec.Kind), archivePeriod, archiveEvery, archiveAtMinute, archiveDaysMask)
 
-	// Сразу после регистрации сначала ставим текущий опрос с высоким
-	// приоритетом. Это важно после простоя/возврата прибора в сеть: оператор
-	// должен сразу увидеть, отвечает ли прибор и как расходятся его часы,
-	// а не ждать окончания глубокого стартового дозабора.
-	sched.RequestManualPoll(devRec.ID, scheduler.KindCurrent)
-	log.Printf("[ИНФО] прибор %s: первичная проверка текущих данных поставлена в очередь\n", devRec.ID)
-
-	// Стартовый дозабор идёт ВТОРЫМ заданием того же приоритета. Scheduler
-	// сохраняет FIFO для равного приоритета, поэтому current гарантированно
-	// начнётся раньше backfill, но оба по-прежнему сериализованы для одного
-	// прибора и не мешают параллельной работе других приборов.
+	// Startup-backfill — отдельная операция восстановления пропусков и
+	// поэтому запускается сразу. Регулярный архивный опрос НЕ ставится
+	// "сейчас": Scheduler ждёт ближайшую разрешённую календарную границу.
 	if len(p.Archives) > 0 {
 		sched.RequestManualPoll(devRec.ID, scheduler.KindBackfill)
-		log.Printf("[ИНФО] прибор %s: стартовый дозабор поставлен в очередь после первичной проверки\n", devRec.ID)
+		log.Printf("[ИНФО] прибор %s: стартовый дозабор поставлен в очередь; следующий штатный опрос — по календарному расписанию\n", devRec.ID)
 	}
 
 	// Upstream delivery: both VKM and Akron use the same direct write

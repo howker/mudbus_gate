@@ -3,6 +3,7 @@ package profile
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -20,12 +21,13 @@ type Profile struct {
 }
 
 type Meta struct {
-	Vendor         string   `yaml:"vendor"`
-	Model          string   `yaml:"model"`
-	ProfileVersion string   `yaml:"profile_version"`
-	Protocol       string   `yaml:"protocol"`
-	FirmwareCompat []string `yaml:"firmware_compat"`
-	Description    string   `yaml:"description"`
+	Vendor               string   `yaml:"vendor"`
+	Model                string   `yaml:"model"`
+	ProfileVersion       string   `yaml:"profile_version"`
+	Protocol             string   `yaml:"protocol"`
+	FirmwareCompat       []string `yaml:"firmware_compat"`
+	Description          string   `yaml:"description"`
+	ArchivePeriodMinutes int      `yaml:"archive_period_minutes"`
 }
 
 type Transport struct {
@@ -210,6 +212,17 @@ var allowedQuality = map[string]bool{
 // Validate checks the profile against the rules mirrored from profile.schema.json.
 // This is a lightweight hand-written validator (no external jsonschema dependency
 // available offline); it enforces the same required fields and enums as the schema.
+// ArchivePeriod returns the base archive period declared by the profile.
+// Old third-party profiles that predate the field keep the historical hourly
+// default; bundled production profiles declare the value explicitly.
+func (p *Profile) ArchivePeriod() time.Duration {
+	minutes := p.Meta.ArchivePeriodMinutes
+	if minutes <= 0 {
+		minutes = 60
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
 func (p *Profile) Validate() error {
 	if p.Meta.Vendor == "" {
 		return fmt.Errorf("meta.vendor is required")
@@ -222,6 +235,12 @@ func (p *Profile) Validate() error {
 	}
 	if !allowedProtocols[p.Meta.Protocol] {
 		return fmt.Errorf("meta.protocol %q is not one of modbus|merkuriy", p.Meta.Protocol)
+	}
+	if p.Meta.ArchivePeriodMinutes < 0 || p.Meta.ArchivePeriodMinutes > 1440 {
+		return fmt.Errorf("meta.archive_period_minutes must be 0..1440, got %d", p.Meta.ArchivePeriodMinutes)
+	}
+	if p.Meta.ArchivePeriodMinutes > 0 && 1440%p.Meta.ArchivePeriodMinutes != 0 {
+		return fmt.Errorf("meta.archive_period_minutes must divide 1440 minutes, got %d", p.Meta.ArchivePeriodMinutes)
 	}
 
 	if len(p.Points) == 0 {

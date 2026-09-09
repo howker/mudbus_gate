@@ -28,18 +28,22 @@ func TestUpsertGetListDevice(t *testing.T) {
 	ctx := context.Background()
 
 	rec := DeviceRecord{
-		ID:                 "vkm_test",
-		Name:               "ВКМ тест",
-		Kind:               "vkm360",
-		Profile:            "profiles/vkm360.yaml",
-		TransportKind:      "modbus_tcp",
-		Host:               "10.0.0.1",
-		Port:               502,
-		UnitID:             2,
-		Retries:            3,
-		CurrentPollSeconds: 3600,
-		ArchiveAtMinute:    -1, // unset sentinel
-		Enabled:            true,
+		ID:                  "vkm_test",
+		Name:                "ВКМ тест",
+		Kind:                "vkm360",
+		Profile:             "profiles/vkm360.yaml",
+		TransportKind:       "modbus_tcp",
+		Host:                "10.0.0.1",
+		Port:                502,
+		UnitID:              2,
+		Retries:             3,
+		CurrentPollSeconds:  3600,
+		ArchiveAtMinute:     -1, // unset sentinel
+		ArchiveEveryPeriods: 2,
+		ArchiveDaysMask:     31, // Mon-Fri
+		ArchiveWindowStart:  "08:00",
+		ArchiveWindowEnd:    "18:00",
+		Enabled:             true,
 	}
 	if err := repo.UpsertDevice(ctx, rec); err != nil {
 		t.Fatalf("upsert device: %v", err)
@@ -57,6 +61,9 @@ func TestUpsertGetListDevice(t *testing.T) {
 	}
 	if got.ArchiveAtMinute != -1 {
 		t.Fatalf("expected ArchiveAtMinute sentinel -1 preserved, got %d", got.ArchiveAtMinute)
+	}
+	if got.ArchiveEveryPeriods != 2 || got.ArchiveDaysMask != 31 || got.ArchiveWindowStart != "08:00" || got.ArchiveWindowEnd != "18:00" {
+		t.Fatalf("archive schedule round-trip mismatch: %+v", got)
 	}
 	if !got.Enabled {
 		t.Fatal("expected Enabled=true to round-trip")

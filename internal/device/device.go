@@ -828,6 +828,17 @@ func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, i
 // PollArchives runs each archive strategy declared in the device profile
 // (exported so internal/poller can drive it centrally).
 func (d *Device) PollArchives(ctx context.Context) {
+	// Шлюз работает по архивному расписанию, поэтому отдельный регулярный
+	// цикл "текущих" больше не нужен. Контроль часов прибора выполняем
+	// перед архивным тактом: монитор времени и безопасная коррекция ВКМ
+	// остаются живыми, но не создают второго пользовательского расписания.
+	if release, err := d.acquireLeaseWithRetry(ctx, "archive-clock", 30*time.Second); err != nil {
+		log.Printf("[%s] контроль времени перед архивным опросом: не удалось занять прибор: %v\n", d.ID, err)
+	} else {
+		d.updateTimeDrift(ctx)
+		release()
+	}
+
 	for _, a := range d.Profile.Archives {
 		// VKM's mb_request_poll_string strategy returns ONE aggregate per
 		// request (CONFIRMED live 2026-08-01 — see vkm_hourly.go), not a

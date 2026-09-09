@@ -3,6 +3,7 @@ meta:
   model: "Акрон-01"
   profile_version: "1.0.0"
   protocol: "modbus"
+  archive_period_minutes: 60
   firmware_compat: [">=3.7"]
   description: "Akron-01/02: current values via standard function 03 (firmware >=3.7 required), hourly archive via User-Defined command 104. See ВЗАИМОДЕЙСТВИЕ С КОНТРОЛЛЕРОМ СЕТИ MODBUS ПРИБОРОВ Акрон-01 и Акрон-02-1."
 transport:

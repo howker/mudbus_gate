@@ -135,6 +135,10 @@ type deviceSchedule struct {
 	nextArchiveDue  time.Time
 	archiveWindow   *Window
 
+	archiveCalendar bool
+	archiveEvery    int
+	archiveDaysMask uint8 // bit0=Monday ... bit6=Sunday
+
 	// archiveAtMinute, when >= 0, anchors the hourly archive poll to a
 	// fixed minute past each hour (e.g. 5 → always HH:05) instead of
 	// "start time + N*interval", which drifts to an arbitrary minute
@@ -171,6 +175,47 @@ type deviceSchedule struct {
 // дольше одного шага) — при interval=1h ведёт себя ТОЧНО как раньше
 // (один проход цикла эквивалентен старому одиночному +Add(time.Hour)),
 // так что для Akron поведение не меняется.
+
+// nextArchiveCalendar returns the next regular archive poll strictly after now.
+// The cadence is anchored to local midnight, not process start, so restarts do
+// not shift an every-N-period schedule. offsetMinutes is applied after each
+// archive-period boundary. daysMask uses bit0=Monday ... bit6=Sunday; 0 means
+// every day for backward compatibility.
+func nextArchiveCalendar(now time.Time, period time.Duration, every int, daysMask uint8, window *Window, offsetMinutes int) time.Time {
+	if period <= 0 {
+		period = time.Hour
+	}
+	if every <= 0 {
+		every = 1
+	}
+	if daysMask == 0 {
+		daysMask = 0x7f
+	}
+	step := period * time.Duration(every)
+	if step <= 0 {
+		step = period
+	}
+
+	for dayOffset := 0; dayOffset < 14; dayOffset++ {
+		day := time.Date(now.Year(), now.Month(), now.Day()+dayOffset, 0, 0, 0, 0, now.Location())
+		weekdayBit := uint8(1 << ((int(day.Weekday()) + 6) % 7)) // Go Sunday=0 -> Monday bit0
+		if daysMask&weekdayBit == 0 {
+			continue
+		}
+		for boundary := day; boundary.Before(day.Add(24 * time.Hour)); boundary = boundary.Add(step) {
+			candidate := boundary.Add(time.Duration(offsetMinutes) * time.Minute)
+			if !candidate.After(now) {
+				continue
+			}
+			if window != nil && !window.contains(candidate) {
+				continue
+			}
+			return candidate
+		}
+	}
+	return time.Time{}
+}
+
 func nextArchiveAnchored(now time.Time, atMinute int, interval time.Duration) time.Time {
 	if interval <= 0 {
 		interval = time.Hour
@@ -235,6 +280,25 @@ func (s *Scheduler) RegisterWithArchiveAnchor(deviceID string, currentInterval, 
 	}
 }
 
+// RegisterArchiveCalendar configures the production archive schedule. Unlike
+// the legacy Register* methods, the first regular archive task is NOT due
+// immediately: the first Tick calculates the next calendar boundary. Startup
+// catch-up is a separate KindBackfill task queued explicitly by the server.
+func (s *Scheduler) RegisterArchiveCalendar(deviceID string, archivePeriod time.Duration, every int, daysMask uint8, archiveWindow *Window, offsetMinutes int) {
+	if every <= 0 {
+		every = 1
+	}
+	if daysMask == 0 {
+		daysMask = 0x7f
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.devices[deviceID] = &deviceSchedule{
+		deviceID: deviceID, archiveInterval: archivePeriod, archiveWindow: archiveWindow,
+		archiveAtMinute: offsetMinutes, archiveCalendar: true, archiveEvery: every, archiveDaysMask: daysMask,
+	}
+}
+
 // Tick checks every registered device's due times against now and
 // enqueues any tasks that have become due. Callers (the Poller) are
 // expected to call this periodically (e.g. every second) - Tick itself
@@ -251,23 +315,25 @@ func (s *Scheduler) Tick(now time.Time) {
 			s.enqueueLocked(&Task{DeviceID: ds.deviceID, Kind: KindCurrent, Priority: PriorityNormal})
 			ds.nextCurrentDue = now.Add(ds.currentInterval)
 		}
-		if ds.archiveInterval > 0 && !now.Before(ds.nextArchiveDue) {
-			if ds.archiveWindow == nil || ds.archiveWindow.contains(now) {
-				s.enqueueLocked(&Task{DeviceID: ds.deviceID, Kind: KindArchive, Priority: PriorityNormal})
-				// Anchored mode: next poll at the fixed minute past the
-				// next hour, so the schedule never drifts with process
-				// start time. Interval mode (archiveAtMinute < 0): legacy
-				// now+interval.
-				if ds.archiveAtMinute >= 0 {
-					ds.nextArchiveDue = nextArchiveAnchored(now, ds.archiveAtMinute, ds.archiveInterval)
-				} else {
-					ds.nextArchiveDue = now.Add(ds.archiveInterval)
+		if ds.archiveInterval > 0 {
+			if ds.archiveCalendar {
+				if ds.nextArchiveDue.IsZero() {
+					ds.nextArchiveDue = nextArchiveCalendar(now, ds.archiveInterval, ds.archiveEvery, ds.archiveDaysMask, ds.archiveWindow, ds.archiveAtMinute)
+				} else if !now.Before(ds.nextArchiveDue) {
+					s.enqueueLocked(&Task{DeviceID: ds.deviceID, Kind: KindArchive, Priority: PriorityNormal})
+					ds.nextArchiveDue = nextArchiveCalendar(now, ds.archiveInterval, ds.archiveEvery, ds.archiveDaysMask, ds.archiveWindow, ds.archiveAtMinute)
 				}
-			} else {
-				// Outside the configured window - defer until it next
-				// opens, rather than enqueueing now or re-checking every
-				// single Tick.
-				ds.nextArchiveDue = ds.archiveWindow.nextStart(now)
+			} else if !now.Before(ds.nextArchiveDue) {
+				if ds.archiveWindow == nil || ds.archiveWindow.contains(now) {
+					s.enqueueLocked(&Task{DeviceID: ds.deviceID, Kind: KindArchive, Priority: PriorityNormal})
+					if ds.archiveAtMinute >= 0 {
+						ds.nextArchiveDue = nextArchiveAnchored(now, ds.archiveAtMinute, ds.archiveInterval)
+					} else {
+						ds.nextArchiveDue = now.Add(ds.archiveInterval)
+					}
+				} else {
+					ds.nextArchiveDue = ds.archiveWindow.nextStart(now)
+				}
 			}
 		}
 	}

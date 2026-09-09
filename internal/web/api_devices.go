@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -54,7 +55,11 @@ type deviceJSON struct {
 	CurrentPollSeconds              int    `json:"current_poll_seconds"`
 	BackfillMaxDepthHours           int    `json:"backfill_max_depth_hours"`
 	GapScanWindowHours              int    `json:"gap_scan_window_hours"`
-	ArchiveAtMinute                 int    `json:"archive_at_minute"` // -1 = unset/default
+	ArchiveAtMinute                 int    `json:"archive_at_minute"`
+	ArchiveEveryPeriods             int    `json:"archive_every_periods"`
+	ArchiveDaysMask                 int    `json:"archive_days_mask"`
+	ArchiveWindowStart              string `json:"archive_window_start"`
+	ArchiveWindowEnd                string `json:"archive_window_end"`
 	TimeCorrectionDeadbandSeconds   int    `json:"time_correction_deadband_seconds"`
 	TimeCorrectionMaxStepSeconds    int    `json:"time_correction_max_step_seconds"`
 	TimeCorrectionDailyLimitSeconds int    `json:"time_correction_daily_limit_seconds"`
@@ -78,6 +83,8 @@ func deviceToJSON(d sqliterepo.DeviceRecord) deviceJSON {
 		TimeoutMs: d.TimeoutMs, UnitID: d.UnitID, Retries: d.Retries,
 		CurrentPollSeconds: d.CurrentPollSeconds, BackfillMaxDepthHours: d.BackfillMaxDepthHours,
 		GapScanWindowHours: d.GapScanWindowHours, ArchiveAtMinute: d.ArchiveAtMinute,
+		ArchiveEveryPeriods: d.ArchiveEveryPeriods, ArchiveDaysMask: d.ArchiveDaysMask,
+		ArchiveWindowStart: d.ArchiveWindowStart, ArchiveWindowEnd: d.ArchiveWindowEnd,
 		TimeCorrectionDeadbandSeconds:   d.TimeCorrectionDeadbandSeconds,
 		TimeCorrectionMaxStepSeconds:    d.TimeCorrectionMaxStepSeconds,
 		TimeCorrectionDailyLimitSeconds: d.TimeCorrectionDailyLimitSeconds,
@@ -93,6 +100,8 @@ func deviceFromJSON(j deviceJSON) sqliterepo.DeviceRecord {
 		TimeoutMs: j.TimeoutMs, UnitID: j.UnitID, Retries: j.Retries,
 		CurrentPollSeconds: j.CurrentPollSeconds, BackfillMaxDepthHours: j.BackfillMaxDepthHours,
 		GapScanWindowHours: j.GapScanWindowHours, ArchiveAtMinute: j.ArchiveAtMinute,
+		ArchiveEveryPeriods: j.ArchiveEveryPeriods, ArchiveDaysMask: j.ArchiveDaysMask,
+		ArchiveWindowStart: j.ArchiveWindowStart, ArchiveWindowEnd: j.ArchiveWindowEnd,
 		TimeCorrectionDeadbandSeconds:   j.TimeCorrectionDeadbandSeconds,
 		TimeCorrectionMaxStepSeconds:    j.TimeCorrectionMaxStepSeconds,
 		TimeCorrectionDailyLimitSeconds: j.TimeCorrectionDailyLimitSeconds,
@@ -123,6 +132,27 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+var canonicalCOM = regexp.MustCompile(`^COM([1-9][0-9]{0,2})$`)
+
+func validateDeviceCOM(transportKind, com string) error {
+	if transportKind == "modbus_tcp" {
+		return nil
+	}
+	m := canonicalCOM.FindStringSubmatch(strings.ToUpper(strings.TrimSpace(com)))
+	if m == nil {
+		return fmt.Errorf("COM-порт должен быть передан как COM<номер>; в интерфейсе вводится только номер")
+	}
+	return nil
+}
+
+func validateScheduleTime(v string) bool {
+	if v == "" {
+		return true
+	}
+	_, err := time.Parse("15:04", v)
+	return err == nil
+}
+
 // handleDevices: GET lists every device; POST upserts one (JSON body =
 // deviceJSON, ID required).
 func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
@@ -151,6 +181,31 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 		}
 		if j.Kind != "vkm360" && j.Kind != "akron" && j.Kind != "ivk-ter" {
 			writeError(w, http.StatusBadRequest, `поле kind должно быть "vkm360", "akron" или "ivk-ter"`)
+			return
+		}
+		if err := validateDeviceCOM(j.TransportKind, j.COM); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if j.TransportKind != "modbus_tcp" {
+			j.COM = strings.ToUpper(strings.TrimSpace(j.COM))
+		}
+		if j.ArchiveAtMinute < 0 || j.ArchiveAtMinute > 59 {
+			writeError(w, http.StatusBadRequest, "сдвиг архивного опроса должен быть от 0 до 59 минут")
+			return
+		}
+		if j.ArchiveEveryPeriods <= 0 {
+			j.ArchiveEveryPeriods = 1
+		}
+		if j.ArchiveDaysMask == 0 {
+			j.ArchiveDaysMask = 127
+		}
+		if j.ArchiveDaysMask < 1 || j.ArchiveDaysMask > 127 {
+			writeError(w, http.StatusBadRequest, "выберите хотя бы один день архивного опроса")
+			return
+		}
+		if (j.ArchiveWindowStart == "") != (j.ArchiveWindowEnd == "") || !validateScheduleTime(j.ArchiveWindowStart) || !validateScheduleTime(j.ArchiveWindowEnd) {
+			writeError(w, http.StatusBadRequest, "временное окно должно быть пустым либо задано парой HH:MM — HH:MM")
 			return
 		}
 		if j.TimeCorrectionDeadbandSeconds < 0 {
