@@ -720,9 +720,11 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 			deviceID, deviceKindLabelRU(kind), from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
 		switch kind {
 		case "akron":
-			return dev.ForceReloadAkronHourly(jobCtx, from, onProgress)
+			return dev.ForceReloadAkronHourly(jobCtx, from, to, onProgress)
 		case "vkm360":
 			return dev.ForceReloadVKMHourly(jobCtx, from, to, onProgress)
+		case "ivk-ter":
+			return dev.ForceReloadFunc65Hourly(jobCtx, from, to, onProgress)
 		default:
 			return 0, fmt.Errorf("принудительный переопрос не реализован для типа прибора %q", kind)
 		}

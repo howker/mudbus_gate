@@ -34,7 +34,18 @@ import (
 // onProgress, если не nil, вызывается после каждой обработанной страницы
 // (done — сколько часов уже обработано, total — сколько всего) — см.
 // тот же параметр в ForceReloadVKMHourly, добавлено 2026-08-27.
-func (d *Device) ForceReloadAkronHourly(ctx context.Context, fromTime time.Time, onProgress func(done, total int)) (int, error) {
+func filterAkronReloadRange(records []archive.ArchiveRecord, from, to time.Time) []archive.ArchiveRecord {
+	out := make([]archive.ArchiveRecord, 0, len(records))
+	for _, rec := range records {
+		ts, ok := akronRowTime(rec.Fields)
+		if !ok || ts.Before(from) || ts.After(to) {
+			continue
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+func (d *Device) ForceReloadAkronHourly(ctx context.Context, fromTime, toTime time.Time, onProgress func(done, total int)) (int, error) {
 	var a profile.Archive
 	found := false
 	for _, cand := range d.Profile.Archives {
@@ -61,9 +72,16 @@ func (d *Device) ForceReloadAkronHourly(ctx context.Context, fromTime time.Time,
 	pageSize := a.MaxRowsOrDefault()
 	bufferDepth := a.BufferDepthOrDefault()
 
+	fromHour := fromTime.Truncate(time.Hour)
+	toHour := toTime.Truncate(time.Hour)
+	if toHour.Before(fromHour) {
+		return 0, fmt.Errorf("некорректный диапазон переопроса: по %s раньше чем с %s",
+			toHour.Format("02.01.2006 15:04"), fromHour.Format("02.01.2006 15:04"))
+	}
+
 	// Сколько часов назад от текущего момента находится fromTime —
 	// столько записей (вглубь от вершины индекса) и нужно перечитать.
-	depthHours := int(time.Since(fromTime).Hours()) + 1
+	depthHours := int(time.Since(fromHour).Hours()) + 1
 	if depthHours < 1 {
 		depthHours = 1
 	}
@@ -109,7 +127,8 @@ func (d *Device) ForceReloadAkronHourly(ctx context.Context, fromTime time.Time,
 		// (SaveHourlyArchive — upsert) и заодно применит проверку
 		// правдоподобия значения — если на линии СЕЙЧАС тоже помеха,
 		// заведомо плохое новое чтение не заменит собой хорошее старое.
-		totalSaved += persistAkronHourly(ctx, d.Repo, d.ID, a, records)
+		inRange := filterAkronReloadRange(records, fromHour, toHour)
+		totalSaved += persistAkronHourly(ctx, d.Repo, d.ID, a, inRange)
 		pagesDone++
 		if onProgress != nil {
 			onProgress(pagesDone, totalPages)

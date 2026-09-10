@@ -21,7 +21,13 @@ import (
 func func65StorageHour(a profile.Archive, ts time.Time) time.Time {
 	boundary := time.Date(ts.Year(), ts.Month(), ts.Day(), ts.Hour(), 0, 0, 0, ts.Location())
 	semantics, _ := a.Params["timestamp_semantics"].(string)
-	if semantics == "period_end" && ts.After(boundary) {
+	if semantics == "period_end" {
+		// Live IVK-TER verification showed that the raw archive timestamp
+		// can arrive exactly on HH:00:00 while the vendor UI presents the
+		// same record as HH:59:59. In both forms the row belongs to the
+		// hourly period that closes at the NEXT hour boundary. Therefore an
+		// exact boundary must be shifted too; checking ts.After(boundary)
+		// left real IVK-TER rows one hour early.
 		return boundary.Add(time.Hour)
 	}
 	return boundary
@@ -206,4 +212,128 @@ func validateFunc65Record(rec archive.ArchiveRecord) error {
 		return fmt.Errorf("в записи нет archive_time")
 	}
 	return nil
+}
+
+// ForceReloadFunc65Hourly повторно читает часовой архив VZLET function 65
+// за выбранный оператором диапазон и делает обычный upsert в archive_hourly.
+// В отличие от startup-backfill здесь цель — не только заполнить пропуски,
+// а ПЕРЕПРОЧИТАТЬ уже существующие часы и заменить их свежими значениями.
+//
+// Архив ИВК-ТЭР адресуется индексом от вершины кольцевого буфера, поэтому
+// сначала приходится идти от newest к older. Записи новее верхней границы
+// просто пропускаются; после достижения записи старше нижней границы проход
+// заканчивается. Один индекс function 65 соответствует одному часовому
+// периоду, поэтому progress сообщает число реально просмотренных позиций.
+func (d *Device) ForceReloadFunc65Hourly(ctx context.Context, from, to time.Time, onProgress func(done, total int)) (int, error) {
+	if d == nil || d.Profile == nil {
+		return 0, fmt.Errorf("профиль прибора не загружен")
+	}
+	if to.IsZero() {
+		to = time.Now()
+	}
+
+	fromHour := from.Truncate(time.Hour)
+	toHour := to.Truncate(time.Hour)
+	if toHour.Before(fromHour) {
+		return 0, fmt.Errorf("верхняя граница переопроса %s раньше нижней %s",
+			toHour.Format("02.01.2006 15:04"), fromHour.Format("02.01.2006 15:04"))
+	}
+
+	var target *profile.Archive
+	for i := range d.Profile.Archives {
+		if d.Profile.Archives[i].Strategy == "mb_func65" {
+			target = &d.Profile.Archives[i]
+			break
+		}
+	}
+	if target == nil {
+		return 0, fmt.Errorf("в профиле прибора нет часового архива function 65")
+	}
+	a := *target
+
+	reader, ok := archive.Get(a.Strategy)
+	if !ok {
+		return 0, fmt.Errorf("неизвестный способ чтения архива %q", a.Strategy)
+	}
+
+	depth := a.BufferDepthOrDefault()
+	if depth <= 0 {
+		return 0, fmt.Errorf("для архива %s не задана доступная глубина", a.ID)
+	}
+
+	layout := layoutFromProfile(a)
+	periodsSaved := 0
+	valuesSaved := 0
+	reachedRequestedRange := false
+
+	log.Printf("[%s] принудительный переопрос архива %s ИВК-ТЭР: диапазон %s..%s, доступная глубина до %d ч\n",
+		d.ID, a.ID, fromHour.Format("02.01.2006 15:04"), toHour.Format("02.01.2006 15:04"), depth)
+
+	for index := 0; index < depth; index++ {
+		select {
+		case <-ctx.Done():
+			return periodsSaved, ctx.Err()
+		default:
+		}
+
+		release, leaseErr := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
+		if leaseErr != nil {
+			return periodsSaved, fmt.Errorf("прибор занят другим опросом: %w", leaseErr)
+		}
+		records, readErr := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, archive.ArchiveQuery{
+			DeviceID: d.ID, ArchiveID: a.ID, Instance: 1,
+			FromIndex: index, ToIndex: index,
+			RecordLayout: layout, WordOrder32: d.Profile.Codec.WordOrder32, WordOrder64: d.Profile.Codec.WordOrder64,
+			Params: a.Params,
+		})
+		release()
+
+		if onProgress != nil {
+			onProgress(index+1, depth)
+		}
+		if readErr != nil {
+			return periodsSaved, fmt.Errorf("ошибка чтения позиции %d архива %s: %w", index, a.ID, readErr)
+		}
+		if len(records) == 0 {
+			break
+		}
+
+		stop := false
+		for _, rec := range records {
+			if rec.RecordTS.IsZero() {
+				continue
+			}
+			tsHour := func65StorageHour(a, rec.RecordTS)
+
+			if tsHour.After(toHour) {
+				continue
+			}
+			if tsHour.Before(fromHour) {
+				stop = true
+				break
+			}
+
+			reachedRequestedRange = true
+			saved := persistFunc65Hourly(ctx, d.Repo, d.ID, a, []archive.ArchiveRecord{rec})
+			if saved > 0 {
+				periodsSaved++
+				valuesSaved += saved
+				health.MarkPollProgress(d.ID, time.Now())
+				log.Printf("[%s] принудительный переопрос ИВК-ТЭР: час %s обновлён, сохранено показателей %d\n",
+					d.ID, tsHour.Format("02.01.2006 15:04"), saved)
+			}
+		}
+		if stop {
+			break
+		}
+	}
+
+	if !reachedRequestedRange {
+		return 0, fmt.Errorf("в доступном архиве прибора не найдено записей за диапазон %s..%s",
+			fromHour.Format("02.01.2006 15:04"), toHour.Format("02.01.2006 15:04"))
+	}
+
+	log.Printf("[%s] принудительный переопрос ИВК-ТЭР завершён: обновлено часовых периодов %d, сохранено показателей %d\n",
+		d.ID, periodsSaved, valuesSaved)
+	return periodsSaved, nil
 }

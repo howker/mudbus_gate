@@ -17,11 +17,12 @@ func TestFunc65StorageHour_PeriodEndMovesIVKTimestampToClosingBoundary(t *testin
 	}
 }
 
-func TestFunc65StorageHour_ExactBoundaryIsNotMovedTwice(t *testing.T) {
+func TestFunc65StorageHour_PeriodEndMovesExactRawBoundaryToNextHour(t *testing.T) {
 	loc := time.FixedZone("UTC+4", 4*60*60)
 	a := profile.Archive{Params: map[string]interface{}{"timestamp_semantics": "period_end"}}
-	want := time.Date(2026, 9, 10, 3, 0, 0, 0, loc)
-	if got := func65StorageHour(a, want); !got.Equal(want) {
+	raw := time.Date(2026, 9, 10, 3, 0, 0, 0, loc)
+	want := time.Date(2026, 9, 10, 4, 0, 0, 0, loc)
+	if got := func65StorageHour(a, raw); !got.Equal(want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
 }

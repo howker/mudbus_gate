@@ -143,6 +143,29 @@ type archiveResponse struct {
 	Rows        []archiveRow `json:"rows"`
 }
 
+// parseArchiveRangeBound accepts both the old date-only API form and the
+// new minute-precise form used by the Archive tab. Keeping date-only support
+// avoids breaking old bookmarks/scripts. A date-only upper bound means the
+// whole day; a minute-precise upper bound includes that selected minute.
+func parseArchiveRangeBound(value string, upper bool, loc *time.Location) (time.Time, error) {
+	if loc == nil {
+		loc = time.Local
+	}
+	if t, err := time.ParseInLocation("2006-01-02T15:04", value, loc); err == nil {
+		if upper {
+			return t.Add(time.Minute - time.Nanosecond), nil
+		}
+		return t, nil
+	}
+	if t, err := time.ParseInLocation("2006-01-02", value, loc); err == nil {
+		if upper {
+			return t.Add(24*time.Hour - time.Nanosecond), nil
+		}
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("ожидается ГГГГ-ММ-ДД или ГГГГ-ММ-ДДTЧЧ:ММ")
+}
+
 // loadArchiveTable does the shared work behind both the JSON and CSV
 // endpoints: read query params, pull raw rows for every one of the
 // device's params, pivot+aggregate, return a ready-to-render table.
@@ -158,15 +181,17 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 		granularity = "raw"
 	}
 
-	from, err := time.ParseInLocation("2006-01-02", fromStr, time.Local)
+	from, err := parseArchiveRangeBound(fromStr, false, time.Local)
 	if err != nil {
-		return archiveResponse{}, fmt.Errorf(`параметр from должен быть в формате ГГГГ-ММ-ДД`)
+		return archiveResponse{}, fmt.Errorf("параметр from: %w", err)
 	}
-	to, err := time.ParseInLocation("2006-01-02", toStr, time.Local)
+	to, err := parseArchiveRangeBound(toStr, true, time.Local)
 	if err != nil {
-		return archiveResponse{}, fmt.Errorf(`параметр to должен быть в формате ГГГГ-ММ-ДД`)
+		return archiveResponse{}, fmt.Errorf("параметр to: %w", err)
 	}
-	to = to.Add(24*time.Hour - time.Second) // inclusive through the end of the "to" day
+	if to.Before(from) {
+		return archiveResponse{}, fmt.Errorf("конец периода не может быть раньше начала")
+	}
 
 	dev, found, err := s.repo.GetDevice(r.Context(), deviceID)
 	if err != nil {

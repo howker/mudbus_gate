@@ -451,9 +451,11 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <select id="ar_device" onchange="onArchiveDeviceChange()"></select>
       </div>
       <div class="form-row"><label>Период</label>
-        <input id="ar_from" type="text" style="width:150px;" placeholder="ГГГГ-ММ-ДД">
+        <input id="ar_from" type="text" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
+        <select id="ar_from_h" style="width:55px;"></select>:<select id="ar_from_m" style="width:55px;"></select>
         &nbsp;—&nbsp;
-        <input id="ar_to" type="text" style="width:150px;" placeholder="ГГГГ-ММ-ДД">
+        <input id="ar_to" type="text" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
+        <select id="ar_to_h" style="width:55px;"></select>:<select id="ar_to_m" style="width:55px;"></select>
       </div>
       <div class="form-row"><label></label>
         <button class="btn secondary" onclick="setArchivePreset('today')">Сегодня</button>
@@ -486,7 +488,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         <input id="rl_from" type="text" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
         <select id="rl_from_h" style="width:55px;"></select>:<select id="rl_from_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
       </div>
-      <div class="form-row" id="rl_to_row"><label>По какую дату (только ВКМ)</label>
+      <div class="form-row" id="rl_to_row"><label>Переопросить по</label>
         <input id="rl_to" type="text" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
         <select id="rl_to_h" style="width:55px;"></select>:<select id="rl_to_m" style="width:55px;"><option value="00">00</option><option value="30">30</option></select>
       </div>
@@ -754,14 +756,14 @@ function validateTimeCorrectionFields(body) {
 function onArchiveDeviceChange() {
   var deviceId = document.getElementById('ar_device').value;
   var d = findDevice(deviceId);
-  var showReload = !!(d && (d.kind === 'akron' || d.kind === 'vkm360'));
+  var showReload = !!(d && (d.kind === 'akron' || d.kind === 'vkm360' || d.kind === 'ivk-ter'));
   document.getElementById('reloadSection').style.display = showReload ? 'block' : 'none';
-  // поле "по" нужно только ВКМ (архив адресуется по времени напрямую) —
-  // у Akron переопрос всегда идёт "с указанной даты и до сейчас"
-  // (архив адресуется по индексу вглубь от текущей вершины, конкретную
-  // верхнюю границу задать нельзя)
-  var isVKM = !!(d && d.kind === 'vkm360');
-  document.getElementById('rl_to_row').style.display = isVKM ? 'block' : 'none';
+  // Поле "по" показываем для ВКМ и ИВК-ТЭР. ВКМ адресуется по времени
+  // напрямую, ИВК-ТЭР — по индексу, но при проходе функции 65 мы можем
+  // остановиться по временной метке записи и тем самым честно ограничить
+  // диапазон. У Akron переопрос остаётся "с указанной даты и до сейчас".
+  var hasReloadTo = !!(d && (d.kind === 'vkm360' || d.kind === 'ivk-ter'));
+  document.getElementById('rl_to_row').style.display = hasReloadTo ? 'block' : 'none';
 
   // Для ИВК-ТЭР пока показываем архив строго в исходной часовой
   // дискретности. Суммировать/усреднять служебные поля архива до
@@ -1115,12 +1117,20 @@ function setArchivePreset(preset) {
   }
   document.getElementById('ar_from').value = dateToInputValue(from);
   document.getElementById('ar_to').value = dateToInputValue(to);
+  // Пресеты по-прежнему означают полный календарный диапазон.
+  // Время затем можно сузить вручную, например сегодня 12:00—15:00.
+  document.getElementById('ar_from_h').value = '00';
+  document.getElementById('ar_from_m').value = '00';
+  document.getElementById('ar_to_h').value = '23';
+  document.getElementById('ar_to_m').value = '59';
 }
 
 function archiveQueryString() {
   var deviceId = document.getElementById('ar_device').value;
-  var from = document.getElementById('ar_from').value;
-  var to = document.getElementById('ar_to').value;
+  var fromDate = document.getElementById('ar_from').value;
+  var toDate = document.getElementById('ar_to').value;
+  var from = fromDate + 'T' + document.getElementById('ar_from_h').value + ':' + document.getElementById('ar_from_m').value;
+  var to = toDate + 'T' + document.getElementById('ar_to_h').value + ':' + document.getElementById('ar_to_m').value;
   var granularity = document.getElementById('ar_granularity').value;
   return 'device_id=' + encodeURIComponent(deviceId) +
     '&from=' + encodeURIComponent(from) +
@@ -2934,6 +2944,24 @@ function populateHourSelect(selectId) {
   }
   sel.innerHTML = html;
 }
+function populateMinuteSelect(selectId) {
+  var sel = document.getElementById(selectId);
+  var html = '';
+  for (var m = 0; m < 60; m++) {
+    var mm = pad2(m);
+    html += '<option value="' + mm + '">' + mm + '</option>';
+  }
+  sel.innerHTML = html;
+}
+populateHourSelect('ar_from_h');
+populateHourSelect('ar_to_h');
+populateMinuteSelect('ar_from_m');
+populateMinuteSelect('ar_to_m');
+document.getElementById('ar_from_h').value = '00';
+document.getElementById('ar_from_m').value = '00';
+document.getElementById('ar_to_h').value = '23';
+document.getElementById('ar_to_m').value = '59';
+
 populateHourSelect('rl_from_h');
 populateHourSelect('rl_to_h');
 

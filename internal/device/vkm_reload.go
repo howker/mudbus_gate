@@ -27,15 +27,6 @@ import (
 // (done — сколько уже сделано, total — сколько всего) — используется
 // веб-интерфейсом, чтобы показывать реальный прогресс длительного
 // переопроса вместо "тишины" на много минут (добавлено 2026-08-27).
-// hourlyArchiveDeleter — узкий локальный интерфейс с одним методом,
-// который умеет только *sqliterepo.Repo (см. internal/storage/sqlite/
-// repo_archive_range.go, DeleteHourlyArchiveRange). Тот же приём, что
-// prevValueChecker в akron_hourly.go — не расширяем общий storage.Repo
-// ради одного метода, полагаемся на приведение типа во время выполнения.
-type hourlyArchiveDeleter interface {
-	DeleteHourlyArchiveRange(ctx context.Context, deviceID, channel, param string, from, to time.Time) (int64, error)
-}
-
 func (d *Device) ForceReloadVKMHourly(ctx context.Context, from, to time.Time, onProgress func(done, total int)) (int, error) {
 	var a profile.Archive
 	found := false
@@ -62,26 +53,9 @@ func (d *Device) ForceReloadVKMHourly(ctx context.Context, from, to time.Time, o
 	// заглушка в тестах) — переопрос честно завершается ошибкой, а не
 	// тихо продолжает без очистки: молчаливо оставить дубликаты хуже,
 	// чем явно сообщить, что не смогли почистить.
-	if deleter, ok := d.Repo.(hourlyArchiveDeleter); ok {
-		deleteFrom := from.Add(-vkmArchivePeriod)
-		deleteTo := to.Add(vkmArchivePeriod)
-		for _, param := range vkmHourlyParams {
-			if _, err := deleter.DeleteHourlyArchiveRange(ctx, d.ID, "", param, deleteFrom, deleteTo); err != nil {
-				return 0, fmt.Errorf("очистка старых записей (%s) перед переопросом: %w", param, err)
-			}
-		}
-	} else {
-		return 0, fmt.Errorf("хранилище не поддерживает очистку перед переопросом (внутренняя ошибка)")
-	}
-
-	// Верхняя граница переопроса НИКОГДА не может заходить в ещё не
-	// завершённый период — иначе запрашиваем и сохраняем "недособранное"
-	// значение (застали прибор посреди периода), и оно ляжет в базу и
-	// уйдёт в ЭС как будто период уже закрыт. Подтверждено живьём
-	// (2026-08-27): выбор "по" = сегодняшняя дата без ограничения дал
-	// строку архива с меткой на 15 минут ВПЕРЕДИ реального времени
-	// сервера. Обрезаем "to" до последнего периода, который уже
-	// гарантированно закрылся к текущему моменту.
+	// ВАЖНО: диапазон заранее НЕ удаляем. Каждая успешно перечитанная запись
+	// заменяет существующую через SaveHourlyArchive (UPSERT). Если связь оборвётся,
+	// старые строки ещё не прочитанных периодов останутся в БД.
 	lastCompletedPeriodStart := time.Now().Truncate(vkmArchivePeriod).Add(-vkmArchivePeriod)
 	if to.After(lastCompletedPeriodStart) {
 		to = lastCompletedPeriodStart
