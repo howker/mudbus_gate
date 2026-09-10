@@ -74,7 +74,7 @@ func (d *Device) BackfillArchives(ctx context.Context, opts BackfillOptions) {
 func (d *Device) backfillAkronHourly(ctx context.Context, a profile.Archive, opts BackfillOptions) {
 	reader, ok := archive.Get(a.Strategy)
 	if !ok {
-		log.Printf("[%s] дозабор %s: неизвестная стратегия %s\n", d.ID, a.ID, a.Strategy)
+		log.Printf("[%s] восстановление архива %s: неизвестный способ чтения %s\n", d.ID, a.ID, a.Strategy)
 		return
 	}
 	layout := layoutFromProfile(a)
@@ -111,7 +111,7 @@ func (d *Device) backfillAkronHourly(ctx context.Context, a profile.Archive, opt
 	toBoundary := now.Truncate(time.Hour)
 	missingList, err := d.Repo.MissingHours(ctx, d.ID, "", "V", fromBoundary, toBoundary)
 	if err != nil {
-		log.Printf("[%s] дозабор %s: не удалось вычислить пропуски: %v — иду вглубь до предела/пустой страницы\n", d.ID, a.ID, err)
+		log.Printf("[%s] восстановление архива %s: не удалось определить отсутствующие часы (%v); проверяю историю до доступного предела\n", d.ID, a.ID, err)
 	}
 	missing := make(map[int64]bool, len(missingList))
 	for _, t := range missingList {
@@ -119,11 +119,11 @@ func (d *Device) backfillAkronHourly(ctx context.Context, a profile.Archive, opt
 	}
 
 	if err == nil && len(missing) == 0 {
-		log.Printf("[%s] дозабор %s: пропусков в пределах %dч нет — добирать нечего\n", d.ID, a.ID, depthLimit)
+		log.Printf("[%s] восстановление архива %s: за последние %d ч отсутствующих часов нет\n", d.ID, a.ID, depthLimit)
 		return
 	}
 
-	log.Printf("[%s] дозабор %s: старт (страница=%d строк, предел=%dч, известно пропущенных часов: %d)\n",
+	log.Printf("[%s] восстановление архива %s: начинаю проверку; за один запрос до %d записей, глубина до %d ч, отсутствующих часов %d\n",
 		d.ID, a.ID, pageSize, depthLimit, len(missing))
 
 	totalSaved := 0
@@ -136,7 +136,7 @@ func (d *Device) backfillAkronHourly(ctx context.Context, a profile.Archive, opt
 
 		release, leaseErr := d.Lease.Acquire(ctx, d.ID, a.ID, 30*time.Second)
 		if leaseErr != nil {
-			log.Printf("[%s] дозабор %s: не удалось занять lease: %v\n", d.ID, a.ID, leaseErr)
+			log.Printf("[%s] восстановление архива %s: прибор занят другим опросом; не удалось дождаться доступа: %v\n", d.ID, a.ID, leaseErr)
 			return
 		}
 		q := archive.ArchiveQuery{
@@ -154,13 +154,13 @@ func (d *Device) backfillAkronHourly(ctx context.Context, a profile.Archive, opt
 		release()
 
 		if err != nil {
-			log.Printf("[%s] дозабор %s: страница i=%d..%d: ошибка чтения: %v — остановка (дальше в буфере, видимо, пусто)\n",
+			log.Printf("[%s] восстановление архива %s: ошибка чтения позиций %d..%d: %v; восстановление остановлено\n",
 				d.ID, a.ID, from+1, to+1, err)
 			reachedEnd = true
 			break
 		}
 		if len(records) == 0 {
-			log.Printf("[%s] дозабор %s: страница i=%d..%d: пусто — архив прибора закончился\n",
+			log.Printf("[%s] восстановление архива %s: позиции %d..%d пусты — достигнут конец доступного архива прибора\n",
 				d.ID, a.ID, from+1, to+1)
 			reachedEnd = true
 			break
@@ -169,7 +169,7 @@ func (d *Device) backfillAkronHourly(ctx context.Context, a profile.Archive, opt
 		saved := persistAkronHourly(ctx, d.Repo, d.ID, a, records)
 		totalSaved += saved
 		health.MarkPollProgress(d.ID, time.Now())
-		log.Printf("[%s] дозабор %s: страница i=%d..%d: получено %d, сохранено %d\n",
+		log.Printf("[%s] восстановление архива %s: позиции %d..%d — получено %d записей, сохранено %d\n",
 			d.ID, a.ID, from+1, to+1, len(records), saved)
 
 		// Cross off every hour this page actually covered — including
@@ -184,17 +184,17 @@ func (d *Device) backfillAkronHourly(ctx context.Context, a profile.Archive, opt
 		}
 
 		if len(missing) == 0 {
-			log.Printf("[%s] дозабор %s: все известные пропуски закрыты — остановка\n", d.ID, a.ID)
+			log.Printf("[%s] восстановление архива %s: все обнаруженные отсутствующие часы восстановлены\n", d.ID, a.ID)
 			reachedEnd = true
 			break
 		}
 	}
 
 	if !reachedEnd {
-		log.Printf("[%s] дозабор %s: достигнут предел глубины %dч, ещё не закрыто пропусков: %d\n",
+		log.Printf("[%s] восстановление архива %s: достигнута глубина %d ч; осталось отсутствующих часов: %d\n",
 			d.ID, a.ID, depthLimit, len(missing))
 	}
-	log.Printf("[%s] дозабор %s: готово, сохранено строк: %d\n", d.ID, a.ID, totalSaved)
+	log.Printf("[%s] восстановление архива %s завершено: сохранено записей %d\n", d.ID, a.ID, totalSaved)
 }
 
 // GapScan patches individual missing hours in the recent window
@@ -219,13 +219,13 @@ func (d *Device) GapScan(ctx context.Context, windowHours int) {
 
 	missing, err := d.Repo.MissingHours(ctx, d.ID, "", "V", fromHour, toHour)
 	if err != nil {
-		log.Printf("[%s] проверка пропусков: ошибка поиска пропусков: %v\n", d.ID, err)
+		log.Printf("[%s] контроль полноты архива: не удалось определить отсутствующие часы: %v\n", d.ID, err)
 		return
 	}
 	if len(missing) == 0 {
 		return // nothing to patch, stay quiet
 	}
-	log.Printf("[%s] проверка пропусков: найдено пропущенных часов в последних %dч: %d — латаю\n",
+	log.Printf("[%s] контроль полноты архива: за последние %d ч найдено отсутствующих часов: %d; начинаю восстановление\n",
 		d.ID, windowHours, len(missing))
 
 	// Re-sweep just the window depth; upsert fills the holes, overlap is

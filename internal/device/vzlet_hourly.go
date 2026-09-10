@@ -12,6 +12,21 @@ import (
 	"mbgw/internal/storage"
 )
 
+// func65StorageHour converts the device record timestamp to the archive
+// period marker used by MBGW. Some VZLET archives (confirmed live for
+// IVK-TER on 2026-09-10) timestamp an hourly record at HH:59:59, i.e. at
+// the END of the hour. Storing Truncate(time.Hour) used to label that record
+// one hour too early. The rule is profile-driven so other function-65 devices
+// keep their current semantics until verified.
+func func65StorageHour(a profile.Archive, ts time.Time) time.Time {
+	boundary := time.Date(ts.Year(), ts.Month(), ts.Day(), ts.Hour(), 0, 0, 0, ts.Location())
+	semantics, _ := a.Params["timestamp_semantics"].(string)
+	if semantics == "period_end" && ts.After(boundary) {
+		return boundary.Add(time.Hour)
+	}
+	return boundary
+}
+
 // persistFunc65Hourly сохраняет профильные числовые поля одной записи
 // VZLET function 65 в общий archive_hourly. archive_time становится
 // меткой часа, а не отдельным измеряемым параметром.
@@ -43,7 +58,7 @@ func persistFunc65Hourly(ctx context.Context, repo storage.Repo, deviceID string
 				DeviceID: deviceID,
 				Channel:  "",
 				Param:    name,
-				TsHour:   rec.RecordTS.Truncate(time.Hour),
+				TsHour:   func65StorageHour(a, rec.RecordTS),
 				Value:    value,
 				Unit:     units[name],
 				Quality:  quality,
@@ -102,12 +117,12 @@ func func65RepresentativeParam(a profile.Archive) string {
 func (d *Device) backfillFunc65Hourly(ctx context.Context, a profile.Archive, opts BackfillOptions) {
 	reader, ok := archive.Get(a.Strategy)
 	if !ok {
-		log.Printf("[%s] дозабор %s: неизвестная стратегия %s\n", d.ID, a.ID, a.Strategy)
+		log.Printf("[%s] восстановление архива %s: неизвестный способ чтения %s\n", d.ID, a.ID, a.Strategy)
 		return
 	}
 	param := func65RepresentativeParam(a)
 	if param == "" {
-		log.Printf("[%s] дозабор %s: в профиле нет числового поля для контроля пропусков\n", d.ID, a.ID)
+		log.Printf("[%s] восстановление архива %s: в профиле нет контрольного числового поля\n", d.ID, a.ID)
 		return
 	}
 
@@ -122,7 +137,7 @@ func (d *Device) backfillFunc65Hourly(ctx context.Context, a profile.Archive, op
 	from := now.Add(-time.Duration(depth-1) * time.Hour)
 	missingList, err := d.Repo.MissingHours(ctx, d.ID, "", param, from, now)
 	if err != nil {
-		log.Printf("[%s] дозабор %s: не удалось вычислить пропуски: %v — читаю до конца архива/предела\n", d.ID, a.ID, err)
+		log.Printf("[%s] восстановление архива %s: не удалось определить отсутствующие часы (%v); проверяю архив прибора до доступного предела\n", d.ID, a.ID, err)
 	}
 	missing := make(map[int64]bool, len(missingList))
 	for _, t := range missingList {
@@ -134,7 +149,7 @@ func (d *Device) backfillFunc65Hourly(ctx context.Context, a profile.Archive, op
 
 	layout := layoutFromProfile(a)
 	totalSaved := 0
-	log.Printf("[%s] дозабор %s ИВК/ВЗЛЁТ: старт, предел %d ч, пропусков %d\n", d.ID, a.ID, depth, len(missing))
+	log.Printf("[%s] восстановление архива %s ИВК-ТЭР: обнаружено %d отсутствующих часовых периодов; проверяю до %d часов назад\n", d.ID, a.ID, len(missing), depth)
 	for index := 0; index < depth; index++ {
 		select {
 		case <-ctx.Done():
@@ -144,7 +159,7 @@ func (d *Device) backfillFunc65Hourly(ctx context.Context, a profile.Archive, op
 
 		release, leaseErr := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
 		if leaseErr != nil {
-			log.Printf("[%s] дозабор %s: не удалось занять прибор: %v\n", d.ID, a.ID, leaseErr)
+			log.Printf("[%s] восстановление архива %s: прибор занят другим опросом; не удалось дождаться доступа: %v\n", d.ID, a.ID, leaseErr)
 			return
 		}
 		records, readErr := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, archive.ArchiveQuery{
@@ -155,11 +170,11 @@ func (d *Device) backfillFunc65Hourly(ctx context.Context, a profile.Archive, op
 		})
 		release()
 		if readErr != nil {
-			log.Printf("[%s] дозабор %s: индекс %d: ошибка чтения: %v\n", d.ID, a.ID, index, readErr)
+			log.Printf("[%s] восстановление архива %s: ошибка чтения позиции %d в архиве прибора: %v\n", d.ID, a.ID, index, readErr)
 			return
 		}
 		if len(records) == 0 {
-			log.Printf("[%s] дозабор %s: индекс %d: архив прибора закончился\n", d.ID, a.ID, index)
+			log.Printf("[%s] восстановление архива %s: достигнут конец доступного архива прибора (позиция %d)\n", d.ID, a.ID, index)
 			break
 		}
 		saved := persistFunc65Hourly(ctx, d.Repo, d.ID, a, records)
@@ -167,14 +182,14 @@ func (d *Device) backfillFunc65Hourly(ctx context.Context, a profile.Archive, op
 		health.MarkPollProgress(d.ID, time.Now())
 		for _, rec := range records {
 			if !rec.RecordTS.IsZero() {
-				delete(missing, rec.RecordTS.Truncate(time.Hour).Unix())
+				delete(missing, func65StorageHour(a, rec.RecordTS).Unix())
 			}
 		}
 		if err == nil && len(missing) == 0 {
 			break
 		}
 	}
-	log.Printf("[%s] дозабор %s ИВК/ВЗЛЁТ: готово, сохранено полей: %d\n", d.ID, a.ID, totalSaved)
+	log.Printf("[%s] восстановление архива %s ИВК-ТЭР завершено: сохранено показателей %d\n", d.ID, a.ID, totalSaved)
 }
 
 func func65LatestQuery(d *Device, a profile.Archive) archive.ArchiveQuery {

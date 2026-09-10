@@ -1,5 +1,5 @@
 // energosphere_sync.go pushes collected meter values (ВКМ-360: heat
-// energy, mass, temperature, pressure; Akron: volume) from mbgw's own
+// energy, mass, temperature, pressure; Akron: volume; IVK-TER: hourly archive fields) from mbgw's own
 // collected archive directly into Энергосфера's PointMains table via
 // extdb.go's PointMainsWriter, bypassing the ЭС device drivers entirely.
 //
@@ -16,7 +16,7 @@
 // archive on our carrier. RS-485 was the only connection type confirmed
 // to work end-to-end (full 217-record backfill on a fresh point), which
 // mbgw cannot offer without an actual physical or virtual COM port.
-// Direct DB delivery is the one confirmed-working path for these two
+// Direct DB delivery is the confirmed-working path for these
 // channels; FINAL_TRD's "Интеграция с Энергосферой" clause explicitly
 // names "сетевой доступ к БД" as a legitimate delivery method, so this is
 // not an architectural workaround, it's one of the sanctioned options —
@@ -70,7 +70,8 @@ import (
 // PointMapping — одна точка ЭС (ID_PP в PointMains), в которую пишем
 // один параметр прибора с заданным множителем. У ВКМ таких точек обычно
 // 4 на прибор (масса/тепло/температура/давление, теги "S"/"ST"/"T"/"Pi"),
-// у Akron — одна (объём, тег "V").
+// у Akron — одна (объём, тег "V"); у ИВК-ТЭР могут быть настроены любые
+// нужные поля его часового archive_hourly (v_plus, v_minus, q_avg и т.д.).
 type PointMapping struct {
 	Tag     string // тег параметра прибора — см. collectVKMReadings/collectAkronReadings
 	PointID int    // ID_PP в PointMains
@@ -107,8 +108,8 @@ type Config struct {
 	SQLPort     int
 
 	DeviceID string
-	Pipe     int    // используется только при Kind="vkm360" (номер трубопровода в архиве); Akron это поле игнорирует
-	Kind     string // "vkm360" | "akron" — какой источник исходных данных использовать, см. collectVKMReadings/collectAkronReadings
+	Pipe     int    // используется только при Kind="vkm360" (номер трубопровода в архиве); остальные типы игнорируют
+	Kind     string // "vkm360" | "akron" | "ivk-ter" — источник данных; см. collect*Readings
 
 	Points []PointMapping
 
@@ -117,7 +118,7 @@ type Config struct {
 	DryRun        bool
 
 	// TimeShiftMinutes — общий сдвиг метки времени перед записью в
-	// PointMains. Применяется и к ВКМ, и к Akron.
+	// PointMains. Применяется одинаково ко всем поддержанным типам.
 	//
 	// 0 = без сдвига. Отрицательное значение сдвигает метку назад.
 	// Для текущей ЭС живьём подтверждена необходимость коррекции -90 минут
@@ -468,6 +469,32 @@ func collectVKMReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, 
 	return out, nil
 }
 
+// collectIVKReadings читает уже декодированные часовые поля ИВК-ТЭР
+// из общей archive_hourly. В отличие от Akron, v_plus/v_minus ИВК-ТЭР
+// являются готовыми значениями за час (это подтверждается live-сверкой:
+// V+ около 74.6 м3 при Qср около 1243 л/мин за 60 минут), поэтому здесь
+// не вычисляются дельты — выбранное поле идёт в ЭС как есть с настроенным
+// множителем и общим TimeShiftMinutes.
+func collectIVKReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, from, now time.Time) ([]pointReading, error) {
+	var out []pointReading
+	shift := time.Duration(cfg.TimeShiftMinutes) * time.Minute
+
+	for _, m := range cfg.Points {
+		rows, err := repo.GetHourlyArchiveRange(ctx, cfg.DeviceID, "", m.Tag, from, now)
+		if err != nil {
+			return nil, err
+		}
+		for _, row := range rows {
+			out = append(out, pointReading{
+				mapping: m,
+				ts:      row.TsHour.Add(shift),
+				value:   row.Value * m.Factor,
+			})
+		}
+	}
+	return out, nil
+}
+
 // collectAkronReadings читает часовые снимки Akron из archive_hourly.
 //
 // Для тега V archive_hourly хранит накопительный счётчик, поэтому расход
@@ -585,6 +612,8 @@ func collectReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, fro
 	switch cfg.Kind {
 	case "akron":
 		return collectAkronReadings(ctx, repo, cfg, from, now)
+	case "ivk-ter", "ivk_ter":
+		return collectIVKReadings(ctx, repo, cfg, from, now)
 	default:
 		return collectVKMReadings(ctx, repo, cfg, from, now)
 	}

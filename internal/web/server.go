@@ -35,6 +35,11 @@ type Server struct {
 	// dashboard read-only), rather than panicking.
 	onManualPoll func()
 
+	// onManualDevicePoll enqueues an archive poll for exactly one already
+	// registered device. The callback is wired by cmd/mbgw/server.go so the
+	// web package stays independent of scheduler/device internals.
+	onManualDevicePoll func(deviceID string) error
+
 	// onForceReload, если задан, вызывается для принудительного
 	// переопроса архива с указанного периода — см. api_reload.go и
 	// SetForceReload. nil означает, что этот режим запуска не умеет
@@ -142,6 +147,13 @@ func (s *Server) SetManualPoll(fn func()) {
 	s.onManualPoll = fn
 }
 
+// SetManualDevicePoll wires the per-device play button in «Монитор опроса».
+// The callback only queues work; all physical I/O remains inside poller, where
+// it is serialized with scheduled work for the same device.
+func (s *Server) SetManualDevicePoll(fn func(deviceID string) error) {
+	s.onManualDevicePoll = fn
+}
+
 // SetForceReload подключает возможность принудительного переопроса
 // архива — вызывается из cmd/mbgw/server.go после того, как приборы
 // созданы и открыты (см. runServer). Работает для обоих типов приборов
@@ -220,6 +232,7 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/devices", s.handleDevices)
 	mux.HandleFunc("/api/devices/delete", s.handleDeviceDelete)
 	mux.HandleFunc("/api/devices/probe", s.handleDeviceProbe)
+	mux.HandleFunc("/api/devices/poll-now", s.handleDevicePollNow)
 	mux.HandleFunc("/api/vkm-channels", s.handleVKMChannels)
 	mux.HandleFunc("/api/vkm-channels/check-history", s.handleCheckChannelHistory)
 	mux.HandleFunc("/api/es-connection", s.handleESConnection)
@@ -362,6 +375,42 @@ func (s *Server) handlePoll(w http.ResponseWriter, r *http.Request) {
 	}
 	s.onManualPoll()
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "опрос запущен (результат появится через несколько секунд)"})
+}
+
+// handleDevicePollNow queues a near-term archive read for one device. It does
+// not open a second COM port: production owns one transport per registered
+// device, and poller serializes this manual task with scheduled work.
+func (s *Server) handleDevicePollNow(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "только POST"})
+		return
+	}
+	if s.onManualDevicePoll == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "ручной опрос одного прибора не подключён в этом режиме запуска"})
+		return
+	}
+	var req struct {
+		DeviceID string `json:"device_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.DeviceID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "не указан прибор"})
+		return
+	}
+	if err := s.onManualDevicePoll(req.DeviceID); err != nil {
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status":    "queued",
+		"device_id": req.DeviceID,
+		"message":   "ручной архивный опрос поставлен в очередь",
+	})
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {

@@ -105,7 +105,7 @@ func (s *Server) handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 			Name:          dev.Name,
 			Kind:          dev.Kind,
 			Enabled:       dev.Enabled,
-			SyncSupported: dev.Kind == "vkm360" || dev.Kind == "akron",
+			SyncSupported: dev.Kind == "vkm360" || dev.Kind == "akron" || dev.Kind == "ivk-ter" || dev.Kind == "ivk_ter",
 		}
 
 		period, param := archivePeriodAndParamForKind(dev.Kind)

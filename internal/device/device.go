@@ -392,7 +392,30 @@ func (d *Device) readVZLETUnixClock(ctx context.Context) (time.Time, time.Time, 
 		return time.Time{}, midpoint, fmt.Errorf("некорректное значение часов 0x%08X", seconds)
 	}
 
-	return time.Unix(int64(seconds), 0).UTC(), midpoint, nil
+	return vzletClockInstant(seconds, d.Profile.Meta.Model, time.Local), midpoint, nil
+}
+
+// vzletClockInstant converts the uint32 clock register into an actual instant.
+//
+// Live IVK-TER verification (2026-09-10) showed that IR 0x8000 stores the
+// device's LOCAL wall-clock fields counted from the Unix epoch, not a UTC
+// instant. Treating that number with time.Unix(...).UTC() therefore added the
+// server's UTC+4 offset to the measured drift (about +14400 seconds).
+//
+// Keep this quirk explicit to IVK-TER: other VZLET profiles must not silently
+// inherit an interpretation that has not been verified on their hardware.
+func vzletClockInstant(seconds uint32, model string, loc *time.Location) time.Time {
+	decoded := time.Unix(int64(seconds), 0).UTC()
+	if model != "IVK-TER" {
+		return decoded
+	}
+	if loc == nil {
+		loc = time.Local
+	}
+	return time.Date(
+		decoded.Year(), decoded.Month(), decoded.Day(),
+		decoded.Hour(), decoded.Minute(), decoded.Second(), 0, loc,
+	)
 }
 
 // timeCorrectionStore is deliberately a narrow local interface instead of

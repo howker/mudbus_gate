@@ -675,6 +675,26 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 		}
 	})
 
+	// Ручной архивный опрос ОДНОГО прибора из «Монитора опроса».
+	// Важно: транспорт здесь не открывается повторно — он уже открыт и
+	// зарегистрирован службой. Запрос только кладётся в ту же per-device
+	// FIFO, что и плановые задания, поэтому ручной и автоматический I/O
+	// физически не могут пересечься на одном приборе.
+	webServer.SetManualDevicePoll(func(deviceID string) error {
+		devicesMu.Lock()
+		dev, ok := devices[deviceID]
+		devicesMu.Unlock()
+		if !ok {
+			return fmt.Errorf("прибор %s не зарегистрирован в работающей службе (он отключён или не открыл канал связи при старте)", deviceID)
+		}
+		if dev.Profile == nil || len(dev.Profile.Archives) == 0 {
+			return fmt.Errorf("у прибора %s в профиле нет архивов для опроса", deviceID)
+		}
+		sched.RequestManualPoll(deviceID, scheduler.KindManualArchive)
+		log.Printf("[%s] [WEB] ручной архивный опрос поставлен в очередь; он выполнится без пересечения с плановым опросом\n", deviceID)
+		return nil
+	})
+
 	// Принудительный переопрос архива с UI (см. internal/device/
 	// akron_reload.go, internal/device/vkm_reload.go и internal/web/
 	// api_reload.go) — идёт НАПРЯМУЮ к конкретному прибору, в обход
@@ -771,7 +791,7 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 		devicesMu.Lock()
 		kind := deviceKinds[deviceID]
 		devicesMu.Unlock()
-		if kind != "vkm360" && kind != "akron" {
+		if kind != "vkm360" && kind != "akron" && kind != "ivk-ter" && kind != "ivk_ter" {
 			err = fmt.Errorf("принудительная пересинхронизация с ЭС не поддерживается для типа прибора %q (прибор %s)", kind, deviceID)
 			return
 		}
@@ -1131,14 +1151,14 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	// "сейчас": Scheduler ждёт ближайшую разрешённую календарную границу.
 	if len(p.Archives) > 0 {
 		sched.RequestManualPoll(devRec.ID, scheduler.KindBackfill)
-		log.Printf("[ИНФО] прибор %s: стартовый дозабор поставлен в очередь; следующий штатный опрос — по календарному расписанию\n", devRec.ID)
+		log.Printf("[ИНФО] прибор %s: проверка и восстановление недостающих архивных данных поставлены в очередь; следующий штатный опрос — по календарному расписанию\n", devRec.ID)
 	}
 
-	// Upstream delivery: both VKM and Akron use the same direct write
+	// Upstream delivery: VKM, Akron and IVK-TER use the same direct write
 	// path to PointMains. The old Akron device-emulation carrier is not
 	// part of the current `mbgw server` path.
 	switch devRec.Kind {
-	case "akron", "vkm360":
+	case "akron", "vkm360", "ivk-ter", "ivk_ter":
 		if trigger := startESyncForDevice(ctx, repo, devRec.ID, devRec.Kind, dbPath); trigger != nil {
 			devicesMu.Lock()
 			esSyncTriggers[devRec.ID] = trigger
@@ -1254,7 +1274,12 @@ func buildIntegrationConfig(ctx context.Context, repo *sqliterepo.Repo, deviceID
 
 	humanLabels := map[string]string{
 		"ST": "тепло", "S": "масса", "T": "температура", "Pi": "давление",
-		"V": "объём",
+		"V":      "объём",
+		"v_plus": "объём прямой", "v_minus": "объём обратный",
+		"q_avg": "средний расход", "resistance": "сопротивление",
+		"errors": "код ошибок", "comm_fail_time": "нет связи",
+		"flowmeter_type": "тип расходомера", "downtime": "простой",
+		"power_loss_time": "нет питания",
 	}
 	for _, ch := range channels {
 		factor := ch.Factor

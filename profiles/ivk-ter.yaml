@@ -10,7 +10,7 @@ transport:
   supported: ["tcp", "rtu", "tcp-serial"]
   defaults:
     tcp_port: 502
-    baudrate: 9600
+    baudrate: 4800
     parity: "none"
     stopbits: 1
     response_timeout_ms: 1000
@@ -47,7 +47,7 @@ points:
     epoch: "1970-01-01"
     access: "read"
     group: "time"
-    note: "IR 0x8000 (32768): часы прибора, чтение. 4-байтовая метка Unix, как archive_time в часовом архиве."
+    note: "IR 0x8000 (32768): часы прибора. Live 10.09.2026: число кодирует локальные календарные поля; при сравнении с сервером трактовать в time.Local, не как UTC."
 
   - name: "time_set"
     space: "HR"
@@ -65,6 +65,9 @@ archives:
     index_access: true
     params:
       archive_type: 0
+      # Live-проверка 10.09.2026: часовая запись приходит с меткой
+      # HH:59:59 и относится к периоду, заканчивающемуся в следующем HH:00.
+      timestamp_semantics: "period_end"
     note: "Часовой архив ИВК-ТЭР: функция Modbus 65, архив 0. Запись 30 байт; отдельного CRC внутри записи нет."
     record_layout:
       - { offset: 0, name: "archive_time", type: "uint32", epoch: "1970-01-01" }

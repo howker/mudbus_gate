@@ -107,6 +107,10 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 .log-warn { color: #ffb300; font-weight: bold; }
 .poll-dot { display:inline-block; width:16px; height:16px; border-radius:50%; background:#666; border:2px solid #444; vertical-align:middle; }
 .poll-dot.active { background:#4caf50; border-color:#7bd17f; box-shadow:0 0 8px rgba(76,175,80,0.8); }
+.play-btn { width:34px; height:30px; padding:0; font-size:17px; line-height:30px; text-align:center; }
+.manual-poll-overlay { display:none; position:fixed; z-index:10000; left:0; top:0; right:0; bottom:0; background:rgba(0,0,0,0.68); }
+.manual-poll-box { width:620px; max-width:90%; margin:90px auto 0 auto; background:#252526; border:1px solid #555; border-radius:4px; padding:18px; box-shadow:0 4px 24px rgba(0,0,0,0.6); }
+.manual-poll-log { background:#111; border:1px solid #3e3e42; color:#d4d4d4; padding:12px; min-height:150px; max-height:330px; overflow:auto; white-space:pre-wrap; font-family:Consolas,monospace; font-size:12px; }
 .log-filter-btn { cursor:pointer; border:2px solid transparent; }
 .log-filter-btn.selected { border-color:#ffffff !important; opacity:1 !important; }
 .service-log { width:100%; border-collapse:collapse; }
@@ -195,6 +199,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 
     <div class="section">
       <h3 id="deviceFormTitle">Добавить прибор</h3>
+      <p id="deviceFormOpenRow"><button class="btn" onclick="openNewDeviceForm()">Добавить прибор</button></p>
+      <div id="deviceFormBody" style="display:none;">
       <div id="editWarning" style="display:none;background:#4d3800;border:1px solid #8a6d00;color:#ffd479;padding:10px;border-radius:4px;margin-bottom:15px;">
         Вы редактируете СУЩЕСТВУЮЩИЙ прибор «<span id="editWarningName"></span>» (ID: <span id="editWarningID"></span>).
         Сохранение изменит именно этот прибор, а не создаст новый.
@@ -239,8 +245,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 
       <p><a href="#" onclick="toggleAdvanced(); return false;" style="color:#0e639c;font-size:13px;" id="advancedToggle">▸ Дополнительные настройки</a></p>
       <div id="advancedFields" style="display:none;">
-        <div class="form-row"><label>Глубина дозабора при старте (часов)</label><input id="d_backfill_max_depth_hours" type="number" min="0" step="1" value="0"></div>
-        <p class="small-note">Сколько часов назад искать и добирать пропуски при запуске сервера. 0 — использовать максимально доступную глубину архива, указанную профилем данного прибора.</p>
+        <div class="form-row"><label>Глубина восстановления архива при старте (часов)</label><input id="d_backfill_max_depth_hours" type="number" min="0" step="1" value="0"></div>
+        <p class="small-note">Сколько часов назад проверять и восстанавливать отсутствующие архивные периоды при запуске сервера. 0 — использовать максимально доступную глубину архива, указанную профилем данного прибора.</p>
         <div class="form-row"><label>Опрос каждые N периодов</label><input id="d_archive_every_periods" type="number" min="1" step="1" value="1"></div>
         <p class="small-note">1 — опрашивать каждый архивный период прибора; 2 — каждый второй и т.д. Сам период (например 30 или 60 минут) задаётся профилем прибора.</p>
         <div class="form-row"><label>Дни опроса</label><div style="flex:1">
@@ -276,6 +282,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       </p>
       <div id="probeMsg" class="msg"></div>
       <div id="deviceMsg" class="msg"></div>
+      </div>
     </div>
   </div>
 
@@ -350,9 +357,19 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
           <th>Следующий опрос</th>
           <th>Статус последнего опроса</th>
           <th>Время прибора</th>
+          <th>Действие</th>
         </tr></thead>
-        <tbody id="pollMonitorTable"><tr><td colspan="6">Загрузка...</td></tr></tbody>
+        <tbody id="pollMonitorTable"><tr><td colspan="7">Загрузка...</td></tr></tbody>
       </table>
+    </div>
+  </div>
+
+  <div id="manualPollOverlay" class="manual-poll-overlay">
+    <div class="manual-poll-box">
+      <h3 style="margin-top:0;">Ручной опрос — <span id="manualPollDeviceName"></span></h3>
+      <p class="small-note">Ручной запрос использует тот же канал и очередь, что и автоматический опрос. Поэтому два обмена с одним прибором одновременно не выполняются.</p>
+      <pre id="manualPollLog" class="manual-poll-log"></pre>
+      <p><button class="btn secondary" id="manualPollCloseBtn" onclick="closeManualPollPopup()">Закрыть</button></p>
     </div>
   </div>
 
@@ -384,7 +401,7 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
           <option value="all">Все события</option>
           <option value="error">Ошибки</option>
           <option value="poll">Опрос прибора</option>
-          <option value="archive">Архив и дозабор</option>
+          <option value="archive">Архив и восстановление</option>
           <option value="time">Коррекция времени</option>
           <option value="es">Запись в БД ЭС</option>
           <option value="system">Система</option>
@@ -608,6 +625,7 @@ function onKindChange() {
     // может переключить тип связи на Modbus TCP или TCP-конвертер.
     tk.value = 'rtu_serial';
     profileEl.value = 'profiles/ivk-ter.yaml';
+    if (!idField.disabled) { document.getElementById('d_baudrate').value = '4800'; }
   }
   onTransportKindChange();
   updateVKMTimeCorrectionVisibility();
@@ -1241,7 +1259,10 @@ function humanizeLogLine(html) {
   s = s.replace(/\[es-sync\]/g, '[синхронизация с ЭС]');
   s = s.replace(/архив hourly:/g, 'часовой архив:');
   s = s.replace(/VKM архив main:/g, 'архив ВКМ (получасовка):');
-  s = s.replace(/дозабор (hourly|main):/g, 'довыгрузка архива за прошлое время:');
+  s = s.replace(/дозабор (hourly|main):/g, 'восстановление недостающих архивных данных:');
+  s = s.replace(/дозабор:/g, 'восстановление недостающих архивных данных:');
+  s = s.replace(/backfill/gi, 'восстановление архива');
+  s = s.replace(/manual_archive/g, 'ручной архивный опрос');
   s = s.replace(/сохранено часовок: (\d+)\/(\d+)/g, 'сохранено записей за час: $1 из $2');
   s = s.replace(/сохранено полей: (\d+)\/(\d+)/g, 'сохранено показателей: $1 из $2');
   s = s.replace(/проход завершён:/g, 'цикл отправки в ЭС завершён:');
@@ -1501,7 +1522,8 @@ function clearLogView() {
 function pollKindLabel(kind) {
   if (kind === 'current') { return 'текущие данные'; }
   if (kind === 'archive') { return 'архив'; }
-  if (kind === 'backfill') { return 'дозабор архива'; }
+  if (kind === 'manual_archive') { return 'ручной архивный опрос'; }
+  if (kind === 'backfill') { return 'восстановление архива'; }
   if (kind === 'manual_reload') { return 'принудительный переопрос'; }
   return kind || 'опрос';
 }
@@ -1548,13 +1570,13 @@ function loadPollMonitor() {
     var body = document.getElementById('pollMonitorTable');
     if (!body) { return; }
     if (xhr.status !== 200) {
-      body.innerHTML = '<tr><td colspan="6" class="status-bad">Не удалось получить состояние опроса</td></tr>';
+      body.innerHTML = '<tr><td colspan="7" class="status-bad">Не удалось получить состояние опроса</td></tr>';
       return;
     }
 
     var runtime;
     try { runtime = JSON.parse(xhr.responseText) || []; } catch (e) {
-      body.innerHTML = '<tr><td colspan="6" class="status-bad">Ошибка ответа сервера</td></tr>';
+      body.innerHTML = '<tr><td colspan="7" class="status-bad">Ошибка ответа сервера</td></tr>';
       return;
     }
 
@@ -1588,15 +1610,135 @@ function loadPollMonitor() {
         }
       }
 
+      var action = '<button class="btn play-btn" title="Опросить этот прибор сейчас" onclick="startManualDevicePoll(\'' + d.id + '\')">▶</button>';
       html += '<tr><td style="text-align:center;">' + dot + '</td><td>' +
-        escapeHtmlForLog(d.name || d.id) + '</td><td>' + started + '</td><td>' + next + '</td><td>' + last + '</td><td>' + deviceTimeText(st) + '</td></tr>';
+        escapeHtmlForLog(d.name || d.id) + '</td><td>' + started + '</td><td>' + next + '</td><td>' + last + '</td><td>' + deviceTimeText(st) + '</td><td style="text-align:center;">' + action + '</td></tr>';
     }
     if (html === '') {
-      html = '<tr><td colspan="6">Приборов пока нет</td></tr>';
+      html = '<tr><td colspan="7">Приборов пока нет</td></tr>';
     }
     body.innerHTML = html;
   };
   xhr.send();
+}
+
+var manualPollState = null;
+
+function appendManualPollLog(text) {
+  var el = document.getElementById('manualPollLog');
+  if (!el) { return; }
+  el.innerText += (el.innerText ? '\n' : '') + text;
+  el.scrollTop = el.scrollHeight;
+}
+
+function closeManualPollPopup() {
+  document.getElementById('manualPollOverlay').style.display = 'none';
+  if (manualPollState && manualPollState.timer) { window.clearInterval(manualPollState.timer); }
+  manualPollState = null;
+}
+
+function transportLabelForDevice(d) {
+  if (!d) { return 'Канал прибора'; }
+  if (d.transport_kind === 'rtu_serial') { return d.com || 'COM-порт'; }
+  if (d.host) { return d.host + (d.port ? ':' + d.port : ''); }
+  return 'Канал прибора';
+}
+
+function loadPollStateOnce(deviceId, done) {
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/poll-monitor', true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    if (xhr.status !== 200) { done(null); return; }
+    var arr;
+    try { arr = JSON.parse(xhr.responseText) || []; } catch (e) { done(null); return; }
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i].id === deviceId) { done(arr[i]); return; }
+    }
+    done({});
+  };
+  xhr.send();
+}
+
+function startManualDevicePoll(deviceId) {
+  if (manualPollState && manualPollState.timer) { window.clearInterval(manualPollState.timer); }
+  manualPollState = null;
+  var d = findDevice(deviceId);
+  if (!d) { return; }
+  document.getElementById('manualPollDeviceName').innerText = d.name || d.id;
+  document.getElementById('manualPollLog').innerText = '';
+  document.getElementById('manualPollOverlay').style.display = 'block';
+  appendManualPollLog('Запрос ручного опроса прибора ' + (d.name || d.id) + '.');
+  appendManualPollLog('Ручной опрос использует уже зарегистрированный службой канал прибора; второй COM-порт не открывается.');
+
+  loadPollStateOnce(deviceId, function(before) {
+    before = before || {};
+    manualPollState = {
+      deviceId: deviceId,
+      baselineFinished: before.last_poll_finished_at || '',
+      seenStarted: false,
+      waitingLogged: false,
+      timer: null
+    };
+    if (before.poll_in_progress) {
+      appendManualPollLog('Сейчас выполняется ' + pollKindLabel(before.poll_kind) + '. Ручной запрос будет ждать своей очереди.');
+      manualPollState.waitingLogged = true;
+    }
+
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/devices/poll-now', true);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onreadystatechange = function() {
+      if (xhr.readyState !== 4) { return; }
+      if (xhr.status !== 200) {
+        var err = 'не удалось поставить опрос в очередь';
+        try { err = (JSON.parse(xhr.responseText) || {}).error || err; } catch (e) {}
+        appendManualPollLog('ERROR: ' + err);
+        return;
+      }
+      appendManualPollLog('OK: ' + transportLabelForDevice(d) + ': канал прибора зарегистрирован работающей службой и готов к обмену.');
+      appendManualPollLog('OK: ручной архивный опрос поставлен в приоритетную очередь.');
+      manualPollState.timer = window.setInterval(watchManualDevicePoll, 500);
+      watchManualDevicePoll();
+    };
+    xhr.send(JSON.stringify({device_id: deviceId}));
+  });
+}
+
+function watchManualDevicePoll() {
+  var state = manualPollState;
+  if (!state) { return; }
+  loadPollStateOnce(state.deviceId, function(st) {
+    if (!manualPollState || manualPollState !== state) { return; }
+    st = st || {};
+    if (st.poll_in_progress && st.poll_kind === 'manual_archive') {
+      if (!state.seenStarted) {
+        state.seenStarted = true;
+        appendManualPollLog('Опрос начат: ' + (st.poll_started_at || 'сейчас') + '.');
+      }
+      return;
+    }
+    if (st.poll_in_progress && st.poll_kind !== 'manual_archive') {
+      if (!state.waitingLogged) {
+        state.waitingLogged = true;
+        appendManualPollLog('Прибор занят: выполняется ' + pollKindLabel(st.poll_kind) + '. Ручной запрос ждёт окончания этого обмена.');
+      }
+      return;
+    }
+
+    var finishedChanged = st.last_poll_finished_at && st.last_poll_finished_at !== state.baselineFinished;
+    if (st.last_poll_kind === 'manual_archive' && (state.seenStarted || finishedChanged)) {
+      if (state.timer) { window.clearInterval(state.timer); state.timer = null; }
+      if (st.last_poll_ok) {
+        appendManualPollLog('OK: ручной опрос завершён успешно' + (st.last_poll_finished_at ? ' — ' + st.last_poll_finished_at : '') + '.');
+      } else {
+        appendManualPollLog('ERROR: ручной опрос завершён с ошибкой' + (st.last_poll_finished_at ? ' — ' + st.last_poll_finished_at : '') + '.');
+        if (st.last_poll_error) { appendManualPollLog('Причина: ' + st.last_poll_error); }
+      }
+      appendManualPollLog(transportLabelForDevice(findDevice(state.deviceId)) + ': канал остаётся открыт службой для следующих плановых опросов.');
+      loadPollMonitor();
+    }
+  });
 }
 
 // ===================== СЛУЖБА =====================
@@ -1933,9 +2075,20 @@ function findDevice(id) {
   return null;
 }
 
+function showDeviceFormBody() {
+  document.getElementById('deviceFormBody').style.display = 'block';
+  document.getElementById('deviceFormOpenRow').style.display = 'none';
+}
+
+function openNewDeviceForm() {
+  resetDeviceForm();
+  showDeviceFormBody();
+}
+
 function editDevice(id) {
   var d = findDevice(id);
   if (!d) { return; }
+  showDeviceFormBody();
   // Сброс сообщений от ПРЕЖНЕГО прибора — без этого «Сохранено. Для
   // применения запустите/перезапустите mbgw server.» (или результат
   // «Проверить прибор») продолжало висеть на экране после переключения
@@ -2187,6 +2340,17 @@ var POINT_TAG_DEFS = {
   ],
   akron: [
     { tag: 'V', label: 'Объём (V)', hint: 'Часовой расход вычисляется по разнице накопительного V и автоматически делится поровну на две получасовки ЭС. Множитель 1 = м³ без дополнительного пересчёта.' }
+  ],
+  'ivk-ter': [
+    { tag: 'v_plus', label: 'Объём прямой', hint: 'Часовое значение из архива ИВК-ТЭР, м³. Множитель 1 передаёт значение без пересчёта.' },
+    { tag: 'v_minus', label: 'Объём обратный', hint: 'Часовое значение из архива ИВК-ТЭР, м³. Множитель 1 передаёт значение без пересчёта.' },
+    { tag: 'q_avg', label: 'Средний расход', hint: 'Средний расход за архивный час, л/мин. Множитель 1 передаёт значение без пересчёта.' },
+    { tag: 'resistance', label: 'Сопротивление', hint: 'Сопротивление из часового архива ИВК-ТЭР, Ом.' },
+    { tag: 'errors', label: 'Код ошибок', hint: 'Код состояния/ошибок из часовой записи. Обычно множитель оставляют 1.' },
+    { tag: 'comm_fail_time', label: 'Нет связи, мин', hint: 'Продолжительность отсутствия связи, записанная прибором за период.' },
+    { tag: 'flowmeter_type', label: 'Тип расходомера (код)', hint: 'Код типа расходомера из архивной записи ИВК-ТЭР.' },
+    { tag: 'downtime', label: 'Простой, мин', hint: 'Продолжительность простоя за архивный период.' },
+    { tag: 'power_loss_time', label: 'Нет питания, мин', hint: 'Продолжительность отсутствия питания за архивный период.' }
   ]
 };
 
@@ -2202,7 +2366,7 @@ function currentChannelsKind() {
 }
 
 // renderChannelsTable перестраивает строки таблицы под тип прибора —
-// у ВКМ четыре величины, у Akron одна. Вызывается ДО заполнения
+// набор величин определяется типом прибора: ВКМ, Akron или ИВК-ТЭР. Вызывается ДО заполнения
 // значений (loadChannels), чтобы поля #ch_<тег>_id/#ch_<тег>_factor
 // уже существовали в DOM к моменту, когда придёт ответ сервера.
 function renderChannelsTable(kind) {
@@ -2784,6 +2948,8 @@ attachCalendar('dr_to');
 loadDevices();
 loadProfiles();
 resetDeviceForm();
+document.getElementById('deviceFormBody').style.display = 'none';
+document.getElementById('deviceFormOpenRow').style.display = 'block';
 loadDashboard();
 loadPollMonitor();
 // Автообновление вкладки «Главная» — раз в 30с, независимо от того,

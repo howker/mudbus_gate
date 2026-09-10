@@ -33,8 +33,13 @@ func (c *clockRouteClient) Transact(ctx context.Context, req []byte) ([]byte, er
 
 func TestUpdateTimeDrift_VZLETUsesUnixClockPoint(t *testing.T) {
 	addr := 32768
-	deviceClock := time.Now().Add(-90 * time.Second).Truncate(time.Second)
-	raw, err := codec.EncodeUint32(uint32(deviceClock.Unix()), "0123")
+	deviceClock := time.Now().In(time.Local).Add(-90 * time.Second).Truncate(time.Second)
+	wallClockUnix := time.Date(
+		deviceClock.Year(), deviceClock.Month(), deviceClock.Day(),
+		deviceClock.Hour(), deviceClock.Minute(), deviceClock.Second(),
+		0, time.UTC,
+	).Unix()
+	raw, err := codec.EncodeUint32(uint32(wallClockUnix), "0123")
 	if err != nil {
 		t.Fatalf("encode clock: %v", err)
 	}

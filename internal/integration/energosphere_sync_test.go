@@ -204,3 +204,54 @@ func TestCollectReadingsForESRangeIncludesLastAkronHalfHourWithShift(t *testing.
 		t.Fatalf("want last half-hour value 65.5, got %g", last.value)
 	}
 }
+
+func TestCollectIVKReadingsUsesHourlyArchiveAndAppliesFactor(t *testing.T) {
+	repo := newIntegrationTestRepo(t)
+	loc := time.Local
+	ts := time.Date(2026, 9, 10, 15, 0, 0, 0, loc)
+
+	for _, row := range []storage.HourlyArchiveRecord{
+		{DeviceID: "ivk", Param: "v_plus", TsHour: ts, Value: 74.359, Unit: "м3"},
+		{DeviceID: "ivk", Param: "q_avg", TsHour: ts, Value: 1239.318, Unit: "л/мин"},
+	} {
+		if err := repo.SaveHourlyArchive(context.Background(), row); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := collectReadings(
+		context.Background(),
+		repo,
+		Config{
+			DeviceID:         "ivk",
+			Kind:             "ivk-ter",
+			TimeShiftMinutes: 0,
+			Points: []PointMapping{
+				{Tag: "v_plus", PointID: 101, Factor: 1},
+				{Tag: "q_avg", PointID: 102, Factor: 0.001},
+			},
+		},
+		ts,
+		ts,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 IVK readings, got %d: %#v", len(got), got)
+	}
+
+	byTag := make(map[string]pointReading)
+	for _, r := range got {
+		byTag[r.mapping.Tag] = r
+		if !r.ts.Equal(ts) {
+			t.Fatalf("tag %s: got ts %v, want %v", r.mapping.Tag, r.ts, ts)
+		}
+	}
+	if math.Abs(byTag["v_plus"].value-74.359) > 1e-9 {
+		t.Fatalf("v_plus=%g, want 74.359", byTag["v_plus"].value)
+	}
+	if math.Abs(byTag["q_avg"].value-1.239318) > 1e-9 {
+		t.Fatalf("q_avg=%g, want 1.239318 after factor", byTag["q_avg"].value)
+	}
+}

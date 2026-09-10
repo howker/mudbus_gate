@@ -21,6 +21,10 @@ type Kind string
 const (
 	KindCurrent Kind = "current"
 	KindArchive Kind = "archive"
+	// KindManualArchive is the same near-term archive read as KindArchive,
+	// but carries an explicit operator origin into health/UI. It is enqueued
+	// with PriorityManual and never changes the device's calendar schedule.
+	KindManualArchive Kind = "manual_archive"
 	// KindBackfill is a deep archive catch-up (device.BackfillArchives),
 	// as opposed to KindArchive's regular near-term read
 	// (device.PollArchives). Routed through the same single-threaded

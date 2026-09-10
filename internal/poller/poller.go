@@ -239,6 +239,21 @@ func (p *Poller) drain(ctx context.Context) {
 	wg.Wait()
 }
 
+func taskKindLabelRU(kind scheduler.Kind) string {
+	switch kind {
+	case scheduler.KindCurrent:
+		return "опрос текущих данных"
+	case scheduler.KindArchive:
+		return "плановый архивный опрос"
+	case scheduler.KindManualArchive:
+		return "ручной архивный опрос"
+	case scheduler.KindBackfill:
+		return "восстановление недостающих данных архива"
+	default:
+		return "опрос " + string(kind)
+	}
+}
+
 // dispatchLocked берёт мьютекс ИМЕННО ЭТОГО прибора перед тем, как его
 // опрашивать — если для этого же прибора уже выполняется другое
 // задание, эта горутина подождёт здесь, не занимая при этом ничего
@@ -261,11 +276,14 @@ func (p *Poller) dispatch(ctx context.Context, task scheduler.Task) {
 	startedAt := time.Now()
 	before := health.Get().Devices[task.DeviceID]
 	health.MarkPollStarted(task.DeviceID, string(task.Kind), startedAt)
+	log.Printf("[%s] [ОПРОС] %s начат\n", task.DeviceID, taskKindLabelRU(task.Kind))
 
-	recordResult := task.Kind == scheduler.KindCurrent || task.Kind == scheduler.KindArchive
+	recordResult := task.Kind == scheduler.KindCurrent || task.Kind == scheduler.KindArchive || task.Kind == scheduler.KindManualArchive
 	defer func() {
+		finishedAt := time.Now()
 		if !recordResult {
-			health.MarkPollFinished(task.DeviceID, string(task.Kind), time.Now(), true, "", false)
+			health.MarkPollFinished(task.DeviceID, string(task.Kind), finishedAt, true, "", false)
+			log.Printf("[%s] [ОПРОС] %s завершён\n", task.DeviceID, taskKindLabelRU(task.Kind))
 			return
 		}
 
@@ -275,7 +293,7 @@ func (p *Poller) dispatch(ctx context.Context, task scheduler.Task) {
 		case scheduler.KindCurrent:
 			pollOK = after.LastCurrentSuccess.After(startedAt) &&
 				after.LastCurrentSuccess.After(before.LastCurrentSuccess)
-		case scheduler.KindArchive:
+		case scheduler.KindArchive, scheduler.KindManualArchive:
 			pollOK = after.LastArchiveSuccess.After(startedAt) &&
 				after.LastArchiveSuccess.After(before.LastArchiveSuccess)
 		}
@@ -284,13 +302,18 @@ func (p *Poller) dispatch(ctx context.Context, task scheduler.Task) {
 		if !pollOK {
 			errText = "прибор не подтвердил успешное получение и сохранение данных"
 		}
-		health.MarkPollFinished(task.DeviceID, string(task.Kind), time.Now(), pollOK, errText, true)
+		health.MarkPollFinished(task.DeviceID, string(task.Kind), finishedAt, pollOK, errText, true)
+		if pollOK {
+			log.Printf("[%s] [ОПРОС] %s завершён успешно\n", task.DeviceID, taskKindLabelRU(task.Kind))
+		} else {
+			log.Printf("[%s] [ОПРОС] %s завершён с ошибкой: %s\n", task.DeviceID, taskKindLabelRU(task.Kind), errText)
+		}
 	}()
 
 	switch task.Kind {
 	case scheduler.KindCurrent:
 		dev.Poll(ctx)
-	case scheduler.KindArchive:
+	case scheduler.KindArchive, scheduler.KindManualArchive:
 		dev.PollArchives(ctx)
 	case scheduler.KindBackfill:
 		// Deep catch-up (device.BackfillArchives), same call the startup
