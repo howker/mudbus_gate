@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"time"
 )
@@ -119,6 +120,7 @@ func (s *Server) handleForceReload(w http.ResponseWriter, r *http.Request) {
 			job.Error = "Отменено оператором"
 		} else if err != nil {
 			job.Error = err.Error()
+			log.Printf("[%s] [WEB] принудительный переопрос завершён с ошибкой: %v\n", body.DeviceID, err)
 		}
 		s.reloadJobsMu.Unlock()
 	}()
@@ -200,7 +202,7 @@ func (s *Server) handleReloadProgress(w http.ResponseWriter, r *http.Request) {
 		"total":    snapshot.Total,
 		"saved":    snapshot.Saved,
 		"finished": snapshot.Finished,
-		"error":    snapshot.Error,
+		"error":    friendlyPollError(snapshot.Error),
 	})
 }
 

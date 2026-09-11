@@ -274,3 +274,32 @@ func TestPoller_DifferentDevicesRunInParallel(t *testing.T) {
 		t.Fatal("параллельный опрос не завершился")
 	}
 }
+
+func TestPoller_BackfillChecksDeviceClock(t *testing.T) {
+	addr := 32768
+	p := &profile.Profile{
+		Meta:  profile.Meta{Model: "IVK-TER"},
+		Codec: profile.Codec{WordOrder32: "0123"},
+		Points: []profile.Point{{
+			Name: "current_time", Space: "IR", Addr: &addr, Type: "uint32", Epoch: "1970-01-01", Access: "read",
+		}},
+	}
+	cli := &countingClient{}
+	repo, err := sqliterepo.New(":memory:")
+	if err != nil {
+		t.Fatalf("failed to create repo: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+	if err := repo.InitSchema(context.Background()); err != nil {
+		t.Fatalf("failed to init schema: %v", err)
+	}
+	dev := device.New("ivk1", p, cli, &session.NoopSession{}, repo, lease.New())
+
+	sched := scheduler.New(nil)
+	sched.RequestManualPoll("ivk1", scheduler.KindBackfill)
+	New(sched, map[string]*device.Device{"ivk1": dev}, time.Second).drain(context.Background())
+
+	if cli.Reads() != 1 {
+		t.Fatalf("startup backfill clock reads=%d, want 1", cli.Reads())
+	}
+}

@@ -316,6 +316,12 @@ func (p *Poller) dispatch(ctx context.Context, task scheduler.Task) {
 	case scheduler.KindArchive, scheduler.KindManualArchive:
 		dev.PollArchives(ctx)
 	case scheduler.KindBackfill:
+		// Startup/manual backfill must update the same clock status as a regular
+		// archive poll before it can spend minutes walking deep history. This is
+		// intentionally independent of the backfill result: inability to check
+		// the clock does not cancel archive recovery.
+		dev.CheckTime(ctx)
+
 		// Deep catch-up (device.BackfillArchives), same call the startup
 		// sweep makes — but dispatched here, in-queue, so it can never
 		// run concurrently with a current-value or regular-archive poll

@@ -287,6 +287,20 @@ func (d *Device) Poll(ctx context.Context) {
 // Server time is sampled immediately before and after the physical read and
 // the midpoint is used for comparison, which removes most request/response
 // latency bias.
+// CheckTime performs the common clock check used by all production polling
+// paths. It owns the device lease only for the clock transaction, then releases
+// it before archive/current I/O continues. A failed clock check never blocks
+// archive collection; updateTimeDrift records the diagnostic state for the UI.
+func (d *Device) CheckTime(ctx context.Context) {
+	release, err := d.acquireLeaseWithRetry(ctx, "clock", 30*time.Second)
+	if err != nil {
+		log.Printf("[%s] контроль времени: прибор занят другим опросом; проверка пропущена: %v\n", d.ID, err)
+		return
+	}
+	defer release()
+	d.updateTimeDrift(ctx)
+}
+
 func (d *Device) updateTimeDrift(ctx context.Context) {
 	switch {
 	case d.hasAkronArchive():
@@ -851,16 +865,10 @@ func (d *Device) pollOnePoint(ctx context.Context, pt profile.Point, addr int, i
 // PollArchives runs each archive strategy declared in the device profile
 // (exported so internal/poller can drive it centrally).
 func (d *Device) PollArchives(ctx context.Context) {
-	// Шлюз работает по архивному расписанию, поэтому отдельный регулярный
-	// цикл "текущих" больше не нужен. Контроль часов прибора выполняем
-	// перед архивным тактом: монитор времени и безопасная коррекция ВКМ
-	// остаются живыми, но не создают второго пользовательского расписания.
-	if release, err := d.acquireLeaseWithRetry(ctx, "archive-clock", 30*time.Second); err != nil {
-		log.Printf("[%s] контроль времени перед архивным опросом: не удалось занять прибор: %v\n", d.ID, err)
-	} else {
-		d.updateTimeDrift(ctx)
-		release()
-	}
+	// Контроль часов выполняется тем же общим путём, что используется
+	// стартовым и принудительным опросом. Для типов приборов, где запись
+	// времени не поддерживается, это остаётся только безопасным чтением.
+	d.CheckTime(ctx)
 
 	for _, a := range d.Profile.Archives {
 		// VKM's mb_request_poll_string strategy returns ONE aggregate per

@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"mbgw/internal/buildinfo"
 	"mbgw/internal/codec"
 	"mbgw/internal/dbg"
 	"mbgw/internal/device"
@@ -269,6 +270,17 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 	log.SetOutput(newRussianLogWriter(multiWriter))
 	log.SetFlags(log.Ldate | log.Ltime)
 	log.Println("=== запуск шлюза mbgw (сервер: единый процесс, конфигурация из БД) ===")
+	bi := buildinfo.Current()
+	revision := bi.Revision
+	if revision == "" {
+		revision = "не определён"
+	}
+	buildTime := bi.BuildTime
+	if buildTime == "" {
+		buildTime = "не указано"
+	}
+	log.Printf("[СБОРКА] commit=%s, изменённые исходники=%v, время сборки=%s, Go=%s\n",
+		revision, bi.Modified, buildTime, bi.GoVersion)
 
 	// Защита от двойного запуска — сразу после открытия лога, до
 	// регистрации в диспетчере служб и уж тем более до регистрации
@@ -718,6 +730,10 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 		}
 		log.Printf("[WEB] принудительный переопрос архива %s (%s) с %s по %s\n",
 			deviceID, deviceKindLabelRU(kind), from.Format("02.01.2006 15:04"), to.Format("02.01.2006 15:04"))
+		// Принудительный переопрос идёт в обход poller, поэтому контроль
+		// времени вызываем здесь тем же общим методом. Архивный переопрос
+		// продолжается даже если проверка часов не удалась.
+		dev.CheckTime(jobCtx)
 		switch kind {
 		case "akron":
 			return dev.ForceReloadAkronHourly(jobCtx, from, to, onProgress)

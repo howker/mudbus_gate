@@ -190,6 +190,9 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 		if j.TransportKind != "modbus_tcp" {
 			j.COM = strings.ToUpper(strings.TrimSpace(j.COM))
 		}
+		if j.Retries <= 0 {
+			j.Retries = 3
+		}
 		if j.ArchiveAtMinute < 0 || j.ArchiveAtMinute > 59 {
 			writeError(w, http.StatusBadRequest, "сдвиг архивного опроса должен быть от 0 до 59 минут")
 			return
@@ -209,7 +212,7 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if j.TimeCorrectionDeadbandSeconds < 0 {
-			writeError(w, http.StatusBadRequest, "допустимое рассинхронизирование времени не может быть отрицательным")
+			writeError(w, http.StatusBadRequest, "допустимое расхождение времени не может быть отрицательным")
 			return
 		}
 		if j.TimeCorrectionMaxStepSeconds < 0 || j.TimeCorrectionMaxStepSeconds > 99 {

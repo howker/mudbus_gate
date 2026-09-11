@@ -3,6 +3,8 @@ package web
 import (
 	"net/http"
 	"strconv"
+
+	"mbgw/internal/buildinfo"
 )
 
 type serviceStatusJSON struct {
@@ -10,7 +12,15 @@ type serviceStatusJSON struct {
 	RunningAsService bool               `json:"running_as_service"`
 	ServiceInstalled bool               `json:"service_installed"`
 	ServiceState     string             `json:"service_state,omitempty"`
+	Build            buildStatusJSON    `json:"build"`
 	Watchdog         WatchdogStatusJSON `json:"watchdog"`
+}
+
+type buildStatusJSON struct {
+	Revision  string `json:"revision,omitempty"`
+	Modified  bool   `json:"modified"`
+	BuildTime string `json:"build_time,omitempty"`
+	GoVersion string `json:"go_version"`
 }
 
 // WatchdogStatusJSON — runtime-состояние механизма защиты от зависания.
@@ -53,9 +63,14 @@ func (s *Server) handleServiceStatus(w http.ResponseWriter, r *http.Request) {
 	if s.onWatchdogStatus != nil {
 		wd = s.onWatchdogStatus()
 	}
+	bi := buildinfo.Current()
 	writeJSON(w, http.StatusOK, serviceStatusJSON{
 		GOOS: goos, RunningAsService: runningAsService, ServiceInstalled: serviceInstalled,
-		ServiceState: serviceState, Watchdog: wd,
+		ServiceState: serviceState,
+		Build: buildStatusJSON{
+			Revision: bi.Revision, Modified: bi.Modified, BuildTime: bi.BuildTime, GoVersion: bi.GoVersion,
+		},
+		Watchdog: wd,
 	})
 }
 

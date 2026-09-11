@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS devices (
     archive_days_mask        INTEGER NOT NULL DEFAULT 127, -- bit0=Mon ... bit6=Sun
     archive_window_start     TEXT NOT NULL DEFAULT '',     -- HH:MM, empty = no daily window
     archive_window_end       TEXT NOT NULL DEFAULT '',     -- HH:MM, empty = no daily window
-    time_correction_deadband_seconds INTEGER NOT NULL DEFAULT 0, -- 0 = автокоррекция выключена
+    time_correction_deadband_seconds INTEGER NOT NULL DEFAULT 0, -- 0 = без порога; автокоррекция включается двумя лимитами ниже
     time_correction_max_step_seconds INTEGER NOT NULL DEFAULT 0, -- 1..99 сек; 0 = автокоррекция выключена
     time_correction_daily_limit_seconds INTEGER NOT NULL DEFAULT 0, -- суммарный модуль коррекций за скользящие 24ч; 0 = автокоррекция выключена
     enabled                  INTEGER NOT NULL DEFAULT 1,   -- 0/1: poll paused without deleting the device
@@ -137,8 +137,10 @@ CREATE TABLE IF NOT EXISTS es_akron_northbound (
 	// install's CREATE TABLE above already included it).
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN retries INTEGER NOT NULL DEFAULT 3`)
 
-	// Настройки безопасной автокоррекции часов ВКМ. Нулевые значения
-	// оставляют функцию выключенной на существующих базах после обновления.
+	// Настройки безопасной автокоррекции часов ВКМ. После миграции
+	// MaxStep/DailyLimit остаются нулевыми, поэтому автокоррекция выключена.
+	// Deadband=0 сам по себе коррекцию не выключает: это означает отсутствие
+	// дополнительного порога расхождения.
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN time_correction_deadband_seconds INTEGER NOT NULL DEFAULT 0`)
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN time_correction_max_step_seconds INTEGER NOT NULL DEFAULT 0`)
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE devices ADD COLUMN time_correction_daily_limit_seconds INTEGER NOT NULL DEFAULT 0`)
@@ -189,9 +191,10 @@ type DeviceRecord struct {
 	ArchiveDaysMask       int
 	ArchiveWindowStart    string // HH:MM; both window fields empty = all day
 	ArchiveWindowEnd      string
-	// VKM clock auto-correction safety settings. All three must be > 0
-	// for automatic correction to be enabled. MaxStepSeconds is additionally
-	// capped by the device/protocol limit of 99 seconds by the caller.
+	// VKM clock auto-correction safety settings. Automatic correction is
+	// enabled when MaxStepSeconds and DailyLimitSeconds are both > 0.
+	// DeadbandSeconds may be 0, meaning no additional drift threshold.
+	// MaxStepSeconds is additionally capped by the protocol limit of 99 seconds.
 	TimeCorrectionDeadbandSeconds   int
 	TimeCorrectionMaxStepSeconds    int
 	TimeCorrectionDailyLimitSeconds int
@@ -203,6 +206,9 @@ type DeviceRecord struct {
 // not a partial patch; simpler and sufficient for a single-operator admin
 // screen).
 func (r *Repo) UpsertDevice(ctx context.Context, d DeviceRecord) error {
+	if d.Retries <= 0 {
+		d.Retries = 3
+	}
 	if d.TimeCorrectionDeadbandSeconds < 0 {
 		return fmt.Errorf("допустимое расхождение времени не может быть отрицательным")
 	}

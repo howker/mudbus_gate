@@ -239,16 +239,16 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       </div>
       <div class="form-row"><label>Адрес прибора на линии</label><input id="d_unit_id" type="text" value="1"></div>
       <div class="form-row"><label>Таймаут (мс)</label><input id="d_timeout_ms" type="text" value="1000"></div>
-      <div class="form-row"><label>Количество повторов при ошибке</label><input id="d_retries" type="text" value="3"></div>
-      <p class="small-note" style="margin-left:220px;margin-top:-8px;">При сбое запрос повторяется с растущей паузой (0.2с, 0.4с, 0.8с) — полезно на нестабильной линии (RS-485 с помехами, обрывы).</p>
+      <div class="form-row"><label>Количество повторов при ошибке</label><input id="d_retries" type="number" min="1" step="1" value="3"></div>
+      <p class="small-note" style="margin-left:220px;margin-top:-8px;">По умолчанию: 3. При ошибке шлюз повторяет запрос с паузой. Значение 0 не используется: сервер всё равно применит 3.</p>
       <div class="form-row"><label>Включён</label><input id="d_enabled" type="checkbox" checked></div>
 
       <p><a href="#" onclick="toggleAdvanced(); return false;" style="color:#0e639c;font-size:13px;" id="advancedToggle">▸ Дополнительные настройки</a></p>
       <div id="advancedFields" style="display:none;">
         <div class="form-row"><label>Глубина восстановления архива при старте (часов)</label><input id="d_backfill_max_depth_hours" type="number" min="0" step="1" value="0"></div>
-        <p class="small-note">Сколько часов назад проверять и восстанавливать отсутствующие архивные периоды при запуске сервера. 0 — использовать максимально доступную глубину архива, указанную профилем данного прибора.</p>
+        <p class="small-note">По умолчанию: 0. Это означает — проверять максимально доступную глубину архива, указанную профилем данного прибора.</p>
         <div class="form-row"><label>Опрос каждые N периодов</label><input id="d_archive_every_periods" type="number" min="1" step="1" value="1"></div>
-        <p class="small-note">1 — опрашивать каждый архивный период прибора; 2 — каждый второй и т.д. Сам период (например 30 или 60 минут) задаётся профилем прибора.</p>
+        <p class="small-note">По умолчанию: 1 — опрашивать каждый архивный период. 2 — каждый второй и т.д. Длительность периода задаётся профилем прибора.</p>
         <div class="form-row"><label>Дни опроса</label><div style="flex:1">
           <label><input class="d_sched_day" type="checkbox" value="1" checked> Пн</label>
           <label><input class="d_sched_day" type="checkbox" value="2" checked> Вт</label>
@@ -258,20 +258,22 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
           <label><input class="d_sched_day" type="checkbox" value="32" checked> Сб</label>
           <label><input class="d_sched_day" type="checkbox" value="64" checked> Вс</label>
         </div></div>
+        <p class="small-note">По умолчанию выбраны все дни недели.</p>
         <div class="form-row"><label>Разрешённое время суток</label><div style="flex:1"><input id="d_archive_window_start" type="time"> — <input id="d_archive_window_end" type="time"></div></div>
-        <p class="small-note">Оставьте оба поля пустыми для круглосуточного опроса. Интервал может переходить через полночь.</p>
+        <p class="small-note">По умолчанию оба поля пустые — опрос разрешён круглосуточно. Интервал может переходить через полночь.</p>
         <div class="form-row"><label>Сдвиг от границы периода (мин)</label><input id="d_archive_at_minute" type="number" min="0" max="59" step="1" value="5"></div>
-        <p class="small-note">Через сколько минут после границы архивного периода начинать штатный опрос. По умолчанию +5 минут. Следующее фактическое время показывается в «Мониторе опроса».</p>
+        <p class="small-note">Через сколько минут после границы архивного периода начинать штатный опрос. По умолчанию: +5 минут. Следующее фактическое время показывается в «Мониторе опроса».</p>
+        <p class="small-note" style="color:#ffd479;">Время прибора проверяется автоматически при опросе, если его профиль поддерживает чтение часов. Возможность автоматической коррекции зависит от типа прибора.</p>
 
         <div id="vkmTimeCorrectionFields" style="display:none;margin-top:18px;padding-top:12px;border-top:1px solid #3e3e42;">
           <p style="margin-top:0;color:#ffffff;font-size:13px;"><b>Коррекция времени ВКМ-360</b></p>
-          <div class="form-row"><label>Допустимая рассинхронизация, сек</label><input id="d_time_correction_deadband_seconds" type="text" value="0"></div>
-          <p class="small-note" style="margin-left:220px;margin-top:-8px;">Если расхождение времени прибора и сервера по модулю не больше этого значения, часы не корректируются.</p>
-          <div class="form-row"><label>Макс. коррекция за один раз, сек</label><input id="d_time_correction_max_step_seconds" type="text" value="0"></div>
-          <p class="small-note" style="margin-left:220px;margin-top:-8px;">Верхняя граница одной коррекции. Допустимо 0–99 сек; УВП не позволяет корректировать больше 99 секунд одной командой.</p>
-          <div class="form-row"><label>Макс. коррекция за 24 часа, сек</label><input id="d_time_correction_daily_limit_seconds" type="text" value="0"></div>
-          <p class="small-note" style="margin-left:220px;margin-top:-8px;">Суточный лимит считается как сумма модулей реально выполненных коррекций за последние 24 часа. Например, +20 сек и затем -20 сек используют 40 сек лимита.</p>
-          <p class="small-note" style="color:#ffd479;">Автокоррекция выключена, пока «Макс. коррекция за один раз» или «Макс. коррекция за 24 часа» равна 0.</p>
+          <div class="form-row"><label>Допустимое расхождение времени, сек</label><input id="d_time_correction_deadband_seconds" type="number" min="0" step="1" value="0"></div>
+          <p class="small-note" style="margin-left:220px;margin-top:-8px;">По умолчанию: 0. Если автокоррекция включена, 0 означает корректировать любое ненулевое расхождение; значение больше 0 задаёт порог, внутри которого часы не изменяются.</p>
+          <div class="form-row"><label>Макс. коррекция за один раз, сек</label><input id="d_time_correction_max_step_seconds" type="number" min="0" max="99" step="1" value="0"></div>
+          <p class="small-note" style="margin-left:220px;margin-top:-8px;">По умолчанию: 0 — автокоррекция выключена. Для ВКМ допустимо 1–99 сек за одну коррекцию.</p>
+          <div class="form-row"><label>Макс. коррекция за 24 часа, сек</label><input id="d_time_correction_daily_limit_seconds" type="number" min="0" step="1" value="0"></div>
+          <p class="small-note" style="margin-left:220px;margin-top:-8px;">По умолчанию: 0 — автокоррекция выключена. При ненулевом значении ограничивается суммарная величина коррекций за последние 24 часа.</p>
+          <p class="small-note" style="color:#ffd479;">Для включения автокоррекции ВКМ задайте оба ограничения выше 0. Проверка расхождения времени работает и при выключенной автокоррекции.</p>
         </div>
       </div>
 
@@ -742,7 +744,7 @@ function validateTransportFields(body) {
 function validateTimeCorrectionFields(body) {
   if (body.kind !== 'vkm360') { return ''; }
   if (body.time_correction_deadband_seconds < 0) {
-    return 'Поле "Допустимая рассинхронизация" не может быть отрицательным';
+    return 'Поле "Допустимое расхождение времени" не может быть отрицательным';
   }
   if (body.time_correction_max_step_seconds < 0 || body.time_correction_max_step_seconds > 99) {
     return 'Поле "Макс. коррекция за один раз" должно быть от 0 до 99 секунд';
@@ -1773,6 +1775,14 @@ function loadServiceStatus() {
 
 function renderServiceContent(data) {
   var html = '';
+  var build = data.build || {};
+  var revision = build.revision || 'не определён';
+  var shortRevision = revision.length > 12 ? revision.substring(0, 12) : revision;
+  var sourceState = build.revision ? (build.modified ? 'есть незакоммиченные изменения' : 'чистая сборка') : 'состояние исходников не определено';
+  html += '<div class="watchdog-box"><b>Версия программы</b>';
+  html += '<p>Commit: <code title="' + escapeHtmlForLog(revision) + '">' + escapeHtmlForLog(shortRevision) + '</code> — ' + sourceState + '.</p>';
+  html += '<p>Собрано: ' + escapeHtmlForLog(build.build_time || 'время сборки не указано') + '</p>';
+  html += '<p>Go: ' + escapeHtmlForLog(build.go_version || 'нет данных') + '</p></div>';
   if (data.goos !== 'windows') {
     html += '<p class="small-note">Управление службой реализовано для Windows.</p>';
   } else {

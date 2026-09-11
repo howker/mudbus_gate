@@ -3,11 +3,49 @@ package web
 import (
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"mbgw/internal/devicestatus"
 	"mbgw/internal/health"
+	sqliterepo "mbgw/internal/storage/sqlite"
 )
+
+func friendlyPollError(raw string) string {
+	text := strings.ToLower(strings.TrimSpace(raw))
+	if text == "" {
+		return ""
+	}
+	switch {
+	case strings.Contains(text, "отмен") || strings.Contains(text, "context canceled"):
+		return "Опрос отменён"
+	case strings.Contains(text, "lease") || strings.Contains(text, "прибор занят") || strings.Contains(text, "другой операц"):
+		return "Прибор занят другим опросом"
+	case strings.Contains(text, "timeout") || strings.Contains(text, "deadline exceeded") || strings.Contains(text, "таймаут") || strings.Contains(text, "нет ответа"):
+		return "Нет ответа от прибора"
+	case strings.Contains(text, "не подтвердил успешное получение"):
+		return "Данные не получены"
+	default:
+		return "Ошибка опроса — подробности в журнале"
+	}
+}
+
+func friendlyTimeDriftNote(raw string, reliable bool) string {
+	text := strings.ToLower(strings.TrimSpace(raw))
+	if text == "" {
+		return ""
+	}
+	if strings.Contains(text, "не поддерживается") {
+		return "Проверка времени для этого типа прибора не поддерживается"
+	}
+	if strings.Contains(text, "коррекция") && strings.Contains(text, "контрольное чтение") {
+		return "Коррекция выполнена, но проверить результат не удалось"
+	}
+	if !reliable {
+		return "Не удалось проверить время прибора"
+	}
+	return ""
+}
 
 type pollMonitorRow struct {
 	ID string `json:"id"`
@@ -54,9 +92,11 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	enabled := make(map[string]bool, len(configured))
+	configuredByID := make(map[string]sqliterepo.DeviceRecord, len(configured))
 	for _, d := range configured {
 		if d.Enabled {
 			enabled[d.ID] = true
+			configuredByID[d.ID] = d
 		}
 	}
 
@@ -112,7 +152,7 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 		row := pollMonitorRow{
 			ID: id, PollInProgress: st.PollInProgress, PollKind: st.PollKind,
 			LastPollOK: st.LastPollOK, LastPollKnown: st.LastPollKnown,
-			LastPollKind: st.LastPollKind, LastPollError: st.LastPollError,
+			LastPollKind: st.LastPollKind, LastPollError: friendlyPollError(st.LastPollError),
 		}
 		if !st.PollStartedAt.IsZero() {
 			row.PollStartedAt = st.PollStartedAt.Format("02.01.2006 15:04:05")
@@ -128,7 +168,7 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 			row.TimeDriftKnown = true
 			row.TimeDriftReliable = d.Reliable
 			row.TimeDriftSeconds = d.DriftSeconds
-			row.TimeDriftNote = d.Note
+			row.TimeDriftNote = friendlyTimeDriftNote(d.Note, d.Reliable)
 			if !d.CheckedAt.IsZero() {
 				row.TimeDriftCheckedAt = d.CheckedAt.Format("02.01.2006 15:04:05")
 			}
@@ -139,6 +179,32 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 			row.LastCorrectionSeconds = c.LastAppliedSeconds
 			if c.LastAppliedKnown && !c.LastAppliedAt.IsZero() {
 				row.LastCorrectionAt = c.LastAppliedAt.Format("02.01.2006 15:04:05")
+			}
+		}
+
+		// Режим коррекции — это конфигурация прибора, а не результат связи.
+		// Поэтому он должен быть виден даже если прибор был offline при старте
+		// и registerOneDevice не успел заполнить runtime-кэш.
+		cfg := configuredByID[id]
+		if row.CorrectionMode == "" {
+			switch cfg.Kind {
+			case "vkm360":
+				if cfg.TimeCorrectionMaxStepSeconds > 0 && cfg.TimeCorrectionDailyLimitSeconds > 0 {
+					row.CorrectionMode = "vkm_enabled"
+				} else {
+					row.CorrectionMode = "vkm_disabled"
+				}
+			case "ivk-ter", "ivk_ter":
+				row.CorrectionMode = "manual_service"
+			default:
+				row.CorrectionMode = "not_implemented"
+			}
+		}
+		if cfg.Kind == "vkm360" && !row.LastCorrectionKnown {
+			if rec, found, err := s.repo.LastTimeCorrection(r.Context(), id); err == nil && found {
+				row.LastCorrectionKnown = true
+				row.LastCorrectionSeconds = rec.CorrectionSeconds
+				row.LastCorrectionAt = rec.CorrectedAt.Format("02.01.2006 15:04:05")
 			}
 		}
 
@@ -153,7 +219,7 @@ func (s *Server) handlePollMonitor(w http.ResponseWriter, r *http.Request) {
 				row.LastPollKnown = true
 				row.LastPollKind = "manual_reload"
 				row.LastPollOK = reload.errorText == ""
-				row.LastPollError = reload.errorText
+				row.LastPollError = friendlyPollError(reload.errorText)
 				row.LastPollFinishedAt = reload.finishedAt.Format("02.01.2006 15:04:05")
 			}
 		}
