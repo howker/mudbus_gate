@@ -33,6 +33,42 @@ func func65StorageHour(a profile.Archive, ts time.Time) time.Time {
 	return boundary
 }
 
+// func65WallClockHour normalizes only the calendar components of a time value.
+// This is deliberate for IVK-TER: archive_time is decoded by the generic
+// profile codec into a UTC-located time.Time, while the device field itself
+// represents local wall-clock calendar fields. Absolute-instant comparisons
+// would therefore introduce the server timezone offset.
+func func65WallClockHour(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, time.UTC)
+}
+
+// func65QueryTimeForStorageHour converts the hour shown/stored by MBGW into
+// the raw archive period requested from the VZLET device. For period_end
+// archives (live-confirmed IVK-TER), MBGW storage 15:00 corresponds to the
+// device archive record belonging to 14:00..15:00, so function 65 must be
+// asked for raw 14:00.
+func func65QueryTimeForStorageHour(a profile.Archive, storageHour time.Time) time.Time {
+	queryHour := func65WallClockHour(storageHour)
+	semantics, _ := a.Params["timestamp_semantics"].(string)
+	if semantics == "period_end" {
+		return queryHour.Add(-time.Hour)
+	}
+	return queryHour
+}
+
+// func65ReloadQuery always uses function-65 TIME access for operator-forced
+// range rereads. Index access remains appropriate for startup backfill, but
+// an operator-selected calendar interval must not depend on ring-buffer
+// position/order.
+func func65ReloadQuery(d *Device, a profile.Archive, storageHour time.Time) archive.ArchiveQuery {
+	return archive.ArchiveQuery{
+		DeviceID: d.ID, ArchiveID: a.ID, Instance: 1,
+		From:         func65QueryTimeForStorageHour(a, storageHour),
+		RecordLayout: layoutFromProfile(a), WordOrder32: d.Profile.Codec.WordOrder32, WordOrder64: d.Profile.Codec.WordOrder64,
+		Params: a.Params,
+	}
+}
+
 // persistFunc65Hourly сохраняет профильные числовые поля одной записи
 // VZLET function 65 в общий archive_hourly. archive_time становится
 // меткой часа, а не отдельным измеряемым параметром.
@@ -219,11 +255,14 @@ func validateFunc65Record(rec archive.ArchiveRecord) error {
 // В отличие от startup-backfill здесь цель — не только заполнить пропуски,
 // а ПЕРЕПРОЧИТАТЬ уже существующие часы и заменить их свежими значениями.
 //
-// Архив ИВК-ТЭР адресуется индексом от вершины кольцевого буфера, поэтому
-// сначала приходится идти от newest к older. Записи новее верхней границы
-// просто пропускаются; после достижения записи старше нижней границы проход
-// заканчивается. Один индекс function 65 соответствует одному часовому
-// периоду, поэтому progress сообщает число реально просмотренных позиций.
+// Ручной диапазон читается штатным TIME-доступом function 65, а не
+// сканированием кольцевого буфера по индексам. Это соответствует смыслу UI
+// "с/по", не зависит от положения вершины кольца и не смешивает UTC location
+// generic-декодера с локальными календарными полями ИВК-ТЭР.
+//
+// Диапазон заранее НЕ удаляется: каждый успешно прочитанный час сразу
+// перезаписывается UPSERT-ом. При ошибке связи уже обновлённые часы остаются,
+// а ещё не прочитанные старые строки не уничтожаются.
 func (d *Device) ForceReloadFunc65Hourly(ctx context.Context, from, to time.Time, onProgress func(done, total int)) (int, error) {
 	if d == nil || d.Profile == nil {
 		return 0, fmt.Errorf("профиль прибора не загружен")
@@ -232,8 +271,11 @@ func (d *Device) ForceReloadFunc65Hourly(ctx context.Context, from, to time.Time
 		to = time.Now()
 	}
 
-	fromHour := from.Truncate(time.Hour)
-	toHour := to.Truncate(time.Hour)
+	// Для ИВК-ТЭР сравниваем календарные часы, а не абсолютные instants:
+	// generic archive decoder ставит Location=UTC, хотя само поле прибора
+	// представляет локальный wall-clock.
+	fromHour := func65WallClockHour(from)
+	toHour := func65WallClockHour(to)
 	if toHour.Before(fromHour) {
 		return 0, fmt.Errorf("верхняя граница переопроса %s раньше нижней %s",
 			toHour.Format("02.01.2006 15:04"), fromHour.Format("02.01.2006 15:04"))
@@ -256,84 +298,88 @@ func (d *Device) ForceReloadFunc65Hourly(ctx context.Context, from, to time.Time
 		return 0, fmt.Errorf("неизвестный способ чтения архива %q", a.Strategy)
 	}
 
-	depth := a.BufferDepthOrDefault()
-	if depth <= 0 {
-		return 0, fmt.Errorf("для архива %s не задана доступная глубина", a.ID)
+	total := int(toHour.Sub(fromHour)/time.Hour) + 1
+	if total <= 0 {
+		return 0, fmt.Errorf("пустой диапазон переопроса")
 	}
 
-	layout := layoutFromProfile(a)
 	periodsSaved := 0
 	valuesSaved := 0
-	reachedRequestedRange := false
+	missingPeriods := 0
 
-	log.Printf("[%s] принудительный переопрос архива %s ИВК-ТЭР: диапазон %s..%s, доступная глубина до %d ч\n",
-		d.ID, a.ID, fromHour.Format("02.01.2006 15:04"), toHour.Format("02.01.2006 15:04"), depth)
+	log.Printf("[%s] принудительный переопрос архива %s ИВК-ТЭР: диапазон %s..%s, периодов %d\n",
+		d.ID, a.ID, fromHour.Format("02.01.2006 15:04"), toHour.Format("02.01.2006 15:04"), total)
 
-	for index := 0; index < depth; index++ {
+	done := 0
+	for wantedHour := fromHour; !wantedHour.After(toHour); wantedHour = wantedHour.Add(time.Hour) {
 		select {
 		case <-ctx.Done():
 			return periodsSaved, ctx.Err()
 		default:
 		}
 
+		query := func65ReloadQuery(d, a, wantedHour)
 		release, leaseErr := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
 		if leaseErr != nil {
 			return periodsSaved, fmt.Errorf("прибор занят другим опросом: %w", leaseErr)
 		}
-		records, readErr := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, archive.ArchiveQuery{
-			DeviceID: d.ID, ArchiveID: a.ID, Instance: 1,
-			FromIndex: index, ToIndex: index,
-			RecordLayout: layout, WordOrder32: d.Profile.Codec.WordOrder32, WordOrder64: d.Profile.Codec.WordOrder64,
-			Params: a.Params,
-		})
+		records, readErr := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, query)
 		release()
 
+		done++
 		if onProgress != nil {
-			onProgress(index+1, depth)
+			onProgress(done, total)
 		}
 		if readErr != nil {
-			return periodsSaved, fmt.Errorf("ошибка чтения позиции %d архива %s: %w", index, a.ID, readErr)
+			return periodsSaved, fmt.Errorf("ошибка чтения часа %s архива %s: %w",
+				wantedHour.Format("02.01.2006 15:04"), a.ID, readErr)
 		}
 		if len(records) == 0 {
-			break
+			missingPeriods++
+			log.Printf("[%s] принудительный переопрос ИВК-ТЭР: в приборе нет записи за час %s\n",
+				d.ID, wantedHour.Format("02.01.2006 15:04"))
+			continue
 		}
 
-		stop := false
+		matched := false
 		for _, rec := range records {
 			if rec.RecordTS.IsZero() {
 				continue
 			}
-			tsHour := func65StorageHour(a, rec.RecordTS)
 
-			if tsHour.After(toHour) {
-				continue
-			}
-			if tsHour.Before(fromHour) {
-				stop = true
-				break
+			gotHour := func65WallClockHour(func65StorageHour(a, rec.RecordTS))
+			if !gotHour.Equal(wantedHour) {
+				// TIME-запрос должен вернуть именно запрошенный период.
+				// Соседнюю запись не сохраняем: при forced reload безопаснее
+				// остановиться и показать расхождение, чем переписать не тот час.
+				return periodsSaved, fmt.Errorf(
+					"при запросе часа %s прибор вернул запись за %s; запись не сохранена",
+					wantedHour.Format("02.01.2006 15:04"),
+					gotHour.Format("02.01.2006 15:04"),
+				)
 			}
 
-			reachedRequestedRange = true
+			matched = true
 			saved := persistFunc65Hourly(ctx, d.Repo, d.ID, a, []archive.ArchiveRecord{rec})
 			if saved > 0 {
 				periodsSaved++
 				valuesSaved += saved
 				health.MarkPollProgress(d.ID, time.Now())
 				log.Printf("[%s] принудительный переопрос ИВК-ТЭР: час %s обновлён, сохранено показателей %d\n",
-					d.ID, tsHour.Format("02.01.2006 15:04"), saved)
+					d.ID, wantedHour.Format("02.01.2006 15:04"), saved)
 			}
 		}
-		if stop {
-			break
+		if !matched {
+			missingPeriods++
 		}
 	}
 
-	if !reachedRequestedRange {
+	if periodsSaved == 0 {
 		return 0, fmt.Errorf("в доступном архиве прибора не найдено записей за диапазон %s..%s",
 			fromHour.Format("02.01.2006 15:04"), toHour.Format("02.01.2006 15:04"))
 	}
 
-	log.Printf("[%s] принудительный переопрос ИВК-ТЭР завершён: обновлено часовых периодов %d, сохранено показателей %d\n",
-		d.ID, periodsSaved, valuesSaved)
+	log.Printf("[%s] принудительный переопрос ИВК-ТЭР завершён: обновлено часовых периодов %d, сохранено показателей %d, без записи в приборе %d\n",
+		d.ID, periodsSaved, valuesSaved, missingPeriods)
 	return periodsSaved, nil
 }
