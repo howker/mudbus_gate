@@ -153,9 +153,13 @@ func func65RepresentativeParam(a profile.Archive) string {
 	return ""
 }
 
-// backfillFunc65Hourly идёт от вершины кольцевого архива вглубь по одному
-// индексу. Function 65 возвращает одну запись на запрос, поэтому page-size
-// здесь намеренно равен одному.
+// backfillFunc65Hourly восстанавливает отсутствующие часы ИВК-ТЭР через
+// function-65 TIME-доступ. Live-проверка показала, что индекс 0 не является
+// вершиной/самой свежей записью архива, поэтому индексный проход здесь давал
+// ложное ощущение успешного дозабора и мог многократно перечитывать старые
+// периоды. Для каждого реально отсутствующего storage-hour теперь выполняется
+// точный календарный запрос тем же способом, что и при принудительном
+// переопросе диапазона.
 func (d *Device) backfillFunc65Hourly(ctx context.Context, a profile.Archive, opts BackfillOptions) {
 	reader, ok := archive.Get(a.Strategy)
 	if !ok {
@@ -175,72 +179,87 @@ func (d *Device) backfillFunc65Hourly(ctx context.Context, a profile.Archive, op
 	if depth <= 0 {
 		return
 	}
-	now := time.Now().Truncate(time.Hour)
+
+	// ИВК-ТЭР кодирует локальные календарные поля, но generic decoder
+	// помещает их в UTC location. Поэтому и границы поиска пропусков держим
+	// в том же wall-clock представлении, без абсолютного timezone-сдвига.
+	now := func65WallClockHour(time.Now())
 	from := now.Add(-time.Duration(depth-1) * time.Hour)
 	missingList, err := d.Repo.MissingHours(ctx, d.ID, "", param, from, now)
 	if err != nil {
-		log.Printf("[%s] восстановление архива %s: не удалось определить отсутствующие часы (%v); проверяю архив прибора до доступного предела\n", d.ID, a.ID, err)
+		log.Printf("[%s] восстановление архива %s: не удалось определить отсутствующие часы (%v); проверяю весь доступный диапазон\n", d.ID, a.ID, err)
+		missingList = missingList[:0]
+		for h := from; !h.After(now); h = h.Add(time.Hour) {
+			missingList = append(missingList, h)
+		}
 	}
-	missing := make(map[int64]bool, len(missingList))
-	for _, t := range missingList {
-		missing[t.Unix()] = true
-	}
-	if err == nil && len(missing) == 0 {
+	if len(missingList) == 0 {
 		return
 	}
 
-	layout := layoutFromProfile(a)
 	totalSaved := 0
-	log.Printf("[%s] восстановление архива %s ИВК-ТЭР: обнаружено %d отсутствующих часовых периодов; проверяю до %d часов назад\n", d.ID, a.ID, len(missing), depth)
-	for index := 0; index < depth; index++ {
+	periodsSaved := 0
+	log.Printf("[%s] восстановление архива %s ИВК-ТЭР: отсутствует %d часовых периодов; запрашиваю их по времени\n", d.ID, a.ID, len(missingList))
+
+	// Сначала самые свежие пропуски: если связь оборвётся на глубине,
+	// актуальные часы успеют восстановиться первыми.
+	for i := len(missingList) - 1; i >= 0; i-- {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
 
+		wantedHour := func65WallClockHour(missingList[i])
+		query := func65ReloadQuery(d, a, wantedHour)
+
 		release, leaseErr := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
 		if leaseErr != nil {
 			log.Printf("[%s] восстановление архива %s: прибор занят другим опросом; не удалось дождаться доступа: %v\n", d.ID, a.ID, leaseErr)
 			return
 		}
-		records, readErr := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, archive.ArchiveQuery{
-			DeviceID: d.ID, ArchiveID: a.ID, Instance: 1,
-			FromIndex: index, ToIndex: index,
-			RecordLayout: layout, WordOrder32: d.Profile.Codec.WordOrder32, WordOrder64: d.Profile.Codec.WordOrder64,
-			Params: a.Params,
-		})
+		records, readErr := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, query)
 		release()
 		if readErr != nil {
-			log.Printf("[%s] восстановление архива %s: ошибка чтения позиции %d в архиве прибора: %v\n", d.ID, a.ID, index, readErr)
+			log.Printf("[%s] восстановление архива %s: ошибка чтения часа %s: %v\n", d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"), readErr)
 			return
 		}
-		if len(records) == 0 {
-			log.Printf("[%s] восстановление архива %s: достигнут конец доступного архива прибора (позиция %d)\n", d.ID, a.ID, index)
-			break
-		}
-		saved := persistFunc65Hourly(ctx, d.Repo, d.ID, a, records)
-		totalSaved += saved
-		health.MarkPollProgress(d.ID, time.Now())
+
+		matched := false
 		for _, rec := range records {
-			if !rec.RecordTS.IsZero() {
-				delete(missing, func65StorageHour(a, rec.RecordTS).Unix())
+			if err := validateFunc65Record(rec); err != nil {
+				log.Printf("[%s] восстановление архива %s: некорректная запись за час %s: %v\n", d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"), err)
+				continue
+			}
+			gotHour := func65WallClockHour(func65StorageHour(a, rec.RecordTS))
+			if !gotHour.Equal(wantedHour) {
+				log.Printf("[%s] восстановление архива %s: при запросе часа %s прибор вернул %s; запись не сохранена\n",
+					d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"), gotHour.Format("02.01.2006 15:04"))
+				continue
+			}
+
+			saved := persistFunc65Hourly(ctx, d.Repo, d.ID, a, []archive.ArchiveRecord{rec})
+			if saved > 0 {
+				totalSaved += saved
+				periodsSaved++
+				matched = true
 			}
 		}
-		if err == nil && len(missing) == 0 {
-			break
+		if !matched && len(records) == 0 {
+			log.Printf("[%s] восстановление архива %s: в приборе нет записи за час %s\n", d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"))
 		}
+		health.MarkPollProgress(d.ID, time.Now())
 	}
-	log.Printf("[%s] восстановление архива %s ИВК-ТЭР завершено: сохранено показателей %d\n", d.ID, a.ID, totalSaved)
+
+	log.Printf("[%s] восстановление архива %s ИВК-ТЭР завершено: обновлено периодов %d, сохранено показателей %d\n", d.ID, a.ID, periodsSaved, totalSaved)
 }
 
-func func65LatestQuery(d *Device, a profile.Archive) archive.ArchiveQuery {
-	return archive.ArchiveQuery{
-		DeviceID: d.ID, ArchiveID: a.ID, Instance: 1,
-		FromIndex: 0, ToIndex: 0,
-		RecordLayout: layoutFromProfile(a), WordOrder32: d.Profile.Codec.WordOrder32, WordOrder64: d.Profile.Codec.WordOrder64,
-		Params: a.Params,
-	}
+// func65LatestQueryAt строит запрос для последнего завершившегося часового
+// периода на момент now. ВАЖНО: это TIME-доступ, а не индекс 0. Для
+// timestamp_semantics=period_end storage-hour 10:00 запрашивается как raw
+// device-hour 09:00 и после декодирования снова сохраняется с меткой 10:00.
+func func65LatestQueryAt(d *Device, a profile.Archive, now time.Time) archive.ArchiveQuery {
+	return func65ReloadQuery(d, a, func65WallClockHour(now))
 }
 
 func validateFunc65Record(rec archive.ArchiveRecord) error {

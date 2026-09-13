@@ -889,31 +889,48 @@ func (d *Device) PollArchives(ctx context.Context) {
 		layout := layoutFromProfile(a)
 
 		// VZLET/ИВК-ТЭР function 65 умеет адресацию и по времени, и по
-		// индексу. Для регулярного опроса нужен именно индекс 0 — вершина
-		// архива. Старый общий From=now-24h ошибочно заставлял эту стратегию
-		// читать запись суточной давности.
+		// индексу. Live-проверка ИВК-ТЭР показала, что индекс 0 НЕ является
+		// "последней записью". Поэтому регулярный опрос запрашивает конкретный
+		// завершившийся календарный час через TIME-доступ. Это тот же контракт,
+		// который уже используется принудительным переопросом диапазона.
 		if a.Strategy == "mb_func65" {
+			now := time.Now()
+			wantedHour := func65WallClockHour(now)
+			query := func65LatestQueryAt(d, a, now)
+
 			release, leaseErr := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
 			if leaseErr != nil {
 				log.Printf("[%s] архив %s: не удалось занять прибор: %v\n", d.ID, a.ID, leaseErr)
 				continue
 			}
-			records, readErr := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, func65LatestQuery(d, a))
+			records, readErr := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, query)
 			release()
 			if readErr != nil {
-				log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: ошибка чтения: %v\n", d.ID, a.ID, readErr)
+				log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: ошибка чтения часа %s: %v\n", d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"), readErr)
 				continue
 			}
+
+			matched := make([]archive.ArchiveRecord, 0, len(records))
 			for _, rec := range records {
 				if err := validateFunc65Record(rec); err != nil {
 					log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: некорректная запись: %v\n", d.ID, a.ID, err)
+					continue
 				}
+				gotHour := func65WallClockHour(func65StorageHour(a, rec.RecordTS))
+				if !gotHour.Equal(wantedHour) {
+					log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: при запросе часа %s прибор вернул запись за %s; запись не сохранена\n",
+						d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"), gotHour.Format("02.01.2006 15:04"))
+					continue
+				}
+				matched = append(matched, rec)
 			}
-			saved := persistFunc65Hourly(ctx, d.Repo, d.ID, a, records)
+
+			saved := persistFunc65Hourly(ctx, d.Repo, d.ID, a, matched)
 			if saved > 0 {
 				health.MarkArchiveSuccess(d.ID, time.Now())
 			}
-			log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: получено записей %d, сохранено полей %d\n", d.ID, a.ID, len(records), saved)
+			log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: запрошен час %s, получено записей %d, сохранено полей %d\n",
+				d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"), len(records), saved)
 			continue
 		}
 

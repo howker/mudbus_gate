@@ -74,3 +74,30 @@ func TestFunc65ReloadQueryUsesTimeAccess(t *testing.T) {
 		t.Fatalf("query From = %v, want raw wall-clock 10.09.2026 14:00", q.From)
 	}
 }
+
+func TestFunc65LatestQueryUsesTimeAccessForCurrentStorageHour(t *testing.T) {
+	a := periodEndArchiveForReloadTest()
+	d := &Device{ID: "ivk_test", Profile: &profile.Profile{Codec: profile.Codec{WordOrder32: "0123"}}}
+	loc := time.FixedZone("local", 4*60*60)
+	now := time.Date(2026, 9, 13, 10, 55, 14, 0, loc)
+
+	q := func65LatestQueryAt(d, a, now)
+	wantFrom := time.Date(2026, 9, 13, 9, 0, 0, 0, time.UTC)
+	if !q.From.Equal(wantFrom) {
+		t.Fatalf("latest query From=%v, want %v (TIME request for raw period 09:00 -> storage 10:00)", q.From, wantFrom)
+	}
+	if q.From.IsZero() {
+		t.Fatal("latest query must use TIME access, got zero From")
+	}
+}
+
+func TestFunc65LatestQueryDoesNotUseIndexZeroAsNewest(t *testing.T) {
+	a := periodEndArchiveForReloadTest()
+	d := &Device{ID: "ivk_test", Profile: &profile.Profile{Codec: profile.Codec{WordOrder32: "0123"}}}
+	now := time.Date(2026, 9, 13, 10, 5, 0, 0, time.UTC)
+
+	q := func65LatestQueryAt(d, a, now)
+	if q.From.IsZero() {
+		t.Fatal("regular IVK poll fell back to index access; live device proved index 0 is not the newest record")
+	}
+}
