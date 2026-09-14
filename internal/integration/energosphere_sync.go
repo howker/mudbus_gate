@@ -513,6 +513,40 @@ func projectHourlyToHalfHours(m PointMapping, hourEnd time.Time, value float64, 
 	}
 }
 
+// wallClockInLocation keeps the visible calendar fields and only changes
+// the Location. This is NOT an instant conversion. IVK-TER archive_time is
+// decoded/stored as UTC-located time.Time even though the device value is a
+// local wall-clock calendar. Comparing it as an absolute instant against
+// operator ranges parsed in time.Local shifts the effective boundary by the
+// server UTC offset.
+func wallClockInLocation(t time.Time, loc *time.Location) time.Time {
+	if loc == nil {
+		loc = time.Local
+	}
+	return time.Date(
+		t.Year(), t.Month(), t.Day(),
+		t.Hour(), t.Minute(), t.Second(), t.Nanosecond(), loc,
+	)
+}
+
+// normalizeESSyncCursorTime keeps IVK-TER cursors on the same neutral
+// wall-clock scale as archive_hourly. Existing IVK cursors were written from
+// UTC-located archive timestamps, while the wall-clock fix rebuilds new
+// PointMains timestamps in the caller's local Location. Comparing those values
+// directly as absolute instants would make the same visible calendar timestamp
+// differ by the server UTC offset.
+//
+// IVK cursors are therefore stored and compared as UTC-located wall-clock
+// calendar fields. Other device kinds keep their existing instant semantics.
+func normalizeESSyncCursorTime(cfg Config, t time.Time) time.Time {
+	switch cfg.Kind {
+	case "ivk-ter", "ivk_ter":
+		return wallClockInLocation(t, time.UTC)
+	default:
+		return t
+	}
+}
+
 // ivkHalfHourMode fixes the semantics of every field that the current
 // IVK-TER hourly profile exposes. This table is intentionally explicit: when a
 // new field/device is added, its meaning must be decided instead of falling
@@ -545,18 +579,29 @@ func collectIVKReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, 
 	var out []pointReading
 	shift := time.Duration(cfg.TimeShiftMinutes) * time.Minute
 
+	// IVK-TER archive timestamps are stored with Location=UTC, but their
+	// calendar fields are device LOCAL wall-clock, not UTC instants. Query the
+	// SQLite rows in that same neutral wall-clock representation, then rebuild
+	// the resulting PointMains timestamps in the caller's wall-clock location
+	// (normally time.Local). This keeps range comparisons and TimeShiftMinutes
+	// on one calendar scale without changing the stored archive schema.
+	wallLoc := now.Location()
+	queryFrom := wallClockInLocation(from, time.UTC)
+	queryTo := wallClockInLocation(now, time.UTC)
+
 	for _, m := range cfg.Points {
 		mode, ok := ivkHalfHourMode(m.Tag)
 		if !ok {
 			return nil, fmt.Errorf("ИВК-ТЭР: для параметра %q не задано правило преобразования часового значения в получасовые точки ЭС", m.Tag)
 		}
 
-		rows, err := repo.GetHourlyArchiveRange(ctx, cfg.DeviceID, "", m.Tag, from, now)
+		rows, err := repo.GetHourlyArchiveRange(ctx, cfg.DeviceID, "", m.Tag, queryFrom, queryTo)
 		if err != nil {
 			return nil, err
 		}
 		for _, row := range rows {
-			out = append(out, projectHourlyToHalfHours(m, row.TsHour, row.Value, shift, mode)...)
+			hourEnd := wallClockInLocation(row.TsHour, wallLoc)
+			out = append(out, projectHourlyToHalfHours(m, hourEnd, row.Value, shift, mode)...)
 		}
 	}
 	return out, nil
@@ -735,6 +780,7 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 			continue
 		}
 
+		cur = normalizeESSyncCursorTime(cfg, cur)
 		cursors[m.PointID] = cur
 
 		// Cursor хранит уже СДВИНУТУЮ метку ЭС. collectReadings принимает
@@ -764,21 +810,23 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 	blocked := make(map[int]bool)
 
 	advanceCursor := func(r pointReading) bool {
-		if err := repo.SetESSyncCursor(ctx, cfg.DeviceID, r.mapping.PointID, r.ts); err != nil {
+		cursorTS := normalizeESSyncCursorTime(cfg, r.ts)
+		if err := repo.SetESSyncCursor(ctx, cfg.DeviceID, r.mapping.PointID, cursorTS); err != nil {
 			log.Printf("[синхронизация с ЭС] запись курсора (%s ID_PP=%d %s): %v\n",
 				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), err)
 			failed++
 			blocked[r.mapping.PointID] = true
 			return false
 		}
-		cursors[r.mapping.PointID] = r.ts
+		cursors[r.mapping.PointID] = cursorTS
 		return true
 	}
 
 	for _, r := range readings {
 		pointID := r.mapping.PointID
 
-		if cur, ok := cursors[pointID]; ok && !r.ts.After(cur) {
+		cursorTS := normalizeESSyncCursorTime(cfg, r.ts)
+		if cur, ok := cursors[pointID]; ok && !cursorTS.After(cur) {
 			skippedByCursor++
 			continue
 		}

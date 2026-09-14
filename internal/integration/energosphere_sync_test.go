@@ -223,11 +223,14 @@ func TestCollectIVKReadingsProjectsHourlyFieldsToHalfHours(t *testing.T) {
 	repo := newIntegrationTestRepo(t)
 	loc := time.Local
 	ts := time.Date(2026, 9, 10, 15, 0, 0, 0, loc)
+	storedTS := time.Date(2026, 9, 10, 15, 0, 0, 0, time.UTC)
 
-	saveIVKHourly(t, repo, "v_plus", ts, 74.359, "м3")
-	saveIVKHourly(t, repo, "q_avg", ts, 1239.318, "л/мин")
-	saveIVKHourly(t, repo, "downtime", ts, 10, "мин")
-	saveIVKHourly(t, repo, "errors", ts, 3, "")
+	// Production IVK-TER archive_hourly keeps the device's local calendar
+	// fields in a UTC-located time.Time. The requested range is local wall-clock.
+	saveIVKHourly(t, repo, "v_plus", storedTS, 74.359, "м3")
+	saveIVKHourly(t, repo, "q_avg", storedTS, 1239.318, "л/мин")
+	saveIVKHourly(t, repo, "downtime", storedTS, 10, "мин")
+	saveIVKHourly(t, repo, "errors", storedTS, 3, "")
 
 	got, err := collectReadings(
 		context.Background(),
@@ -313,9 +316,10 @@ func TestCollectIVKReadingsRejectsUnknownHalfHourSemantics(t *testing.T) {
 func TestCollectReadingsForESRangeIncludesFirstIVKHalfHourAtUpperBoundary(t *testing.T) {
 	repo := newIntegrationTestRepo(t)
 	loc := time.Local
-	hourEnd := time.Date(2026, 9, 10, 15, 0, 0, 0, loc)
+	storedHourEnd := time.Date(2026, 9, 10, 15, 0, 0, 0, time.UTC)
 
-	saveIVKHourly(t, repo, "v_plus", hourEnd, 80, "м3")
+	// Same production quirk as above: UTC Location carries local wall-clock fields.
+	saveIVKHourly(t, repo, "v_plus", storedHourEnd, 80, "м3")
 
 	cfg := Config{
 		DeviceID:         "ivk",
@@ -344,5 +348,105 @@ func TestCollectReadingsForESRangeIncludesFirstIVKHalfHourAtUpperBoundary(t *tes
 	}
 	if math.Abs(got[0].value-40) > 1e-9 {
 		t.Fatalf("want first half-hour value 40, got %g", got[0].value)
+	}
+}
+
+func TestCollectReadingsForESRangeIVKUsesWallClockNotAbsoluteInstant(t *testing.T) {
+	repo := newIntegrationTestRepo(t)
+	local := time.FixedZone("UTC+4", 4*60*60)
+
+	// This reproduces the production IVK-TER storage quirk: archive_time is
+	// decoded/stored with Location=UTC, but its calendar fields are local
+	// wall-clock. These are the real 20:00 and 21:00 storage hours.
+	saveIVKHourly(t, repo, "v_plus", time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC), 81.0330581665039, "м3")
+	saveIVKHourly(t, repo, "v_plus", time.Date(2026, 9, 14, 21, 0, 0, 0, time.UTC), 81.0478134155273, "м3")
+
+	cfg := Config{
+		DeviceID:         "ivk",
+		Kind:             "ivk-ter",
+		TimeShiftMinutes: -90,
+		Points: []PointMapping{
+			{Tag: "v_plus", PointID: 101, Factor: 1},
+		},
+	}
+
+	fromES := time.Date(2026, 9, 14, 0, 0, 0, 0, local)
+	toES := time.Date(2026, 9, 14, 21, 42, 0, 0, local)
+
+	got, err := collectReadingsForESRange(context.Background(), repo, cfg, fromES, toES)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("want 4 IVK half-hour readings for 20:00/21:00 source hours, got %d: %#v", len(got), got)
+	}
+
+	wantTS := []time.Time{
+		time.Date(2026, 9, 14, 18, 0, 0, 0, local),
+		time.Date(2026, 9, 14, 18, 30, 0, 0, local),
+		time.Date(2026, 9, 14, 19, 0, 0, 0, local),
+		time.Date(2026, 9, 14, 19, 30, 0, 0, local),
+	}
+	wantValue := []float64{
+		81.0330581665039 / 2,
+		81.0330581665039 / 2,
+		81.0478134155273 / 2,
+		81.0478134155273 / 2,
+	}
+
+	for i := range wantTS {
+		if !got[i].ts.Equal(wantTS[i]) {
+			t.Fatalf("reading %d: want ts=%v, got %v", i, wantTS[i], got[i].ts)
+		}
+		if got[i].ts.Location() != local {
+			t.Fatalf("reading %d: want local wall-clock location, got %v", i, got[i].ts.Location())
+		}
+		if math.Abs(got[i].value-wantValue[i]) > 1e-9 {
+			t.Fatalf("reading %d: want value=%g, got %g", i, wantValue[i], got[i].value)
+		}
+	}
+}
+
+func TestIVKSyncCursorUsesWallClockSemanticsAcrossLocationChange(t *testing.T) {
+	local := time.FixedZone("UTC+4", 4*60*60)
+	cfg := Config{Kind: "ivk-ter", TimeShiftMinutes: -90}
+
+	// Production cursor written before the wall-clock fix: the visible ES
+	// timestamp 18:30 was stored with Location=UTC.
+	oldCursor := time.Date(2026, 9, 14, 18, 30, 0, 0, time.UTC)
+
+	// After the wall-clock fix the same visible ES timestamp is produced in
+	// the server's local Location. It must compare equal to the old cursor,
+	// not four hours earlier as an absolute instant.
+	sameReading := time.Date(2026, 9, 14, 18, 30, 0, 0, local)
+	newerReading := time.Date(2026, 9, 14, 19, 0, 0, 0, local)
+
+	gotOld := normalizeESSyncCursorTime(cfg, oldCursor)
+	gotSame := normalizeESSyncCursorTime(cfg, sameReading)
+	gotNewer := normalizeESSyncCursorTime(cfg, newerReading)
+
+	if gotOld.Location() != time.UTC || gotSame.Location() != time.UTC || gotNewer.Location() != time.UTC {
+		t.Fatalf("IVK cursor timestamps must use UTC-located wall-clock semantics: old=%v same=%v newer=%v", gotOld, gotSame, gotNewer)
+	}
+	if !gotSame.Equal(gotOld) {
+		t.Fatalf("same wall-clock timestamp must match old cursor: old=%v same=%v", gotOld, gotSame)
+	}
+	if !gotNewer.After(gotOld) {
+		t.Fatalf("newer wall-clock timestamp must advance cursor: old=%v newer=%v", gotOld, gotNewer)
+	}
+
+	// Cursor is already an ES timestamp. Reversing -90 minutes must yield
+	// the neutral source wall-clock lower bound 20:00.
+	sourceCursor := gotOld.Add(-time.Duration(cfg.TimeShiftMinutes) * time.Minute)
+	wantSource := time.Date(2026, 9, 14, 20, 0, 0, 0, time.UTC)
+	if !sourceCursor.Equal(wantSource) {
+		t.Fatalf("want source cursor %v, got %v", wantSource, sourceCursor)
+	}
+
+	// Other device kinds must retain the pre-existing instant semantics.
+	akronTS := time.Date(2026, 9, 14, 18, 30, 0, 0, local)
+	gotAkron := normalizeESSyncCursorTime(Config{Kind: "akron"}, akronTS)
+	if gotAkron != akronTS {
+		t.Fatalf("Akron cursor must remain unchanged: want %v, got %v", akronTS, gotAkron)
 	}
 }
