@@ -205,19 +205,29 @@ func TestCollectReadingsForESRangeIncludesLastAkronHalfHourWithShift(t *testing.
 	}
 }
 
-func TestCollectIVKReadingsUsesHourlyArchiveAndAppliesFactor(t *testing.T) {
+func saveIVKHourly(t *testing.T, repo *sqliterepo.Repo, param string, ts time.Time, value float64, unit string) {
+	t.Helper()
+
+	if err := repo.SaveHourlyArchive(context.Background(), storage.HourlyArchiveRecord{
+		DeviceID: "ivk",
+		Param:    param,
+		TsHour:   ts,
+		Value:    value,
+		Unit:     unit,
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCollectIVKReadingsProjectsHourlyFieldsToHalfHours(t *testing.T) {
 	repo := newIntegrationTestRepo(t)
 	loc := time.Local
 	ts := time.Date(2026, 9, 10, 15, 0, 0, 0, loc)
 
-	for _, row := range []storage.HourlyArchiveRecord{
-		{DeviceID: "ivk", Param: "v_plus", TsHour: ts, Value: 74.359, Unit: "м3"},
-		{DeviceID: "ivk", Param: "q_avg", TsHour: ts, Value: 1239.318, Unit: "л/мин"},
-	} {
-		if err := repo.SaveHourlyArchive(context.Background(), row); err != nil {
-			t.Fatal(err)
-		}
-	}
+	saveIVKHourly(t, repo, "v_plus", ts, 74.359, "м3")
+	saveIVKHourly(t, repo, "q_avg", ts, 1239.318, "л/мин")
+	saveIVKHourly(t, repo, "downtime", ts, 10, "мин")
+	saveIVKHourly(t, repo, "errors", ts, 3, "")
 
 	got, err := collectReadings(
 		context.Background(),
@@ -225,10 +235,12 @@ func TestCollectIVKReadingsUsesHourlyArchiveAndAppliesFactor(t *testing.T) {
 		Config{
 			DeviceID:         "ivk",
 			Kind:             "ivk-ter",
-			TimeShiftMinutes: 0,
+			TimeShiftMinutes: -90,
 			Points: []PointMapping{
 				{Tag: "v_plus", PointID: 101, Factor: 1},
 				{Tag: "q_avg", PointID: 102, Factor: 0.001},
+				{Tag: "downtime", PointID: 103, Factor: 1},
+				{Tag: "errors", PointID: 104, Factor: 1},
 			},
 		},
 		ts,
@@ -237,21 +249,100 @@ func TestCollectIVKReadingsUsesHourlyArchiveAndAppliesFactor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 {
-		t.Fatalf("want 2 IVK readings, got %d: %#v", len(got), got)
+	if len(got) != 8 {
+		t.Fatalf("want 8 IVK half-hour readings, got %d: %#v", len(got), got)
 	}
 
-	byTag := make(map[string]pointReading)
+	firstTS := time.Date(2026, 9, 10, 13, 0, 0, 0, loc)
+	secondTS := time.Date(2026, 9, 10, 13, 30, 0, 0, loc)
+
+	byTag := make(map[string][]pointReading)
 	for _, r := range got {
-		byTag[r.mapping.Tag] = r
-		if !r.ts.Equal(ts) {
-			t.Fatalf("tag %s: got ts %v, want %v", r.mapping.Tag, r.ts, ts)
+		byTag[r.mapping.Tag] = append(byTag[r.mapping.Tag], r)
+	}
+
+	checks := []struct {
+		tag           string
+		first, second float64
+	}{
+		{tag: "v_plus", first: 74.359 / 2, second: 74.359 / 2},
+		{tag: "q_avg", first: 1.239318, second: 1.239318},
+		{tag: "downtime", first: 5, second: 5},
+		{tag: "errors", first: 3, second: 3},
+	}
+
+	for _, tc := range checks {
+		r := byTag[tc.tag]
+		if len(r) != 2 {
+			t.Fatalf("tag %s: want 2 readings, got %d: %#v", tc.tag, len(r), r)
+		}
+		if !r[0].ts.Equal(firstTS) || !r[1].ts.Equal(secondTS) {
+			t.Fatalf("tag %s: want timestamps %v/%v, got %v/%v", tc.tag, firstTS, secondTS, r[0].ts, r[1].ts)
+		}
+		if math.Abs(r[0].value-tc.first) > 1e-9 || math.Abs(r[1].value-tc.second) > 1e-9 {
+			t.Fatalf("tag %s: want values %g/%g, got %g/%g", tc.tag, tc.first, tc.second, r[0].value, r[1].value)
 		}
 	}
-	if math.Abs(byTag["v_plus"].value-74.359) > 1e-9 {
-		t.Fatalf("v_plus=%g, want 74.359", byTag["v_plus"].value)
+}
+
+func TestCollectIVKReadingsRejectsUnknownHalfHourSemantics(t *testing.T) {
+	repo := newIntegrationTestRepo(t)
+	loc := time.Local
+	ts := time.Date(2026, 9, 10, 15, 0, 0, 0, loc)
+
+	saveIVKHourly(t, repo, "future_field", ts, 42, "")
+
+	_, err := collectIVKReadings(
+		context.Background(),
+		repo,
+		Config{
+			DeviceID: "ivk",
+			Kind:     "ivk-ter",
+			Points: []PointMapping{
+				{Tag: "future_field", PointID: 105, Factor: 1},
+			},
+		},
+		ts,
+		ts,
+	)
+	if err == nil {
+		t.Fatal("want unknown IVK hourly semantics to be rejected")
 	}
-	if math.Abs(byTag["q_avg"].value-1.239318) > 1e-9 {
-		t.Fatalf("q_avg=%g, want 1.239318 after factor", byTag["q_avg"].value)
+}
+
+func TestCollectReadingsForESRangeIncludesFirstIVKHalfHourAtUpperBoundary(t *testing.T) {
+	repo := newIntegrationTestRepo(t)
+	loc := time.Local
+	hourEnd := time.Date(2026, 9, 10, 15, 0, 0, 0, loc)
+
+	saveIVKHourly(t, repo, "v_plus", hourEnd, 80, "м3")
+
+	cfg := Config{
+		DeviceID:         "ivk",
+		Kind:             "ivk-ter",
+		TimeShiftMinutes: -90,
+		Points: []PointMapping{
+			{Tag: "v_plus", PointID: 101, Factor: 1},
+		},
+	}
+
+	// 15:00 local source hour -> logical half-hours 14:30/15:00 ->
+	// with -90 min shift -> ES 13:00/13:30. The range ends exactly on
+	// the FIRST half-hour point, so source reading must look 30m ahead.
+	fromES := time.Date(2026, 9, 10, 13, 0, 0, 0, loc)
+	toES := fromES
+
+	got, err := collectReadingsForESRange(context.Background(), repo, cfg, fromES, toES)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want exactly first IVK half-hour reading, got %d: %#v", len(got), got)
+	}
+	if !got[0].ts.Equal(toES) {
+		t.Fatalf("want ES timestamp %v, got %v", toES, got[0].ts)
+	}
+	if math.Abs(got[0].value-40) > 1e-9 {
+		t.Fatalf("want first half-hour value 40, got %g", got[0].value)
 	}
 }

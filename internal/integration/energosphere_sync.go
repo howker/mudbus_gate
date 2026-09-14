@@ -469,27 +469,94 @@ func collectVKMReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, 
 	return out, nil
 }
 
+// hourlyHalfHourMode describes how one HOURLY source value is projected
+// onto Energosphere's fixed 30-minute PointMains grid.
+//
+// This is deliberately a value-semantic decision, not a device-name rule:
+//   - interval total/duration: split 50/50, preserving the hourly sum;
+//   - average/state: repeat the same value for both half-hours.
+//
+// A cumulative counter is converted to an hourly interval value BEFORE this
+// helper is called (Akron V is the current example). Unknown semantics must not
+// be silently guessed: the caller has to classify the parameter explicitly.
+type hourlyHalfHourMode uint8
+
+const (
+	hourlySplitTotal hourlyHalfHourMode = iota
+	hourlyRepeatValue
+)
+
+// projectHourlyToHalfHours converts one hourly value whose timestamp marks the
+// END of the hour into two PointMains values whose timestamps mark the END of
+// each half-hour. TimeShiftMinutes is applied only after those logical
+// half-hour boundaries have been formed.
+func projectHourlyToHalfHours(m PointMapping, hourEnd time.Time, value float64, shift time.Duration, mode hourlyHalfHourMode) []pointReading {
+	finalValue := value * m.Factor
+	firstValue := finalValue
+	secondValue := finalValue
+	if mode == hourlySplitTotal {
+		firstValue /= 2
+		secondValue /= 2
+	}
+
+	return []pointReading{
+		{
+			mapping: m,
+			ts:      hourEnd.Add(-30 * time.Minute).Add(shift),
+			value:   firstValue,
+		},
+		{
+			mapping: m,
+			ts:      hourEnd.Add(shift),
+			value:   secondValue,
+		},
+	}
+}
+
+// ivkHalfHourMode fixes the semantics of every field that the current
+// IVK-TER hourly profile exposes. This table is intentionally explicit: when a
+// new field/device is added, its meaning must be decided instead of falling
+// back to an accidental "write the hourly point as-is" path.
+func ivkHalfHourMode(tag string) (hourlyHalfHourMode, bool) {
+	switch tag {
+	case "v_plus", "v_minus", "comm_fail_time", "downtime", "power_loss_time":
+		// Totals/durations accumulated over the hour. There is no finer source
+		// profile, so the documented approximation is an even 50/50 split.
+		return hourlySplitTotal, true
+	case "q_avg", "resistance", "errors", "flowmeter_type":
+		// Average/state/configuration values describe the hourly period as a
+		// whole; preserve the value in both half-hour slots.
+		return hourlyRepeatValue, true
+	default:
+		return 0, false
+	}
+}
+
 // collectIVKReadings читает уже декодированные часовые поля ИВК-ТЭР
-// из общей archive_hourly. В отличие от Akron, v_plus/v_minus ИВК-ТЭР
-// являются готовыми значениями за час (это подтверждается live-сверкой:
-// V+ около 74.6 м3 при Qср около 1243 л/мин за 60 минут), поэтому здесь
-// не вычисляются дельты — выбранное поле идёт в ЭС как есть с настроенным
-// множителем и общим TimeShiftMinutes.
+// из общей archive_hourly и приводит их к обязательной получасовой сетке ЭС.
+//
+// v_plus/v_minus являются готовыми объёмами ЗА ЧАС (live-сверка: V+ около
+// 74.6 м3 при Qср около 1243 л/мин за 60 минут), поэтому их не нужно
+// превращать в дельту, но нужно разделить 50/50 между двумя получасовками.
+// Средние значения/состояния повторяются в обеих получасовках. Метка
+// row.TsHour означает конец часового периода; TimeShiftMinutes применяется
+// после формирования меток HH:30 и HH+1:00.
 func collectIVKReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, from, now time.Time) ([]pointReading, error) {
 	var out []pointReading
 	shift := time.Duration(cfg.TimeShiftMinutes) * time.Minute
 
 	for _, m := range cfg.Points {
+		mode, ok := ivkHalfHourMode(m.Tag)
+		if !ok {
+			return nil, fmt.Errorf("ИВК-ТЭР: для параметра %q не задано правило преобразования часового значения в получасовые точки ЭС", m.Tag)
+		}
+
 		rows, err := repo.GetHourlyArchiveRange(ctx, cfg.DeviceID, "", m.Tag, from, now)
 		if err != nil {
 			return nil, err
 		}
 		for _, row := range rows {
-			out = append(out, pointReading{
-				mapping: m,
-				ts:      row.TsHour.Add(shift),
-				value:   row.Value * m.Factor,
-			})
+			out = append(out, projectHourlyToHalfHours(m, row.TsHour, row.Value, shift, mode)...)
 		}
 	}
 	return out, nil
@@ -529,21 +596,11 @@ func collectAkronReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config
 			return nil, err
 		}
 
-		// Защитная ветка на случай появления у Akron параметров,
-		// которые уже являются готовыми интервальными значениями.
+		// Для Akron сейчас подтверждён только V. Любой новый часовой тег
+		// сначала должен получить явную семантику (total/average/state),
+		// иначе нельзя корректно положить его в получасовую сетку ЭС.
 		if m.Tag != "V" {
-			for _, row := range rows {
-				if row.TsHour.Before(from) {
-					continue
-				}
-
-				out = append(out, pointReading{
-					mapping: m,
-					ts:      row.TsHour.Add(shift),
-					value:   row.Value * m.Factor,
-				})
-			}
-			continue
+			return nil, fmt.Errorf("Akron: для параметра %q не задано правило преобразования часового значения в получасовые точки ЭС", m.Tag)
 		}
 
 		var prevValue float64
@@ -558,25 +615,10 @@ func collectAkronReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config
 					time.Hour,
 				)
 				if ok {
-					half := delta * m.Factor / 2
-
-					// row.TsHour — конец часового интервала.
-					// Создаём две получасовые точки: HH:30 и следующий HH:00.
-					firstHalfEnd := row.TsHour.Add(-30 * time.Minute).Add(shift)
-					secondHalfEnd := row.TsHour.Add(shift)
-
-					out = append(out,
-						pointReading{
-							mapping: m,
-							ts:      firstHalfEnd,
-							value:   half,
-						},
-						pointReading{
-							mapping: m,
-							ts:      secondHalfEnd,
-							value:   half,
-						},
-					)
+					// CounterDelta уже превратил накопительный счётчик в
+					// часовую величину. Дальше действует общий контракт ЭС:
+					// interval total -> две равные получасовки.
+					out = append(out, projectHourlyToHalfHours(m, row.TsHour, delta, shift, hourlySplitTotal)...)
 				} else if row.TsHour.Sub(prevTS) != time.Hour {
 					log.Printf(
 						"[синхронизация с ЭС] Akron %s: пропуск %s — нет соседнего часового снимка перед ним (предыдущий %s)\n",
@@ -632,6 +674,15 @@ func collectReadingsForESRange(ctx context.Context, repo *sqliterepo.Repo, cfg C
 	shift := time.Duration(cfg.TimeShiftMinutes) * time.Minute
 	sourceFrom := from.Add(-shift)
 	sourceTo := to.Add(-shift)
+
+	// Hourly sources create a point at hourEnd-30m as well as at hourEnd.
+	// If the requested ES range ends exactly on that FIRST half-hour point,
+	// the source row we need is 30 minutes later than sourceTo. Read one
+	// half-hour ahead, then keep the existing final ES-range filter below.
+	switch cfg.Kind {
+	case "akron", "ivk-ter", "ivk_ter":
+		sourceTo = sourceTo.Add(30 * time.Minute)
+	}
 
 	readings, err := collectReadings(ctx, repo, cfg, sourceFrom, sourceTo)
 	if err != nil {
