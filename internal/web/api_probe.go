@@ -82,6 +82,17 @@ type probeResponse struct {
 	Steps       []string `json:"steps,omitempty"`
 }
 
+// lockProbePhysicalChannel reserves the SAME physical bus lock used by the
+// production Readers. The lock is acquired before tr.Open, which is critical:
+// otherwise two configured devices (or a UI probe and the service) can both
+// race to open one COM port before transaction-level locking even begins.
+//
+// Probe code holds this outer lock for its whole diagnostic sequence and uses
+// pollcore.New (private reader lock) inside it, avoiding recursive locking.
+func lockProbePhysicalChannel(params transport.Params, deviceID string) func() {
+	return pollcore.LockKey(pollcore.PhysicalIOLockKey(params, deviceID))
+}
+
 func (s *Server) handleDeviceProbe(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "используйте POST")
@@ -154,6 +165,9 @@ func probeAkron(ctx context.Context, req probeRequest) probeResponse {
 		return probeResponse{OK: false, Error: "не удалось создать транспорт: " + err.Error()}
 	}
 
+	unlockIO := lockProbePhysicalChannel(trParams, req.ID)
+	defer unlockIO()
+
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
@@ -167,7 +181,7 @@ func probeAkron(ctx context.Context, req probeRequest) probeResponse {
 	if unitID == 0 {
 		unitID = 1
 	}
-	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), pollcore.PhysicalIOLockKey(trParams, req.ID))
+	reader := pollcore.New(tr, isTCP, uint8(unitID))
 
 	resp := probeResponse{OK: true}
 
@@ -265,6 +279,12 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 		return probeResponse{OK: false, Error: "не удалось создать транспорт: " + err.Error()}
 	}
 
+	// Держим bus-lock на ВСЮ диагностическую операцию: Open -> session
+	// handshake -> чтения -> Close. Так probe ждёт текущий обмен службы,
+	// а не получает ложное "порт занят".
+	unlockIO := lockProbePhysicalChannel(trParams, req.ID)
+	defer unlockIO()
+
 	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
@@ -273,20 +293,11 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 	}
 	defer tr.Close()
 
-	// Используем тот же ключ физического канала, что и боевой poller.
-	// Это особенно важно для tcp_serial/общего конвертера: ручная
-	// проверка из UI не должна врезаться в текущий обмен другого прибора
-	// на том же физическом канале.
-	ioLockKey := pollcore.PhysicalIOLockKey(trParams, req.ID)
-
 	sess, err := session.New("modbus_byteorder_auth")
 	if err != nil {
 		return probeResponse{OK: false, Error: "создание сессии: " + err.Error()}
 	}
-	unlock := pollcore.LockKey(ioLockKey)
-	err = sess.Open(probeCtx, tr)
-	unlock()
-	if err != nil {
+	if err = sess.Open(probeCtx, tr); err != nil {
 		return probeResponse{OK: false, Error: "открытие сессии (byte-order/авторизация): " + err.Error()}
 	}
 
@@ -295,7 +306,7 @@ func probeVKM(ctx context.Context, req probeRequest) probeResponse {
 	if unitID == 0 {
 		unitID = 1
 	}
-	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), ioLockKey)
+	reader := pollcore.New(tr, isTCP, uint8(unitID))
 
 	resp := probeResponse{OK: true}
 
@@ -409,8 +420,14 @@ func probeIVKTER(ctx context.Context, req probeRequest) (resp probeResponse) {
 	probeStepOK("транспорт создан")
 
 	// Четыре независимых диагностических запроса могут каждый исчерпать
-	// несколько transport retries. Общий budget специально больше обычного
-	// probe, чтобы первый timeout не лишал функцию 65 своей попытки.
+	// несколько transport retries. Сначала занимаем тот же physical-bus lock,
+	// что использует служба, и только ПОТОМ открываем порт. Поэтому проверка
+	// прибора на общем COM ждёт завершения текущего обмена вместо "порт занят".
+	unlockIO := lockProbePhysicalChannel(trParams, req.ID)
+	defer unlockIO()
+
+	// Общий budget специально больше обычного probe, чтобы первый timeout
+	// не лишал функцию 65 своей попытки.
 	probeCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	if err := tr.Open(probeCtx); err != nil {
@@ -438,7 +455,7 @@ func probeIVKTER(ctx context.Context, req probeRequest) (resp probeResponse) {
 	if unitID == 0 {
 		unitID = 1
 	}
-	reader := pollcore.NewWithLockKey(tr, isTCP, uint8(unitID), pollcore.PhysicalIOLockKey(trParams, req.ID))
+	reader := pollcore.New(tr, isTCP, uint8(unitID))
 	resp.Steps = append(resp.Steps, fmt.Sprintf("начат опрос ИВК-ТЭР, Modbus-адрес %d", unitID))
 
 	// Каждый этап получает собственный timeout: ошибка одного регистра не

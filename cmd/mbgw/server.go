@@ -39,7 +39,8 @@ import (
 )
 
 // collectAkronPassport делает один короткий обмен командой 101
-// (идентификация) через УЖЕ ОТКРЫТЫЙ транспорт прибора и сохраняет
+// (идентификация) через Reader. Для serial Reader сам открывает физический
+// канал только на время транзакции и сразу освобождает его, затем сохраняет
 // результат (заводской номер, тип, версия прошивки) в БД как паспорт —
 // см. подробное объяснение в месте вызова, в основном цикле регистрации
 // приборов выше. Ошибка здесь НЕ прерывает запуск сервера и не мешает
@@ -688,10 +689,10 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 	})
 
 	// Ручной архивный опрос ОДНОГО прибора из «Монитора опроса».
-	// Важно: транспорт здесь не открывается повторно — он уже открыт и
-	// зарегистрирован службой. Запрос только кладётся в ту же per-device
-	// FIFO, что и плановые задания, поэтому ручной и автоматический I/O
-	// физически не могут пересечься на одном приборе.
+	// Запрос кладётся в ту же per-device FIFO, что и плановые задания.
+	// Сам serial-транспорт открывается Reader'ом только на время конкретной
+	// транзакции; общий physical-I/O lock не допускает пересечения обменов
+	// разных приборов, сидящих на одном COM-порту.
 	webServer.SetManualDevicePoll(func(deviceID string) error {
 		devicesMu.Lock()
 		dev, ok := devices[deviceID]
@@ -1039,9 +1040,18 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 		log.Printf("[ERROR] прибор %s: не удалось создать транспорт: %v\n", devRec.ID, err)
 		return
 	}
-	if err := tr.Open(ctx); err != nil {
-		// Open мог частично выделить ресурс до возврата ошибки; Close обязан
-		// быть идемпотентным, поэтому безопасно сделать best-effort cleanup.
+
+	// Физический канал принадлежит ШИНЕ, а не прибору. Несколько
+	// Modbus-адресов могут жить на одном COM-порту. Поэтому даже стартовое
+	// Open/session выполняется под тем же bus-lock, что и боевой Reader.
+	// После session.Open RTU/TCP-serial освобождается; дальнейшие транзакции
+	// будут открывать его только на время одного обмена.
+	ioLockKey := pollcore.PhysicalIOLockKey(trParams, devRec.ID)
+	unlockIO := pollcore.LockKey(ioLockKey)
+	openErr := tr.Open(ctx)
+	if openErr != nil {
+		_ = transport.ReleaseIdle(tr)
+		unlockIO()
 		_ = tr.Close()
 		switch devRec.TransportKind {
 		case "modbus_tcp":
@@ -1052,18 +1062,23 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 			if endpoint == "" {
 				endpoint = devRec.TransportKind
 			}
-			log.Printf("[НЕТ СВЯЗИ] прибор %s (%s): не удалось открыть подключение. Проверьте питание прибора, кабель и настройки подключения.\n",
-				devRec.ID, endpoint)
+			log.Printf("[НЕТ СВЯЗИ] прибор %s (%s): не удалось открыть подключение: %v. Проверьте питание прибора, кабель и настройки подключения.\n",
+				devRec.ID, endpoint, openErr)
 		}
 		return
 	}
-	ioLockKey := pollcore.PhysicalIOLockKey(trParams, devRec.ID)
-	unlockIO := pollcore.LockKey(ioLockKey)
-	err = sess.Open(ctx, tr)
+
+	sessionErr := sess.Open(ctx, tr)
+	releaseErr := transport.ReleaseIdle(tr)
 	unlockIO()
-	if err != nil {
+	if sessionErr != nil {
 		_ = tr.Close()
-		log.Printf("[ERROR] ошибка сессии %s: %v\n", devRec.ID, err)
+		log.Printf("[ERROR] ошибка сессии %s: %v\n", devRec.ID, sessionErr)
+		return
+	}
+	if releaseErr != nil {
+		_ = tr.Close()
+		log.Printf("[ERROR] прибор %s: не удалось освободить физический канал после открытия сессии: %v\n", devRec.ID, releaseErr)
 		return
 	}
 	if transports == nil || !transports.Add(devRec.ID, tr) {
@@ -1089,8 +1104,8 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	// молчим»). Раньше паспорт собирала отдельная ручная утилита
 	// (akronread --save-passport); в едином процессе server этот шаг
 	// нужно делать здесь, автоматически, при каждой регистрации
-	// Akron-прибора — используя уже открытый транспорт, без отдельного
-	// подключения.
+	// Akron-прибора — используя тот же объект транспорта; физический COM
+	// Reader откроет только на время команды 101 и сразу освободит.
 	if devRec.Kind == "akron" {
 		collectAkronPassport(ctx, repo, devRec.ID, reader)
 	} else {

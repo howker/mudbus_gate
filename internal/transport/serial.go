@@ -190,6 +190,27 @@ func (t *serialTransport) Receive(ctx context.Context, timeout time.Duration) ([
     return buf, nil
 }
 
+// Release closes only the currently opened physical serial/TCP-serial
+// handle and keeps this transport object reusable. Production polling uses
+// this after every complete Modbus transaction so an idle COM port is not
+// permanently owned by one configured device. Close remains the FINAL
+// lifecycle operation and makes later Open calls fail with ErrClosed.
+func (t *serialTransport) Release() error {
+    t.mu.Lock()
+    defer t.mu.Unlock()
+
+    if t.closed {
+        return fmt.Errorf("serial transport: %w", errs.ErrClosed)
+    }
+    if t.port == nil {
+        return nil
+    }
+
+    err := t.port.Close()
+    t.port = nil
+    return err
+}
+
 func (t *serialTransport) Close() error {
     t.mu.Lock()
     defer t.mu.Unlock()
@@ -201,6 +222,23 @@ func (t *serialTransport) Close() error {
         return err
     }
     return nil
+}
+
+// ReleaseIdle releases a reusable physical channel when the concrete
+// transport supports it. RTU serial and TCP-serial implement Release;
+// native Modbus TCP deliberately keeps its existing persistent connection.
+//
+// The Transport interface itself is not widened: existing transports,
+// tools and tests keep the original Open/Close contract.
+func ReleaseIdle(tr Transport) error {
+    if tr == nil {
+        return nil
+    }
+    releaser, ok := tr.(interface{ Release() error })
+    if !ok {
+        return nil
+    }
+    return releaser.Release()
 }
 
 func (t *serialTransport) Info() Params {

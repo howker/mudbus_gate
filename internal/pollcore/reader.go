@@ -103,22 +103,56 @@ func NewWithLockKey(tr transport.Transport, isTCP bool, unitID uint8, lockKey st
 	}
 }
 
+// withPhysicalChannel runs one complete protocol transaction while holding
+// the shared physical-bus lock. Serial transports are opened immediately
+// before the transaction and released immediately after it; native Modbus TCP
+// keeps its existing persistent connection because ReleaseIdle is a no-op for
+// that transport.
+//
+// Opening/closing is deliberately INSIDE ioMu. Two devices with different
+// Modbus unit IDs on the same COM port therefore cannot race at Open() even
+// though each device owns its own Transport object.
+func (r *Reader) withPhysicalChannel(ctx context.Context, fn func() ([]byte, error)) (resp []byte, err error) {
+	// Keep lock ownership in ONE place together with the physical lifecycle.
+	// This prevents any present or future Reader operation from accidentally
+	// doing Open/Release outside the shared bus mutex.
+	r.ioMu.Lock()
+	defer r.ioMu.Unlock()
+
+	if r.tr == nil {
+		return nil, fmt.Errorf("nil transport")
+	}
+	if err := r.tr.Open(ctx); err != nil {
+		// Best-effort cleanup if an implementation allocated a resource before
+		// returning its Open error. Do not call Close: Close is terminal, while
+		// a later poll must be allowed to retry a temporarily busy COM port.
+		_ = transport.ReleaseIdle(r.tr)
+		return nil, err
+	}
+	defer func() {
+		if releaseErr := transport.ReleaseIdle(r.tr); releaseErr != nil && err == nil {
+			err = fmt.Errorf("release idle transport: %w", releaseErr)
+		}
+	}()
+	return fn()
+}
+
 // ReadRaw reads a logical point (space/addr/dataType) and returns the raw
 // data bytes (function code and byte count already stripped).
 func (r *Reader) ReadRaw(ctx context.Context, space string, addr int, dataType string) ([]byte, error) {
-	r.ioMu.Lock()
-	defer r.ioMu.Unlock()
-
-	return modbus.ReadPoint(ctx, r.tr, r.isTCP, r.unitID, space, addr, dataType)
+	return r.withPhysicalChannel(ctx, func() ([]byte, error) {
+		return modbus.ReadPoint(ctx, r.tr, r.isTCP, r.unitID, space, addr, dataType)
+	})
 }
 
 // Transact sends an already-built PDU and returns the raw response PDU.
-// The shared lock covers the whole Modbus transaction, including retries.
+// The shared lock covers Open -> whole Modbus transaction (including retries)
+// -> ReleaseIdle, so another device on the same COM port can only start after
+// the previous one has physically released the port.
 func (r *Reader) Transact(ctx context.Context, pduReq []byte) ([]byte, error) {
-	r.ioMu.Lock()
-	defer r.ioMu.Unlock()
-
-	return modbus.Transact(ctx, r.tr, r.isTCP, nextTxIDPublic(), r.unitID, pduReq)
+	return r.withPhysicalChannel(ctx, func() ([]byte, error) {
+		return modbus.Transact(ctx, r.tr, r.isTCP, nextTxIDPublic(), r.unitID, pduReq)
+	})
 }
 
 // nextTxIDPublic exposes modbus's internal tx id counter through a small
