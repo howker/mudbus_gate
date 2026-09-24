@@ -290,6 +290,18 @@ func (c Config) interval() time.Duration {
 	return 60 * time.Second
 }
 
+// The durable dirty queue (B1) is the primary repair mechanism. This recent
+// reconciliation is a second, deliberately bounded safety net for gaps that
+// pre-date the queue or were created outside mbgw. It runs at worker startup
+// and then hourly, checking only the latest seven days. That window matches
+// the historical default ES backfill depth while keeping SQL Server work
+// small: one timestamp-range SELECT per configured ID_PP, not one query per
+// reading.
+const (
+	recentESReconcileWindow   = 7 * 24 * time.Hour
+	recentESReconcileInterval = time.Hour
+)
+
 // RunEnergosphereSync opens both databases and loops every interval,
 // syncing the backfill window, until ctx is cancelled.
 // trigger, если не nil, позволяет вызывающему коду попросить сделать
@@ -482,6 +494,7 @@ func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.
 	loggedNotConfigured := false
 	var dirtyTrigger <-chan struct{}
 	wakeOnDirty := false
+	var nextRecentReconcile time.Time
 
 	for {
 		if waitFor > 0 {
@@ -614,6 +627,21 @@ func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.
 			log.Printf("[синхронизация с ЭС] восстановление пропусков: диапазонов проверено %d, закрыто %d, добавлено %d, уже было %d, заблокировано проверкой %d, ошибок %d\n",
 				stats.RangesChecked, stats.RangesCompleted, stats.Inserted, stats.Existing, stats.Blocked, stats.Failed)
 		}
+
+		now := time.Now()
+		if nextRecentReconcile.IsZero() || !now.Before(nextRecentReconcile) {
+			from := now.Add(-recentESReconcileWindow)
+			stats, recErr := reconcileRecentESWindow(ctx, repo, writer, cfg, from, now)
+			nextRecentReconcile = now.Add(recentESReconcileInterval)
+			if recErr != nil {
+				log.Printf("[синхронизация с ЭС] периодическая проверка недавних пропусков: %v\n", recErr)
+			} else if stats.Inserted > 0 || stats.Blocked > 0 || stats.Failed > 0 {
+				log.Printf("[синхронизация с ЭС] периодическая проверка %s..%s: локальных точек %d, запросов к ЭС %d, добавлено %d, уже было %d, заблокировано %d, ошибок %d\n",
+					from.Format("02.01 15:04"), now.Format("02.01 15:04"),
+					stats.LocalReadings, stats.BatchQueries, stats.Inserted, stats.Existing, stats.Blocked, stats.Failed)
+			}
+		}
+
 		wakeOnDirty = true
 		waitFor = cfg.interval()
 	}
@@ -1103,6 +1131,101 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 type insertOnlyPointWriter interface {
 	PointExists(context.Context, int, time.Time) (bool, error)
 	InsertPoint(context.Context, int, time.Time, float64, int) error
+}
+
+type recentReconcileWriter interface {
+	insertOnlyPointWriter
+	ExistingPointTimes(context.Context, int, time.Time, time.Time) (map[string]struct{}, error)
+}
+
+type recentReconcileStats struct {
+	LocalReadings int
+	BatchQueries  int
+	Inserted      int
+	Existing      int
+	Blocked       int
+	Failed        int
+}
+
+// reconcileRecentESWindow is the bounded, periodic second safety layer. It
+// does not use or move the ordinary cursor and does not require a dirty-range
+// marker. Existing PointMains rows are never overwritten.
+func reconcileRecentESWindow(ctx context.Context, repo *sqliterepo.Repo, writer recentReconcileWriter, cfg Config, from, to time.Time) (recentReconcileStats, error) {
+	var stats recentReconcileStats
+	if repo == nil {
+		return stats, fmt.Errorf("локальная БД не подключена")
+	}
+	if writer == nil {
+		return stats, fmt.Errorf("запись в ЭС не подключена")
+	}
+	if to.Before(from) {
+		from, to = to, from
+	}
+
+	readings, err := collectReadingsForESRange(ctx, repo, cfg, from, to)
+	if err != nil {
+		return stats, fmt.Errorf("чтение локального архива: %w", err)
+	}
+	stats.LocalReadings = len(readings)
+	if len(readings) == 0 {
+		return stats, nil
+	}
+
+	byPoint := make(map[int][]pointReading)
+	for _, r := range readings {
+		byPoint[r.mapping.PointID] = append(byPoint[r.mapping.PointID], r)
+	}
+
+	for pointID, pointReadings := range byPoint {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+		stats.BatchQueries++
+		existing, err := writer.ExistingPointTimes(ctx, pointID, from, to)
+		if err != nil {
+			stats.Failed += len(pointReadings)
+			log.Printf("[синхронизация с ЭС] периодическая проверка ID_PP=%d: чтение существующих меток: %v\n", pointID, err)
+			continue
+		}
+
+		for _, r := range pointReadings {
+			if err := validatePointReading(r); err != nil {
+				stats.Blocked++
+				log.Printf("[синхронизация с ЭС] периодическая проверка: БЛОКИРОВКА (%s ID_PP=%d %s): %v\n",
+					r.mapping.Label, pointID, r.ts.Format("02.01 15:04"), err)
+				continue
+			}
+
+			key := pointMainsTimeKey(r.ts)
+			if _, ok := existing[key]; ok {
+				stats.Existing++
+				continue
+			}
+			if cfg.DryRun {
+				log.Printf("[синхронизация с ЭС] периодическая ПРОВЕРКА БЕЗ ЗАПИСИ — было бы добавлено: %s ID_PP=%d %s значение=%g\n",
+					r.mapping.Label, pointID, r.ts.Format("02.01.2006 15:04"), r.value)
+				continue
+			}
+
+			if err := writer.InsertPoint(ctx, pointID, r.ts, r.value, 0); err != nil {
+				if IsDuplicateKeyError(err) {
+					existing[key] = struct{}{}
+					stats.Existing++
+					continue
+				}
+				stats.Failed++
+				log.Printf("[синхронизация с ЭС] периодическая проверка: вставка (%s ID_PP=%d %s): %v\n",
+					r.mapping.Label, pointID, r.ts.Format("02.01 15:04"), err)
+				continue
+			}
+
+			existing[key] = struct{}{}
+			stats.Inserted++
+			health.MarkESWriteSuccess(cfg.DeviceID, time.Now())
+		}
+	}
+
+	return stats, nil
 }
 
 type dirtyHealStats struct {

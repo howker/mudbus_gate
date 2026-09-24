@@ -193,6 +193,47 @@ ORDER BY name
 // showed up as "not found" here before this cast was added, spamming
 // duplicate-key errors on a retry loop every sync interval. Casting both
 // sides to the SAME datetime precision makes the comparison exact.
+// ExistingPointTimes returns all PointMains timestamps already present for
+// one ID_PP in an inclusive range. Recent reconciliation uses this instead
+// of issuing PointExists once per local reading: one SELECT per configured
+// point is enough for the whole safety window.
+//
+// The returned key intentionally keeps calendar fields only (to whole-second
+// precision). PointMains.DT is SQL Server datetime and all archive-derived
+// timestamps written by mbgw are period boundaries, so sub-second precision
+// is not meaningful here. Keeping calendar fields also avoids a Location
+// mismatch for IVK-TER's wall-clock timestamps.
+func pointMainsTimeKey(ts time.Time) string {
+	return ts.Format("2006-01-02 15:04:05")
+}
+
+func (w *PointMainsWriter) ExistingPointTimes(ctx context.Context, pointID int, from, to time.Time) (map[string]struct{}, error) {
+	if to.Before(from) {
+		from, to = to, from
+	}
+	q := fmt.Sprintf(
+		"SELECT DT FROM [%s].dbo.PointMains WITH (NOLOCK) WHERE ID_PP = @p1 AND DT >= CAST(@p2 AS datetime) AND DT <= CAST(@p3 AS datetime)",
+		w.database)
+	rows, err := w.db.QueryContext(ctx, q, pointID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]struct{})
+	for rows.Next() {
+		var ts time.Time
+		if err := rows.Scan(&ts); err != nil {
+			return nil, err
+		}
+		out[pointMainsTimeKey(ts)] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (w *PointMainsWriter) PointExists(ctx context.Context, pointID int, ts time.Time) (bool, error) {
 	q := fmt.Sprintf(
 		"SELECT TOP 1 1 FROM [%s].dbo.PointMains WITH (NOLOCK) WHERE ID_PP = @p1 AND DT = CAST(@p2 AS datetime)",
