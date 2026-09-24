@@ -234,6 +234,7 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/devices/probe", s.handleDeviceProbe)
 	mux.HandleFunc("/api/devices/poll-now", s.handleDevicePollNow)
 	mux.HandleFunc("/api/vkm-channels", s.handleVKMChannels)
+	mux.HandleFunc("/api/vkm-source-tags", s.handleVKMSourceTags)
 	mux.HandleFunc("/api/vkm-channels/check-history", s.handleCheckChannelHistory)
 	mux.HandleFunc("/api/es-connection", s.handleESConnection)
 	mux.HandleFunc("/api/es-connection/test", s.handleESConnectionTest)

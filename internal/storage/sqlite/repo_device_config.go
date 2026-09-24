@@ -690,13 +690,13 @@ WHERE es_channel_id IN (%s) AND device_id != ?
 	return conflicts, rows.Err()
 }
 
-// SetVKMChannels atomically replaces every mapping for a device.
-// PipeNo is 1..10 and SlotNo is 1..4. For backward compatibility with old
-// callers, zero PipeNo means pipe 1 and zero SlotNo is assigned to the next
-// free slot of that pipe in input order.
-func (r *Repo) SetVKMChannels(ctx context.Context, deviceID string, rows []VKMChannelRecord) error {
+// normalizeVKMChannels validates and canonicalizes the complete point-mapping
+// set before a transaction starts. Keeping validation outside the transaction
+// lets SetVKMChannelsAndActivePipes update both channel mappings and the active
+// pipe list atomically without duplicating the mapping rules.
+func normalizeVKMChannels(deviceID string, rows []VKMChannelRecord) ([]VKMChannelRecord, error) {
 	if deviceID == "" {
-		return fmt.Errorf("set vkm channels: device id is empty")
+		return nil, fmt.Errorf("set vkm channels: device id is empty")
 	}
 
 	normalized := make([]VKMChannelRecord, len(rows))
@@ -709,7 +709,7 @@ func (r *Repo) SetVKMChannels(ctx context.Context, deviceID string, rows []VKMCh
 			row.PipeNo = 1
 		}
 		if row.PipeNo < 1 || row.PipeNo > 10 {
-			return fmt.Errorf("set vkm channels: pipe %d is outside 1..10", row.PipeNo)
+			return nil, fmt.Errorf("set vkm channels: pipe %d is outside 1..10", row.PipeNo)
 		}
 		if row.SlotNo == 0 {
 			slot := nextSlot[row.PipeNo] + 1
@@ -719,38 +719,35 @@ func (r *Repo) SetVKMChannels(ctx context.Context, deviceID string, rows []VKMCh
 			row.SlotNo = slot
 		}
 		if row.SlotNo < 1 || row.SlotNo > 4 {
-			return fmt.Errorf("set vkm channels: pipe %d slot %d is outside 1..4", row.PipeNo, row.SlotNo)
+			return nil, fmt.Errorf("set vkm channels: pipe %d slot %d is outside 1..4", row.PipeNo, row.SlotNo)
 		}
 		key := [2]int{row.PipeNo, row.SlotNo}
 		if usedSlot[key] {
-			return fmt.Errorf("set vkm channels: duplicate pipe %d slot %d", row.PipeNo, row.SlotNo)
+			return nil, fmt.Errorf("set vkm channels: duplicate pipe %d slot %d", row.PipeNo, row.SlotNo)
 		}
 		usedSlot[key] = true
 		if row.SlotNo > nextSlot[row.PipeNo] {
 			nextSlot[row.PipeNo] = row.SlotNo
 		}
 		if strings.TrimSpace(row.Tag) == "" {
-			return fmt.Errorf("set vkm channels: pipe %d slot %d has empty source tag", row.PipeNo, row.SlotNo)
+			return nil, fmt.Errorf("set vkm channels: pipe %d slot %d has empty source tag", row.PipeNo, row.SlotNo)
 		}
 		if row.ESChannelID != 0 {
 			if usedChannel[row.ESChannelID] {
-				return fmt.Errorf("set vkm channels: ID_PP %d is duplicated within device %q", row.ESChannelID, deviceID)
+				return nil, fmt.Errorf("set vkm channels: ID_PP %d is duplicated within device %q", row.ESChannelID, deviceID)
 			}
 			usedChannel[row.ESChannelID] = true
 		}
 		normalized[i] = row
 	}
+	return normalized, nil
+}
 
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("set vkm channels: begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
+func replaceVKMChannelsTx(ctx context.Context, tx *sql.Tx, deviceID string, rows []VKMChannelRecord) error {
 	if _, err := tx.ExecContext(ctx, `DELETE FROM es_vkm_channels WHERE device_id = ?`, deviceID); err != nil {
 		return fmt.Errorf("set vkm channels: clear existing: %w", err)
 	}
-	for _, row := range normalized {
+	for _, row := range rows {
 		if _, err := tx.ExecContext(ctx, `
 INSERT INTO es_vkm_channels
     (device_id, pipe_no, slot_no, source_tag, es_channel_id, factor, min_value, max_value)
@@ -759,8 +756,62 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			return fmt.Errorf("set vkm channels: insert pipe %d slot %d (%s): %w", row.PipeNo, row.SlotNo, row.Tag, err)
 		}
 	}
+	return nil
+}
+
+// SetVKMChannels atomically replaces every mapping for a device.
+// PipeNo is 1..10 and SlotNo is 1..4. For backward compatibility with old
+// callers, zero PipeNo means pipe 1 and zero SlotNo is assigned to the next
+// free slot of that pipe in input order.
+func (r *Repo) SetVKMChannels(ctx context.Context, deviceID string, rows []VKMChannelRecord) error {
+	normalized, err := normalizeVKMChannels(deviceID, rows)
+	if err != nil {
+		return err
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("set vkm channels: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := replaceVKMChannelsTx(ctx, tx, deviceID, normalized); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("set vkm channels: commit: %w", err)
+	}
+	return nil
+}
+
+// SetVKMChannelsAndActivePipes is the Web UI save path for VKM-360. It
+// changes the four mapping slots per pipe and the set of pipes polled by the
+// archive engine in one SQLite transaction, so an interrupted save can never
+// leave mappings and polling configuration describing different pipes.
+func (r *Repo) SetVKMChannelsAndActivePipes(ctx context.Context, deviceID string, rows []VKMChannelRecord, pipes []int) error {
+	normalizedChannels, err := normalizeVKMChannels(deviceID, rows)
+	if err != nil {
+		return err
+	}
+	normalizedPipes, err := normalizeVKMPipes(pipes)
+	if err != nil {
+		return err
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("set VKM point config: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := replaceVKMChannelsTx(ctx, tx, deviceID, normalizedChannels); err != nil {
+		return err
+	}
+	if err := replaceVKMActivePipesTx(ctx, tx, deviceID, normalizedPipes); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("set VKM point config: commit: %w", err)
 	}
 	return nil
 }

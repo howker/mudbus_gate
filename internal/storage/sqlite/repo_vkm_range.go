@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -80,4 +81,23 @@ ORDER BY ts_hour DESC LIMIT 1
 		return 0, time.Time{}, time.Time{}, false, fmt.Errorf("newest vkm raw: %w", err)
 	}
 	return count, oldest, newest, true, nil
+}
+
+// GetLatestVKMRawString returns the newest raw archive string stored for one
+// VKM-360 pipe. found=false means that pipe has not produced any archived raw
+// row yet; callers may then fall back to the standard tag list until the first
+// successful archive poll completes.
+func (r *Repo) GetLatestVKMRawString(ctx context.Context, deviceID string, pipe int) (raw string, ts time.Time, found bool, err error) {
+	err = r.db.QueryRowContext(ctx, `
+SELECT raw_string, ts_hour FROM archive_vkm_raw
+WHERE device_id = ? AND pipe = ?
+ORDER BY ts_hour DESC LIMIT 1
+`, deviceID, pipe).Scan(&raw, &ts)
+	if err == sql.ErrNoRows {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, fmt.Errorf("get latest vkm raw string: %w", err)
+	}
+	return raw, ts, true, nil
 }

@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"sort"
 )
@@ -39,6 +40,38 @@ ORDER BY pipe ASC
 	return out, nil
 }
 
+func normalizeVKMPipes(pipes []int) ([]int, error) {
+	if len(pipes) == 0 {
+		return nil, fmt.Errorf("active VKM pipe list must not be empty")
+	}
+	seen := make(map[int]bool, len(pipes))
+	normalized := make([]int, 0, len(pipes))
+	for _, pipe := range pipes {
+		if pipe < vkmMinPipe || pipe > vkmMaxPipe {
+			return nil, fmt.Errorf("VKM pipe %d is outside %d..%d", pipe, vkmMinPipe, vkmMaxPipe)
+		}
+		if seen[pipe] {
+			return nil, fmt.Errorf("VKM pipe %d is duplicated", pipe)
+		}
+		seen[pipe] = true
+		normalized = append(normalized, pipe)
+	}
+	sort.Ints(normalized)
+	return normalized, nil
+}
+
+func replaceVKMActivePipesTx(ctx context.Context, tx *sql.Tx, deviceID string, pipes []int) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM vkm_active_pipes WHERE device_id = ?`, deviceID); err != nil {
+		return fmt.Errorf("clear vkm active pipes: %w", err)
+	}
+	for _, pipe := range pipes {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO vkm_active_pipes (device_id, pipe) VALUES (?, ?)`, deviceID, pipe); err != nil {
+			return fmt.Errorf("insert vkm active pipe %d: %w", pipe, err)
+		}
+	}
+	return nil
+}
+
 // SetVKMActivePipes atomically replaces the active archive-pipe set for one
 // VKM-360. The protocol supports pipe numbers 1..10; duplicates and values
 // outside that range are rejected rather than silently normalized.
@@ -46,23 +79,10 @@ func (r *Repo) SetVKMActivePipes(ctx context.Context, deviceID string, pipes []i
 	if deviceID == "" {
 		return fmt.Errorf("device id is empty")
 	}
-	if len(pipes) == 0 {
-		return fmt.Errorf("active VKM pipe list must not be empty")
+	normalized, err := normalizeVKMPipes(pipes)
+	if err != nil {
+		return err
 	}
-
-	seen := make(map[int]bool, len(pipes))
-	normalized := make([]int, 0, len(pipes))
-	for _, pipe := range pipes {
-		if pipe < vkmMinPipe || pipe > vkmMaxPipe {
-			return fmt.Errorf("VKM pipe %d is outside %d..%d", pipe, vkmMinPipe, vkmMaxPipe)
-		}
-		if seen[pipe] {
-			return fmt.Errorf("VKM pipe %d is duplicated", pipe)
-		}
-		seen[pipe] = true
-		normalized = append(normalized, pipe)
-	}
-	sort.Ints(normalized)
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -70,13 +90,8 @@ func (r *Repo) SetVKMActivePipes(ctx context.Context, deviceID string, pipes []i
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM vkm_active_pipes WHERE device_id = ?`, deviceID); err != nil {
-		return fmt.Errorf("clear vkm active pipes: %w", err)
-	}
-	for _, pipe := range normalized {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO vkm_active_pipes (device_id, pipe) VALUES (?, ?)`, deviceID, pipe); err != nil {
-			return fmt.Errorf("insert vkm active pipe %d: %w", pipe, err)
-		}
+	if err := replaceVKMActivePipesTx(ctx, tx, deviceID, normalized); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("set vkm active pipes commit: %w", err)

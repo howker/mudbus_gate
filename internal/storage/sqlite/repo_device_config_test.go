@@ -380,3 +380,45 @@ func TestSetVKMChannelsRejectsDuplicateIDPPWithinDevice(t *testing.T) {
 		t.Fatal("want duplicate ID_PP to be rejected")
 	}
 }
+
+func TestSetVKMChannelsAndActivePipesUpdatesBoth(t *testing.T) {
+	repo := newTestRepoWithDeviceConfig(t)
+	ctx := context.Background()
+
+	if err := repo.SetVKMActivePipes(ctx, "vkm-ui", []int{1}); err != nil {
+		t.Fatalf("seed active pipes: %v", err)
+	}
+	if err := repo.SetVKMChannels(ctx, "vkm-ui", []VKMChannelRecord{
+		{PipeNo: 1, SlotNo: 1, Tag: "T", ESChannelID: 101, Factor: 1},
+	}); err != nil {
+		t.Fatalf("seed channels: %v", err)
+	}
+
+	if err := repo.SetVKMChannelsAndActivePipes(ctx, "vkm-ui", []VKMChannelRecord{
+		{PipeNo: 1, SlotNo: 1, Tag: "ST", ESChannelID: 201, Factor: 1},
+		{PipeNo: 2, SlotNo: 1, Tag: "V", ESChannelID: 202, Factor: 1},
+	}, []int{1, 2}); err != nil {
+		t.Fatalf("save combined config: %v", err)
+	}
+
+	pipes, err := repo.GetVKMActivePipes(ctx, "vkm-ui")
+	if err != nil {
+		t.Fatalf("get active pipes: %v", err)
+	}
+	if len(pipes) != 2 || pipes[0] != 1 || pipes[1] != 2 {
+		t.Fatalf("active pipes=%v, want [1 2]", pipes)
+	}
+	rows, err := repo.GetVKMChannels(ctx, "vkm-ui")
+	if err != nil {
+		t.Fatalf("get channels: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("channels=%d, want 2", len(rows))
+	}
+	if rows[0].PipeNo != 1 || rows[0].Tag != "ST" || rows[0].ESChannelID != 201 {
+		t.Fatalf("pipe1 mapping=%+v", rows[0])
+	}
+	if rows[1].PipeNo != 2 || rows[1].Tag != "V" || rows[1].ESChannelID != 202 {
+		t.Fatalf("pipe2 mapping=%+v", rows[1])
+	}
+}

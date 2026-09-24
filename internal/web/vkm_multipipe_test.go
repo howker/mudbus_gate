@@ -1,7 +1,10 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
@@ -118,5 +121,82 @@ func TestComputeVKMArchiveInfoUnknownWhenActivePipeHasNoRawData(t *testing.T) {
 	info := s.computeVKMArchiveInfo(ctx, "vkm_multi", -1)
 	if info.LagKnown {
 		t.Fatalf("LagKnown=true with no raw data for active pipe 2: %+v", info)
+	}
+}
+
+func TestVKMSourceTagsFromLatestRaw(t *testing.T) {
+	s, repo := newVKMMultipipeWebTestServer(t)
+	ctx := context.Background()
+	ts := time.Date(2026, 9, 24, 12, 30, 0, 0, time.Local)
+	if err := repo.SaveVKMRawString(ctx, "vkm_multi", 2, ts,
+		"Time=839865600-839867400сек;Pi=412115.688Па;T=155.373093°С;S=276.720459кг;ST=762482432Дж;NSS=;"); err != nil {
+		t.Fatalf("save raw: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/vkm-source-tags?device_id=vkm_multi", nil)
+	rr := httptest.NewRecorder()
+	s.handleVKMSourceTags(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var rows []struct {
+		PipeNo int      `json:"pipe_no"`
+		Found  bool     `json:"found"`
+		Tags   []string `json:"tags"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(rows) != 10 {
+		t.Fatalf("rows=%d, want 10", len(rows))
+	}
+	p2 := rows[1]
+	if p2.PipeNo != 2 || !p2.Found {
+		t.Fatalf("pipe2 metadata=%+v", p2)
+	}
+	want := []string{"Pi", "T", "S", "ST"}
+	if len(p2.Tags) != len(want) {
+		t.Fatalf("pipe2 tags=%v, want %v", p2.Tags, want)
+	}
+	for i := range want {
+		if p2.Tags[i] != want[i] {
+			t.Fatalf("pipe2 tags=%v, want %v", p2.Tags, want)
+		}
+	}
+	if rows[2].Found || len(rows[2].Tags) != 0 {
+		t.Fatalf("pipe3 unexpectedly has source tags: %+v", rows[2])
+	}
+}
+
+func TestHandleVKMChannelsSavesActivePipesWithMappings(t *testing.T) {
+	s, repo := newVKMMultipipeWebTestServer(t)
+	body := []byte(`{
+		"device_id":"vkm_multi",
+		"active_pipes":[1,2],
+		"force":true,
+		"channels":[
+			{"pipe_no":1,"slot_no":1,"tag":"ST","es_channel_id":501,"factor":1},
+			{"pipe_no":2,"slot_no":1,"tag":"V","es_channel_id":502,"factor":1}
+		]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/vkm-channels", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	s.handleVKMChannels(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	pipes, err := repo.GetVKMActivePipes(context.Background(), "vkm_multi")
+	if err != nil {
+		t.Fatalf("get active pipes: %v", err)
+	}
+	if len(pipes) != 2 || pipes[0] != 1 || pipes[1] != 2 {
+		t.Fatalf("active pipes=%v, want [1 2]", pipes)
+	}
+	rows, err := repo.GetVKMChannels(context.Background(), "vkm_multi")
+	if err != nil {
+		t.Fatalf("get channels: %v", err)
+	}
+	if len(rows) != 2 || rows[0].PipeNo != 1 || rows[1].PipeNo != 2 {
+		t.Fatalf("saved mappings=%+v", rows)
 	}
 }

@@ -292,14 +292,21 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
   <div id="panel-channels" class="panel">
     <div class="section">
       <h3>Точки ЭС</h3>
-      <p class="small-note">Каждая величина прибора сопоставляется с конкретной точкой ЭС (полем ID_PP в таблице PointMains).</p>
+      <p class="small-note">Каждая величина прибора сопоставляется с конкретной точкой ЭС (полем ID_PP в таблице PointMains). Для ВКМ-360 можно включить до 10 трубопроводов; у каждого — четыре независимых слота ID_PP с выбором параметра из реально прочитанной архивной строки.</p>
       <div class="form-row"><label>Прибор</label>
         <select id="ch_device" onchange="loadChannels()"></select>
       </div>
-      <table>
-        <thead><tr><th>Величина</th><th>ID_PP</th><th>Множитель</th></tr></thead>
-        <tbody id="channelsTableBody"><tr><td colspan="3">Выберите прибор</td></tr></tbody>
-      </table>
+      <div id="channelsLegacyWrap">
+        <table>
+          <thead><tr><th>Величина</th><th>ID_PP</th><th>Множитель</th></tr></thead>
+          <tbody id="channelsTableBody"><tr><td colspan="3">Выберите прибор</td></tr></tbody>
+        </table>
+      </div>
+      <div id="channelsVKMWrap" style="display:none;">
+        <p class="small-note">Флажок «Опрос» задаёт трубопроводы, которые шлюз реально читает. Параметры в выпадающих списках берутся из последней сохранённой сырой строки каждого трубопровода. Если трубопровод только что включён, сначала сохраните настройки и выполните архивный опрос/переопрос, затем нажмите «Обновить параметры из архива».</p>
+        <p><button class="btn secondary" type="button" onclick="refreshVKMSourceTags()">Обновить параметры из архива</button></p>
+        <div id="vkmPipeGroups"></div>
+      </div>
       <p><button class="btn" onclick="saveChannels()">Сохранить точки</button></p>
       <div id="channelsMsg" class="msg"></div>
     </div>
@@ -531,7 +538,9 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 var allDevices = [];
 var allProfiles = [];
 var editingOriginalKind = null; // set by editDevice(), cleared by resetDeviceForm() — used to warn if the operator changes "Тип прибора" while editing an EXISTING device (root cause of the 2026-08-23 incident: switching kind mid-edit silently repurposed one device's saved row into a different device).
-var channelSafetyByTag = {}; // min/max остаются backend-настройкой; из обычного операторского UI они скрыты, но при сохранении существующие значения не теряются.
+var channelSafetyByTag = {}; // non-VKM legacy rows keep backend min/max even though that compact table does not expose them.
+var vkmChannelBySlot = {};   // key "pipe:slot" -> saved mapping row
+var vkmSourceTagsByPipe = {}; // pipe -> tags parsed from the newest raw archive row
 
 function loadProfiles() {
   var xhr = new XMLHttpRequest();
@@ -2409,11 +2418,22 @@ function currentChannelsKind() {
   return null;
 }
 
-// renderChannelsTable перестраивает строки таблицы под тип прибора —
-// набор величин определяется типом прибора: ВКМ, Akron или ИВК-ТЭР. Вызывается ДО заполнения
-// значений (loadChannels), чтобы поля #ch_<тег>_id/#ch_<тег>_factor
-// уже существовали в DOM к моменту, когда придёт ответ сервера.
+// renderChannelsTable keeps the compact historical layout for Akron/IVK.
+// VKM-360 uses a separate pipe/slot editor below because its source tag is no
+// longer hard-coded: each of up to ten pipes has four independently mapped
+// ID_PP slots.
 function renderChannelsTable(kind) {
+  var legacy = document.getElementById('channelsLegacyWrap');
+  var vkm = document.getElementById('channelsVKMWrap');
+  if (kind === 'vkm360') {
+    legacy.style.display = 'none';
+    vkm.style.display = 'block';
+    renderVKMPipeGroups();
+    return;
+  }
+
+  legacy.style.display = 'block';
+  vkm.style.display = 'none';
   var defs = POINT_TAG_DEFS[kind] || [];
   var html = '';
   for (var i = 0; i < defs.length; i++) {
@@ -2423,6 +2443,153 @@ function renderChannelsTable(kind) {
   }
   if (html === '') { html = '<tr><td colspan="3">Выберите прибор</td></tr>'; }
   document.getElementById('channelsTableBody').innerHTML = html;
+}
+
+function currentVKMActivePipeMap() {
+  var deviceId = document.getElementById('ch_device').value;
+  var pipes = [1];
+  for (var i = 0; i < allDevices.length; i++) {
+    if (allDevices[i].id === deviceId) {
+      if (allDevices[i].vkm_active_pipes && allDevices[i].vkm_active_pipes.length) {
+        pipes = allDevices[i].vkm_active_pipes;
+      }
+      break;
+    }
+  }
+  var out = {};
+  for (var j = 0; j < pipes.length; j++) { out[pipes[j]] = true; }
+  return out;
+}
+
+function vkmFallbackTags() {
+  var defs = POINT_TAG_DEFS.vkm360 || [];
+  var out = [];
+  for (var i = 0; i < defs.length; i++) { out.push(defs[i].tag); }
+  return out;
+}
+
+function vkmTagLabel(tag) {
+  var defs = POINT_TAG_DEFS.vkm360 || [];
+  for (var i = 0; i < defs.length; i++) {
+    if (defs[i].tag === tag) { return defs[i].label; }
+  }
+  return tag;
+}
+
+function vkmTagOptions(pipe, selected) {
+  var meta = vkmSourceTagsByPipe[pipe];
+  var tags = (meta && meta.tags && meta.tags.length) ? meta.tags.slice(0) : vkmFallbackTags();
+  var seen = {};
+  var html = '<option value="">— параметр —</option>';
+  if (selected) {
+    var already = false;
+    for (var z = 0; z < tags.length; z++) { if (tags[z] === selected) { already = true; break; } }
+    if (!already) { tags.unshift(selected); }
+  }
+  for (var i = 0; i < tags.length; i++) {
+    var t = tags[i];
+    if (seen[t]) { continue; }
+    seen[t] = true;
+    html += '<option value="' + escapeHtmlForLog(t) + '"' + (t === selected ? ' selected' : '') + '>' +
+      escapeHtmlForLog(vkmTagLabel(t)) + '</option>';
+  }
+  return html;
+}
+
+function vkmPipeHasMapping(pipe) {
+  for (var slot = 1; slot <= 4; slot++) {
+    if (vkmChannelBySlot[pipe + ':' + slot]) { return true; }
+  }
+  return false;
+}
+
+function renderVKMPipeGroups() {
+  var host = document.getElementById('vkmPipeGroups');
+  if (!host) { return; }
+  var active = currentVKMActivePipeMap();
+  var html = '';
+  for (var pipe = 1; pipe <= 10; pipe++) {
+    var expanded = pipe === 1 || active[pipe] || vkmPipeHasMapping(pipe);
+    var meta = vkmSourceTagsByPipe[pipe];
+    var note = 'Архивная строка ещё не сохранена — показан базовый набор параметров.';
+    if (meta && meta.found) {
+      note = 'Параметры из последней архивной строки' + (meta.ts ? ' (' + meta.ts.replace('T', ' ') + ')' : '') + '.';
+    }
+    html += '<div style="border:1px solid #3e3e42;margin:10px 0;background:#1e1e1e;">' +
+      '<div style="padding:8px 10px;background:#333337;">' +
+      '<button type="button" class="btn secondary" style="width:180px;text-align:left;" onclick="toggleVKMPipe(' + pipe + ')">' +
+      '<span id="ch_pipe_' + pipe + '_arrow">' + (expanded ? '▼' : '▶') + '</span> Трубопровод ' + pipe + '</button>' +
+      '<label style="margin-left:12px;color:#cccccc;"><input id="ch_pipe_' + pipe + '_active" type="checkbox"' + (active[pipe] ? ' checked' : '') + '> Опрос</label>' +
+      '</div>' +
+      '<div id="ch_pipe_' + pipe + '_body" style="display:' + (expanded ? 'block' : 'none') + ';padding:8px 10px;">' +
+      '<div id="ch_pipe_' + pipe + '_source_note" class="small-note">' + note + '</div>' +
+      '<table><thead><tr><th>Слот</th><th>Параметр прибора</th><th>ID_PP</th><th>Множитель</th><th>Мин.</th><th>Макс.</th></tr></thead><tbody>';
+    for (var slot = 1; slot <= 4; slot++) {
+      var key = pipe + ':' + slot;
+      var row = vkmChannelBySlot[key] || {};
+      var tag = row.tag || '';
+      var id = row.es_channel_id || '';
+      var factor = (row.factor === undefined || row.factor === null) ? '1' : row.factor;
+      var minValue = (row.min_value === undefined || row.min_value === null) ? '' : row.min_value;
+      var maxValue = (row.max_value === undefined || row.max_value === null) ? '' : row.max_value;
+      html += '<tr><td>' + slot + '</td>' +
+        '<td><select id="ch_p' + pipe + '_s' + slot + '_tag" style="width:190px;">' + vkmTagOptions(pipe, tag) + '</select></td>' +
+        '<td><input id="ch_p' + pipe + '_s' + slot + '_id" type="text" value="' + id + '" style="width:90px;"></td>' +
+        '<td><input id="ch_p' + pipe + '_s' + slot + '_factor" type="text" value="' + factor + '" style="width:100px;"></td>' +
+        '<td><input id="ch_p' + pipe + '_s' + slot + '_min" type="text" value="' + minValue + '" style="width:90px;"></td>' +
+        '<td><input id="ch_p' + pipe + '_s' + slot + '_max" type="text" value="' + maxValue + '" style="width:90px;"></td></tr>';
+    }
+    html += '</tbody></table></div></div>';
+  }
+  host.innerHTML = html;
+}
+
+function toggleVKMPipe(pipe) {
+  var body = document.getElementById('ch_pipe_' + pipe + '_body');
+  var arrow = document.getElementById('ch_pipe_' + pipe + '_arrow');
+  if (!body) { return; }
+  var open = body.style.display !== 'none';
+  body.style.display = open ? 'none' : 'block';
+  if (arrow) { arrow.innerText = open ? '▶' : '▼'; }
+}
+
+function applyVKMSourceTags(rows) {
+  vkmSourceTagsByPipe = {};
+  for (var i = 0; i < rows.length; i++) { vkmSourceTagsByPipe[rows[i].pipe_no] = rows[i]; }
+  for (var pipe = 1; pipe <= 10; pipe++) {
+    var meta = vkmSourceTagsByPipe[pipe];
+    var noteEl = document.getElementById('ch_pipe_' + pipe + '_source_note');
+    if (noteEl) {
+      noteEl.innerText = (meta && meta.found) ?
+        ('Параметры из последней архивной строки' + (meta.ts ? ' (' + meta.ts.replace('T', ' ') + ')' : '') + '.') :
+        'Архивная строка ещё не сохранена — показан базовый набор параметров.';
+    }
+    for (var slot = 1; slot <= 4; slot++) {
+      var sel = document.getElementById('ch_p' + pipe + '_s' + slot + '_tag');
+      if (!sel) { continue; }
+      var current = sel.value;
+      sel.innerHTML = vkmTagOptions(pipe, current);
+      sel.value = current;
+    }
+  }
+}
+
+function refreshVKMSourceTags() {
+  var deviceId = document.getElementById('ch_device').value;
+  if (!deviceId || currentChannelsKind() !== 'vkm360') { return; }
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/vkm-source-tags?device_id=' + encodeURIComponent(deviceId), true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    if (xhr.status !== 200) {
+      showMsg('channelsMsg', false, 'Не удалось обновить параметры ВКМ: HTTP ' + xhr.status);
+      return;
+    }
+    var rows = [];
+    try { rows = JSON.parse(xhr.responseText) || []; } catch (e) {}
+    applyVKMSourceTags(rows);
+  };
+  xhr.send();
 }
 
 function populateDeviceSelect(selectId, kindFilter) {
@@ -2442,21 +2609,32 @@ function populateDeviceSelect(selectId, kindFilter) {
 function loadChannels() {
   var deviceId = document.getElementById('ch_device').value;
   var kind = currentChannelsKind();
-  renderChannelsTable(kind);
   channelSafetyByTag = {};
+  vkmChannelBySlot = {};
+  vkmSourceTagsByPipe = {};
+  renderChannelsTable(kind);
   if (!deviceId) { return; }
-  var tags = (POINT_TAG_DEFS[kind] || []).map(function(d) { return d.tag; });
 
   var xhr = new XMLHttpRequest();
   xhr.open('GET', '/api/vkm-channels?device_id=' + encodeURIComponent(deviceId), true);
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
     var rows = JSON.parse(xhr.responseText) || [];
+    if (kind === 'vkm360') {
+      for (var i = 0; i < rows.length; i++) {
+        vkmChannelBySlot[rows[i].pipe_no + ':' + rows[i].slot_no] = rows[i];
+      }
+      renderVKMPipeGroups();
+      refreshVKMSourceTags();
+      return;
+    }
+
+    var tags = (POINT_TAG_DEFS[kind] || []).map(function(d) { return d.tag; });
     var byTag = {};
-    for (var i = 0; i < rows.length; i++) { byTag[rows[i].tag] = rows[i]; }
+    for (var j = 0; j < rows.length; j++) { byTag[rows[j].tag] = rows[j]; }
     channelSafetyByTag = byTag;
-    for (var j = 0; j < tags.length; j++) {
-      var t = tags[j];
+    for (var k = 0; k < tags.length; k++) {
+      var t = tags[k];
       var idEl = document.getElementById('ch_' + t + '_id');
       var factorEl = document.getElementById('ch_' + t + '_factor');
       if (!idEl) { continue; }
@@ -2467,40 +2645,92 @@ function loadChannels() {
   xhr.send();
 }
 
+function nullableFloat(v) {
+  if (v === null || v === undefined || String(v).replace(/^\s+|\s+$/g, '') === '') { return null; }
+  var n = parseFloat(v);
+  return isNaN(n) ? null : n;
+}
+
 function saveChannels(force) {
   var deviceId = document.getElementById('ch_device').value;
   if (!deviceId) { showMsg('channelsMsg', false, 'Выберите прибор'); return; }
-  var tags = (POINT_TAG_DEFS[currentChannelsKind()] || []).map(function(d) { return d.tag; });
+  var kind = currentChannelsKind();
   var channels = [];
   var channelIds = [];
-  for (var i = 0; i < tags.length; i++) {
-    var t = tags[i];
-    var idVal = document.getElementById('ch_' + t + '_id').value;
-    if (idVal === '') { continue; }
-    var chId = intOrZero(idVal);
-    var safety = channelSafetyByTag[t] || {};
+  var activePipes = null;
+  var seenIds = {};
 
-    channels.push({
-      tag: t,
-      es_channel_id: chId,
-      factor: floatOrOne(document.getElementById('ch_' + t + '_factor').value),
-      min_value: (safety.min_value !== undefined ? safety.min_value : null),
-      max_value: (safety.max_value !== undefined ? safety.max_value : null)
-    });
-    channelIds.push(chId);
+  if (kind === 'vkm360') {
+    activePipes = [];
+    for (var pipe = 1; pipe <= 10; pipe++) {
+      var activeEl = document.getElementById('ch_pipe_' + pipe + '_active');
+      if (activeEl && activeEl.checked) { activePipes.push(pipe); }
+      for (var slot = 1; slot <= 4; slot++) {
+        var idEl = document.getElementById('ch_p' + pipe + '_s' + slot + '_id');
+        if (!idEl) { continue; }
+        var idVal = String(idEl.value).replace(/^\s+|\s+$/g, '');
+        if (idVal === '') { continue; }
+        var chId = parseInt(idVal, 10);
+        if (isNaN(chId) || chId <= 0) {
+          showMsg('channelsMsg', false, 'Трубопровод ' + pipe + ', слот ' + slot + ': ID_PP должен быть положительным целым числом.');
+          return;
+        }
+        if (seenIds[chId]) {
+          showMsg('channelsMsg', false, 'ID_PP ' + chId + ' указан более одного раза.');
+          return;
+        }
+        seenIds[chId] = true;
+        var tag = document.getElementById('ch_p' + pipe + '_s' + slot + '_tag').value;
+        if (!tag) {
+          showMsg('channelsMsg', false, 'Трубопровод ' + pipe + ', слот ' + slot + ': выберите параметр прибора.');
+          return;
+        }
+        var minValue = nullableFloat(document.getElementById('ch_p' + pipe + '_s' + slot + '_min').value);
+        var maxValue = nullableFloat(document.getElementById('ch_p' + pipe + '_s' + slot + '_max').value);
+        if (minValue !== null && maxValue !== null && minValue > maxValue) {
+          showMsg('channelsMsg', false, 'Трубопровод ' + pipe + ', слот ' + slot + ': минимум больше максимума.');
+          return;
+        }
+        channels.push({
+          pipe_no: pipe,
+          slot_no: slot,
+          tag: tag,
+          es_channel_id: chId,
+          factor: floatOrOne(document.getElementById('ch_p' + pipe + '_s' + slot + '_factor').value),
+          min_value: minValue,
+          max_value: maxValue
+        });
+        channelIds.push(chId);
+      }
+    }
+    if (activePipes.length === 0) {
+      showMsg('channelsMsg', false, 'Для ВКМ-360 должен быть включён хотя бы один трубопровод.');
+      return;
+    }
+  } else {
+    var tags = (POINT_TAG_DEFS[kind] || []).map(function(d) { return d.tag; });
+    for (var i = 0; i < tags.length; i++) {
+      var t = tags[i];
+      var legacyIdVal = document.getElementById('ch_' + t + '_id').value;
+      if (legacyIdVal === '') { continue; }
+      var legacyChId = intOrZero(legacyIdVal);
+      var safety = channelSafetyByTag[t] || {};
+      channels.push({
+        tag: t,
+        es_channel_id: legacyChId,
+        factor: floatOrOne(document.getElementById('ch_' + t + '_factor').value),
+        min_value: (safety.min_value !== undefined ? safety.min_value : null),
+        max_value: (safety.max_value !== undefined ? safety.max_value : null)
+      });
+      channelIds.push(legacyChId);
+    }
   }
 
   if (force) {
-    // проверка истории в ЭС уже пройдена (или пропущена оператором) на
-    // предыдущем шаге — идём сразу к сохранению
-    doSaveChannels(deviceId, channels, true);
+    doSaveChannels(deviceId, channels, activePipes, true);
     return;
   }
 
-  // Сначала спрашиваем САМУ ЭС, нет ли в этих точках уже чужой истории
-  // (см. api_channel_check.go) — это ловит конфликт даже с точками,
-  // которые вообще не настроены у нас самих, в отличие от проверки
-  // внутри doSaveChannels (та знает только про наши собственные приборы).
   document.getElementById('channelsMsg').className = 'msg';
   var checkXhr = new XMLHttpRequest();
   checkXhr.open('POST', '/api/vkm-channels/check-history', true);
@@ -2511,14 +2741,12 @@ function saveChannels(force) {
     try { data = JSON.parse(checkXhr.responseText); } catch (e) {}
 
     if (checkXhr.status === 200 && data.checked === false) {
-      // проверка не смогла выполниться (например, подключение к ЭС не
-      // настроено) — не блокируем сохранение, просто предупреждаем
       if (!confirm('Не удалось проверить точки напрямую в ЭС (' + (data.reason || 'причина неизвестна') +
         '). Продолжить сохранение без этой проверки?')) {
         showMsg('channelsMsg', false, 'Сохранение отменено.');
         return;
       }
-      doSaveChannels(deviceId, channels, false);
+      doSaveChannels(deviceId, channels, activePipes, false);
       return;
     }
 
@@ -2535,35 +2763,43 @@ function saveChannels(force) {
       }
     }
 
-    doSaveChannels(deviceId, channels, false);
+    doSaveChannels(deviceId, channels, activePipes, false);
   };
   checkXhr.send(JSON.stringify({ channel_ids: channelIds }));
 }
 
-function doSaveChannels(deviceId, channels, force) {
+function doSaveChannels(deviceId, channels, activePipes, force) {
   var xhr = new XMLHttpRequest();
   xhr.open('POST', '/api/vkm-channels', true);
   xhr.setRequestHeader('Content-Type', 'application/json');
   xhr.onreadystatechange = function() {
     if (xhr.readyState !== 4) { return; }
     if (xhr.status === 200) {
-      showMsg('channelsMsg', true, 'Точки сохранены.');
+      if (activePipes && activePipes.length) {
+        for (var i = 0; i < allDevices.length; i++) {
+          if (allDevices[i].id === deviceId) { allDevices[i].vkm_active_pipes = activePipes.slice(0); break; }
+        }
+      }
+      showMsg('channelsMsg', true, 'Точки и трубопроводы сохранены.');
+      loadChannels();
     } else if (xhr.status === 409) {
-      // конфликт номеров точек с ДРУГИМ НАШИМ прибором — показываем
-      // предупреждение и даём явно подтвердить сохранение всё равно
       var data = {};
       try { data = JSON.parse(xhr.responseText); } catch (e) {}
       var msg = (data.error || 'Обнаружен конфликт точек.') + ' Сохранить всё равно?';
       if (confirm(msg)) {
-        doSaveChannels(deviceId, channels, true);
+        doSaveChannels(deviceId, channels, activePipes, true);
       } else {
         showMsg('channelsMsg', false, 'Сохранение отменено — исправьте номер точки.');
       }
     } else {
-      showMsg('channelsMsg', false, 'Ошибка: HTTP ' + xhr.status);
+      var errorData = {};
+      try { errorData = JSON.parse(xhr.responseText); } catch (e2) {}
+      showMsg('channelsMsg', false, 'Ошибка: ' + (errorData.error || ('HTTP ' + xhr.status)));
     }
   };
-  xhr.send(JSON.stringify({ device_id: deviceId, channels: channels, force: !!force }));
+  var body = { device_id: deviceId, channels: channels, force: !!force };
+  if (activePipes && activePipes.length) { body.active_pipes = activePipes; }
+  xhr.send(JSON.stringify(body));
 }
 
 function loadESConnection() {
