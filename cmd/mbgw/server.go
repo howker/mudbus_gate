@@ -594,13 +594,13 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 
 	// Devices come from the devices table (UpsertDevice/ListDevices,
 	// internal/storage/sqlite/repo_device_config.go) instead of
-	// config.yaml's Devices []DeviceConfig. Read ONCE here at startup —
-	// there is no hot-reload yet (the not-yet-built Web UI's "add
-	// device" action will require a restart of this process to take
-	// effect until a future step wires a reload/re-register path; adding
-	// that now would be speculative against a UI that doesn't exist yet
-	// — see IMPLEMENTATION_BACKLOG.md's general caution against building
-	// ahead of a confirmed need).
+	// config.yaml's Devices []DeviceConfig. This list is the startup baseline.
+	// If an enabled device cannot register now, the retry worker below reads
+	// that device's CURRENT row from SQLite before every later attempt, so a
+	// corrected COM/address/profile can recover without restarting the service.
+	// Fully automatic discovery of brand-new IDs added after startup remains a
+	// separate hot-reload feature; Release A2 deliberately does not broaden
+	// scope that far.
 	deviceRecords, err := repo.ListDevices(context.Background())
 	if err != nil {
 		return fmt.Errorf("не удалось прочитать список приборов из БД: %w", err)
@@ -661,10 +661,27 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			registerOneDevice(ctx, repo, devRec, leaseMgr, sched, &devicesMu, devices, deviceKinds, transports)
+			registerOneDevice(ctx, repo, devRec, leaseMgr, sched, &devicesMu, devices, deviceKinds, transports, nil)
 		}()
 	}
 	wg.Wait()
+
+	// Запоминаем только те ENABLED-приборы, которые существовали в БД на
+	// старте, но не смогли физически зарегистрироваться. Для них после
+	// запуска poller включится фоновая повторная регистрация с backoff.
+	// Успешно поднятые приборы сюда не попадают, а новые ID, добавленные в
+	// БД уже после старта процесса, намеренно не являются частью Release A2.
+	retryDeviceIDs := make([]string, 0)
+	devicesMu.Lock()
+	for _, devRec := range deviceRecords {
+		if !devRec.Enabled {
+			continue
+		}
+		if _, ok := devices[devRec.ID]; !ok {
+			retryDeviceIDs = append(retryDeviceIDs, devRec.ID)
+		}
+	}
+	devicesMu.Unlock()
 
 	// Watchdog использует только фактически зарегистрированные приборы.
 	// Недоступный при старте прибор не превращается в ложное «зависание»:
@@ -942,6 +959,10 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 		defer close(pollerDone)
 		pl.Run(ctx)
 	}()
+	var deviceRegistrationRetryWG sync.WaitGroup
+	for _, deviceID := range retryDeviceIDs {
+		startDeviceRegistrationRetry(ctx, repo, deviceID, leaseMgr, sched, &devicesMu, devices, deviceKinds, transports, pl, &deviceRegistrationRetryWG)
+	}
 	go wd.Run(ctx)
 	writeServiceEvent(serviceLog, "успешно", "запуск и остановка", "Основной цикл опроса запущен.")
 
@@ -979,6 +1000,11 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 	// только начинал завершение.
 	cancel()
 
+	// Retry-регистраторы тоже могут находиться внутри физического Open/Session.
+	// Дожидаемся их выхода по отменённому context ДО закрытия transport registry
+	// и возврата из server core, чтобы при остановке не оставалось фонового I/O.
+	deviceRegistrationRetryWG.Wait()
+
 	// Poller.Run теперь сам ждёт все per-device worker'ы. Для службы это
 	// принципиально: SCM не увидит «остановлена», пока активный обмен с
 	// прибором реально не закончен/не отменён context.
@@ -995,19 +1021,15 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 	return nil
 }
 
-// registerOneDevice делает всё, что раньше было одной итерацией
-// последовательного цикла в runServer: открывает транспорт/сессию,
-// собирает паспорт (Akron), регистрирует прибор в планировщике,
-// ставит стартовый дозабор в очередь и запускает es-sync.
-// Теперь вызывается в СВОЕЙ горутине на каждый прибор (см.
-// комментарий в runServer у wg.Wait()) — ошибка/долгий дозабор одного
-// прибора здесь никак не влияет на остальные горутины, вызванные для
-// других приборов.
+// registerOneDevice открывает транспорт/сессию, собирает паспорт, создаёт
+// runtime Device, регистрирует его расписание и ставит startup-backfill в
+// очередь. ES-sync с Release A1 запускается отдельно и от физической
+// регистрации больше не зависит. true означает, что прибор полностью
+// зарегистрирован; false — текущая попытка не удалась.
 //
-// devicesMu защищает devices/deviceKinds/esSyncTriggers — эти три карты
-// теперь пишутся ИЗ РАЗНЫХ горутин одновременно (раньше — из одной,
-// строго последовательно), так что блокировка обязательна на каждую
-// запись, не только ради HTTP-обработчиков, как было раньше.
+// devicesMu защищает server-карты devices/deviceKinds. При стартовой
+// регистрации функция вызывается параллельно для разных приборов; при
+// фоновой повторной регистрации тот же mutex защищает Web/UI от гонки.
 func deviceKindLabelRU(kind string) string {
 	switch kind {
 	case "vkm360":
@@ -1046,18 +1068,44 @@ func archiveScheduleWindow(start, end string) (*scheduler.Window, error) {
 	return &scheduler.Window{StartHour: sh, StartMinute: sm, EndHour: eh, EndMinute: em}, nil
 }
 
-func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqliterepo.DeviceRecord, leaseMgr *lease.LocalLease, sched *scheduler.Scheduler, devicesMu *sync.Mutex, devices map[string]*device.Device, deviceKinds map[string]string, transports *transportRegistry) {
+func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqliterepo.DeviceRecord, leaseMgr *lease.LocalLease, sched *scheduler.Scheduler, devicesMu *sync.Mutex, devices map[string]*device.Device, deviceKinds map[string]string, transports *transportRegistry, onRuntimeRegistered func(string, *device.Device)) bool {
 	profilePath := profilePathNextToExe(devRec.Profile)
 	p, err := profile.Parse(profilePath)
 	if err != nil {
 		log.Printf("[ERROR] прибор %s: ошибка профиля %s (разрешённый путь %s): %v\n",
 			devRec.ID, devRec.Profile, profilePath, err)
-		return
+		return false
 	}
 	sess, err := session.NewFromProfile(p.Session)
 	if err != nil {
 		log.Printf("[ERROR] неизвестный тип сессии %s: %v\n", p.Session.Type, err)
-		return
+		return false
+	}
+
+	// Проверяем календарное расписание ДО открытия транспорта и добавления
+	// прибора в runtime-карты. Иначе ошибка конфигурации могла оставить
+	// наполовину зарегистрированный Device/transport и помешать следующей
+	// фоновой попытке после исправления настроек оператором.
+	archivePeriod := time.Duration(0)
+	if len(p.Archives) > 0 {
+		archivePeriod = p.ArchivePeriod()
+	}
+	archiveAtMinute := devRec.ArchiveAtMinute
+	if archiveAtMinute < 0 {
+		archiveAtMinute = 5
+	}
+	archiveEvery := devRec.ArchiveEveryPeriods
+	if archiveEvery <= 0 {
+		archiveEvery = 1
+	}
+	archiveDaysMask := uint8(devRec.ArchiveDaysMask)
+	if archiveDaysMask == 0 {
+		archiveDaysMask = 0x7f
+	}
+	archiveWindow, windowErr := archiveScheduleWindow(devRec.ArchiveWindowStart, devRec.ArchiveWindowEnd)
+	if windowErr != nil {
+		log.Printf("[ERROR] прибор %s: некорректное окно архивного опроса: %v\n", devRec.ID, windowErr)
+		return false
 	}
 
 	retries := devRec.Retries
@@ -1078,7 +1126,7 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	tr, err := transport.New(trParams)
 	if err != nil {
 		log.Printf("[ERROR] прибор %s: не удалось создать транспорт: %v\n", devRec.ID, err)
-		return
+		return false
 	}
 
 	// Физический канал принадлежит ШИНЕ, а не прибору. Несколько
@@ -1105,7 +1153,7 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 			log.Printf("[НЕТ СВЯЗИ] прибор %s (%s): не удалось открыть подключение: %v. Проверьте питание прибора, кабель и настройки подключения.\n",
 				devRec.ID, endpoint, openErr)
 		}
-		return
+		return false
 	}
 
 	sessionErr := sess.Open(ctx, tr)
@@ -1114,17 +1162,17 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	if sessionErr != nil {
 		_ = tr.Close()
 		log.Printf("[ERROR] ошибка сессии %s: %v\n", devRec.ID, sessionErr)
-		return
+		return false
 	}
 	if releaseErr != nil {
 		_ = tr.Close()
 		log.Printf("[ERROR] прибор %s: не удалось освободить физический канал после открытия сессии: %v\n", devRec.ID, releaseErr)
-		return
+		return false
 	}
 	if transports == nil || !transports.Add(devRec.ID, tr) {
 		_ = tr.Close()
 		log.Printf("[INFO] прибор %s: регистрация отменена, сервер уже завершает работу\n", devRec.ID)
-		return
+		return false
 	}
 	isTCP := devRec.TransportKind == "modbus_tcp"
 
@@ -1189,30 +1237,17 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	deviceKinds[devRec.ID] = devRec.Kind
 	devicesMu.Unlock()
 
-	// Базовый архивный период теперь является свойством ПРОФИЛЯ прибора,
-	// а не switch по kind. Это важно для зоопарка: новый профиль сам
-	// объявляет 15/30/60-минутный период и не требует правки server.go.
-	archivePeriod := time.Duration(0)
-	if len(p.Archives) > 0 {
-		archivePeriod = p.ArchivePeriod()
+	// При фоновой повторной регистрации poller уже работает. Добавляем
+	// Device в его собственный потокобезопасный registry ДО регистрации
+	// расписания и startup-backfill, чтобы ни одно уже поставленное задание
+	// не могло попасть в ветку «неизвестный прибор». При обычном стартовом
+	// проходе callback=nil: poller создаётся позже из готового snapshot.
+	if onRuntimeRegistered != nil {
+		onRuntimeRegistered(devRec.ID, dev)
 	}
-	archiveAtMinute := devRec.ArchiveAtMinute
-	if archiveAtMinute < 0 {
-		archiveAtMinute = 5
-	}
-	archiveEvery := devRec.ArchiveEveryPeriods
-	if archiveEvery <= 0 {
-		archiveEvery = 1
-	}
-	archiveDaysMask := uint8(devRec.ArchiveDaysMask)
-	if archiveDaysMask == 0 {
-		archiveDaysMask = 0x7f
-	}
-	archiveWindow, windowErr := archiveScheduleWindow(devRec.ArchiveWindowStart, devRec.ArchiveWindowEnd)
-	if windowErr != nil {
-		log.Printf("[ERROR] прибор %s: некорректное окно архивного опроса: %v\n", devRec.ID, windowErr)
-		return
-	}
+
+	// Базовый архивный период является свойством ПРОФИЛЯ прибора, а
+	// расписание уже провалидировано до открытия физического канала выше.
 	if archivePeriod > 0 {
 		sched.RegisterArchiveCalendar(devRec.ID, archivePeriod, archiveEvery, archiveDaysMask, archiveWindow, archiveAtMinute)
 	}
@@ -1231,6 +1266,110 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 	// физической регистрации прибора сразу после чтения devices из SQLite,
 	// чтобы временная недоступность прибора при старте не отключала доставку
 	// уже накопленных локальных архивов в ЭС.
+	return true
+}
+
+const (
+	deviceRegistrationRetryInitial = 5 * time.Second
+	deviceRegistrationRetryMax     = 5 * time.Minute
+)
+
+func nextDeviceRegistrationRetryDelay(current time.Duration) time.Duration {
+	if current <= 0 {
+		return deviceRegistrationRetryInitial
+	}
+	next := current * 2
+	if next > deviceRegistrationRetryMax {
+		return deviceRegistrationRetryMax
+	}
+	return next
+}
+
+// startDeviceRegistrationRetry keeps exactly one retry loop for a device
+// that existed and was enabled at service startup but failed physical
+// registration. Before every attempt it re-reads that row from SQLite, so
+// operator corrections to COM/address/profile are picked up without a service
+// restart. A deleted or disabled device stops retrying.
+func startDeviceRegistrationRetry(
+	ctx context.Context,
+	repo *sqliterepo.Repo,
+	deviceID string,
+	leaseMgr *lease.LocalLease,
+	sched *scheduler.Scheduler,
+	devicesMu *sync.Mutex,
+	devices map[string]*device.Device,
+	deviceKinds map[string]string,
+	transports *transportRegistry,
+	pl *poller.Poller,
+	retryWG *sync.WaitGroup,
+) {
+	if retryWG != nil {
+		retryWG.Add(1)
+	}
+	go func() {
+		if retryWG != nil {
+			defer retryWG.Done()
+		}
+		delay := deviceRegistrationRetryInitial
+		log.Printf("[ИНФО] прибор %s: не зарегистрирован при старте; повторная попытка через %s\n", deviceID, delay)
+
+		for {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			case <-timer.C:
+			}
+
+			devRec, found, err := repo.GetDevice(ctx, deviceID)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("[ПРЕДУПРЕЖДЕНИЕ] прибор %s: не удалось перечитать настройки для повторной регистрации: %v\n", deviceID, err)
+				delay = nextDeviceRegistrationRetryDelay(delay)
+				continue
+			}
+			if !found {
+				log.Printf("[ИНФО] прибор %s удалён из настроек; повторная регистрация остановлена\n", deviceID)
+				return
+			}
+			if !devRec.Enabled {
+				log.Printf("[ИНФО] прибор %s отключён (enabled=0); повторная регистрация остановлена\n", deviceID)
+				return
+			}
+
+			devicesMu.Lock()
+			_, alreadyRegistered := devices[deviceID]
+			devicesMu.Unlock()
+			if alreadyRegistered || (pl != nil && pl.HasDevice(deviceID)) {
+				return
+			}
+
+			log.Printf("[ИНФО] прибор %s: повторная попытка регистрации\n", deviceID)
+			ok := registerOneDevice(
+				ctx, repo, devRec, leaseMgr, sched, devicesMu, devices, deviceKinds, transports,
+				func(id string, dev *device.Device) {
+					if pl != nil && pl.AddDevice(id, dev) {
+						log.Printf("[ИНФО] прибор %s: добавлен в работающий цикл опроса без перезапуска службы\n", id)
+					}
+				},
+			)
+			if ok {
+				log.Printf("[OK] прибор %s: связь восстановлена, повторная регистрация успешна\n", deviceID)
+				return
+			}
+
+			delay = nextDeviceRegistrationRetryDelay(delay)
+			log.Printf("[ИНФО] прибор %s: повторная регистрация не удалась; следующая попытка через %s\n", deviceID, delay)
+		}
+	}()
 }
 
 // findFreePort returns preferred if it's currently bindable, or the

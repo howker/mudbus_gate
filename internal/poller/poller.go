@@ -49,6 +49,12 @@ type deviceTaskQueue struct {
 
 type Poller struct {
 	scheduler *scheduler.Scheduler
+
+	// devices is the poller's own runtime registry. It is deliberately
+	// protected independently from cmd/mbgw's UI/runtime maps: devices can
+	// appear after startup when a previously unavailable meter is
+	// re-registered in the background.
+	devicesMu sync.RWMutex
 	devices   map[string]*device.Device
 	tickEvery time.Duration
 
@@ -74,7 +80,59 @@ func New(sched *scheduler.Scheduler, devices map[string]*device.Device, tickEver
 	if tickEvery <= 0 {
 		tickEvery = 1 * time.Second
 	}
-	return &Poller{scheduler: sched, devices: devices, tickEvery: tickEvery}
+
+	// Keep an internal copy instead of retaining the caller's map. The server
+	// has its own mutex for Web/UI access; sharing the same Go map with two
+	// unrelated locks would still be a data race. Dynamic registration goes
+	// only through AddDevice below.
+	owned := make(map[string]*device.Device, len(devices))
+	for id, dev := range devices {
+		owned[id] = dev
+	}
+	return &Poller{scheduler: sched, devices: owned, tickEvery: tickEvery}
+}
+
+// AddDevice makes a newly registered runtime device visible to the running
+// poller. false means the ID was already present and nothing was replaced.
+func (p *Poller) AddDevice(deviceID string, dev *device.Device) bool {
+	if p == nil || deviceID == "" || dev == nil {
+		return false
+	}
+	p.devicesMu.Lock()
+	defer p.devicesMu.Unlock()
+	if _, exists := p.devices[deviceID]; exists {
+		return false
+	}
+	p.devices[deviceID] = dev
+	return true
+}
+
+// HasDevice reports whether deviceID is currently available to dispatch.
+func (p *Poller) HasDevice(deviceID string) bool {
+	if p == nil {
+		return false
+	}
+	p.devicesMu.RLock()
+	_, ok := p.devices[deviceID]
+	p.devicesMu.RUnlock()
+	return ok
+}
+
+func (p *Poller) deviceIDs() []string {
+	p.devicesMu.RLock()
+	ids := make([]string, 0, len(p.devices))
+	for id := range p.devices {
+		ids = append(ids, id)
+	}
+	p.devicesMu.RUnlock()
+	return ids
+}
+
+func (p *Poller) getDevice(deviceID string) (*device.Device, bool) {
+	p.devicesMu.RLock()
+	dev, ok := p.devices[deviceID]
+	p.devicesMu.RUnlock()
+	return dev, ok
 }
 
 // Run drives the scheduler (Tick, then drain every due task) until ctx is
@@ -104,7 +162,7 @@ func (p *Poller) Run(ctx context.Context) {
 			// перестанет доходить до MarkPollerCycle и watchdog увидит
 			// остановку центрального механизма без ложных перезапусков.
 			p.scheduler.Tick(now)
-			for deviceID := range p.devices {
+			for _, deviceID := range p.deviceIDs() {
 				if next, ok := p.scheduler.NextPollAt(deviceID); ok {
 					health.SetNextPoll(deviceID, next)
 				}
@@ -267,7 +325,7 @@ func (p *Poller) dispatchLocked(ctx context.Context, task scheduler.Task) {
 
 // dispatch routes one Task to its device's Poll or PollArchives.
 func (p *Poller) dispatch(ctx context.Context, task scheduler.Task) {
-	dev, ok := p.devices[task.DeviceID]
+	dev, ok := p.getDevice(task.DeviceID)
 	if !ok {
 		log.Printf("[опрос] задача для неизвестного прибора %q, пропускаю\n", task.DeviceID)
 		return
