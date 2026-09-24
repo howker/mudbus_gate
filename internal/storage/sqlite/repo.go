@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 
 	_ "modernc.org/sqlite"
 
@@ -12,6 +13,13 @@ import (
 
 type Repo struct {
 	db *sql.DB
+
+	// esDirtySignals is a process-local wake-up path for the durable
+	// es_dirty_ranges queue. The queue itself lives in SQLite; these
+	// channels only let a running ES worker react immediately after a
+	// successful local archive repair instead of waiting for its timer.
+	esDirtyMu      sync.Mutex
+	esDirtySignals map[string]chan struct{}
 }
 
 func New(path string) (*Repo, error) {
@@ -51,7 +59,7 @@ func New(path string) (*Repo, error) {
 		return nil, fmt.Errorf("set busy_timeout: %w", err)
 	}
 
-	return &Repo{db: db}, nil
+	return &Repo{db: db, esDirtySignals: make(map[string]chan struct{})}, nil
 }
 
 func (r *Repo) InitSchema(ctx context.Context) error {

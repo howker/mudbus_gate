@@ -456,6 +456,9 @@ func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.
 	if err := repo.InitESSyncCursorSchema(ctx); err != nil {
 		return fmt.Errorf("не удалось подготовить курсор синхронизации с ЭС: %w", err)
 	}
+	if err := repo.InitESDirtyRangeSchema(ctx); err != nil {
+		return fmt.Errorf("не удалось подготовить очередь восстановления пропусков ЭС: %w", err)
+	}
 
 	var writer *PointMainsWriter
 	var writerKey sqlConnectionKey
@@ -477,10 +480,16 @@ func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.
 	retryDelay := 5 * time.Second
 	waitFor := time.Duration(0)
 	loggedNotConfigured := false
+	var dirtyTrigger <-chan struct{}
+	wakeOnDirty := false
 
 	for {
 		if waitFor > 0 {
 			timer := time.NewTimer(waitFor)
+			dirtyWake := dirtyTrigger
+			if !wakeOnDirty {
+				dirtyWake = nil
+			}
 			select {
 			case <-ctx.Done():
 				if !timer.Stop() {
@@ -500,6 +509,14 @@ func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.
 					}
 				}
 				log.Println("[синхронизация с ЭС] внеплановая синхронизация по запросу")
+			case <-dirtyWake:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				log.Println("[синхронизация с ЭС] локальный архив обновлён — внеплановая проверка пропусков ЭС")
 			}
 		} else {
 			select {
@@ -513,6 +530,7 @@ func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.
 		cfg, found, err := load(ctx)
 		if err != nil {
 			closeWriter()
+			wakeOnDirty = false
 			log.Printf("[синхронизация с ЭС] не удалось перечитать настройки: %v; повтор через %s\n", err, retryDelay)
 			waitFor = retryDelay
 			if retryDelay < 30*time.Second {
@@ -525,6 +543,7 @@ func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.
 		}
 		if !found {
 			closeWriter()
+			wakeOnDirty = false
 			if !loggedNotConfigured {
 				log.Println("[синхронизация с ЭС] подключение к БД ЭС или точки не настроены; worker остаётся запущен и подхватит настройки без перезапуска службы")
 				loggedNotConfigured = true
@@ -534,6 +553,9 @@ func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.
 			continue
 		}
 		loggedNotConfigured = false
+		if dirtyTrigger == nil {
+			dirtyTrigger = repo.ESDirtySignal(cfg.DeviceID)
+		}
 
 		key := connectionKey(cfg)
 		openedNow := false
@@ -547,6 +569,7 @@ func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.
 				Port:     cfg.SQLPort,
 			})
 			if err != nil {
+				wakeOnDirty = false
 				log.Printf("[синхронизация с ЭС] не удалось открыть подключение к SQL Server ЭС: %v; повтор через %s\n", err, retryDelay)
 				waitFor = retryDelay
 				if retryDelay < 30*time.Second {
@@ -567,6 +590,7 @@ func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.
 		cancel()
 		if pingErr != nil {
 			closeWriter()
+			wakeOnDirty = false
 			log.Printf("[синхронизация с ЭС] БД ЭС недоступна: %v; повтор через %s\n", pingErr, retryDelay)
 			waitFor = retryDelay
 			if retryDelay < 30*time.Second {
@@ -584,6 +608,13 @@ func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.
 				cfg.DeviceID, cfg.SQLServer, cfg.SQLDatabase, len(cfg.Points))
 		}
 		runPointSyncOnce(ctx, repo, writer, cfg)
+		if stats, healErr := healESDirtyRanges(ctx, repo, writer, cfg, 256); healErr != nil {
+			log.Printf("[синхронизация с ЭС] восстановление пропусков по изменённому локальному архиву: %v\n", healErr)
+		} else if stats.RangesCompleted > 0 || stats.Inserted > 0 || stats.Blocked > 0 {
+			log.Printf("[синхронизация с ЭС] восстановление пропусков: диапазонов проверено %d, закрыто %d, добавлено %d, уже было %d, заблокировано проверкой %d, ошибок %d\n",
+				stats.RangesChecked, stats.RangesCompleted, stats.Inserted, stats.Existing, stats.Blocked, stats.Failed)
+		}
+		wakeOnDirty = true
 		waitFor = cfg.interval()
 	}
 }
@@ -1067,6 +1098,131 @@ func runPointSyncOnce(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 			inserted, skipped, skippedByCursor, failed,
 			from.Format("02.01 15:04"), now.Format("02.01 15:04"))
 	}
+}
+
+type insertOnlyPointWriter interface {
+	PointExists(context.Context, int, time.Time) (bool, error)
+	InsertPoint(context.Context, int, time.Time, float64, int) error
+}
+
+type dirtyHealStats struct {
+	RangesChecked   int
+	RangesCompleted int
+	Inserted        int
+	Existing        int
+	Blocked         int
+	Failed          int
+}
+
+// healESDirtyRanges reconciles source ranges that were changed locally after
+// the ordinary per-point cursor may already have moved past them.
+//
+// SAFETY CONTRACT: this is INSERT-MISSING-ONLY. Existing PointMains rows are
+// never updated here; overwriting existing ES data remains exclusively the
+// explicit operator ForceResyncRange action.
+func healESDirtyRanges(ctx context.Context, repo *sqliterepo.Repo, writer insertOnlyPointWriter, cfg Config, limit int) (dirtyHealStats, error) {
+	var stats dirtyHealStats
+	if repo == nil {
+		return stats, fmt.Errorf("локальная БД не подключена")
+	}
+	if writer == nil {
+		return stats, fmt.Errorf("запись в ЭС не подключена")
+	}
+
+	ranges, err := repo.ListESDirtyRanges(ctx, cfg.DeviceID, limit)
+	if err != nil {
+		return stats, err
+	}
+
+	for _, dr := range ranges {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
+		stats.RangesChecked++
+
+		sourceFrom := dr.From
+		sourceTo := dr.To
+		switch cfg.Kind {
+		case "ivk-ter", "ivk_ter":
+			// archive_hourly keeps IVK calendar fields with Location=UTC,
+			// although they are local wall-clock. Rebuild the queue bounds
+			// in the server's wall-clock location before using the same
+			// collector as the normal ES path.
+			sourceFrom = wallClockInLocation(sourceFrom, time.Local)
+			sourceTo = wallClockInLocation(sourceTo, time.Local)
+		}
+
+		readings, readErr := collectReadings(ctx, repo, cfg, sourceFrom, sourceTo)
+		if readErr != nil {
+			stats.Failed++
+			log.Printf("[синхронизация с ЭС] dirty-range %s..%s: чтение локального архива: %v\n",
+				dr.From.Format("02.01 15:04"), dr.To.Format("02.01 15:04"), readErr)
+			continue
+		}
+
+		rangeDBOK := true
+		for _, r := range readings {
+			if err := validatePointReading(r); err != nil {
+				// Invalid source data is not retried forever here. If the
+				// archive row is later repaired, Save* re-dirties this range;
+				// until then, refusing the write is the safe terminal action.
+				stats.Blocked++
+				log.Printf("[синхронизация с ЭС] dirty-range: БЛОКИРОВКА (%s ID_PP=%d %s): %v\n",
+					r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), err)
+				continue
+			}
+
+			present, err := writer.PointExists(ctx, r.mapping.PointID, r.ts)
+			if err != nil {
+				stats.Failed++
+				rangeDBOK = false
+				log.Printf("[синхронизация с ЭС] dirty-range: проверка (%s ID_PP=%d %s): %v\n",
+					r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), err)
+				continue
+			}
+			if present {
+				// Never update an existing ES value automatically.
+				stats.Existing++
+				continue
+			}
+
+			if cfg.DryRun {
+				rangeDBOK = false
+				log.Printf("[синхронизация с ЭС] dirty-range ПРОВЕРКА БЕЗ ЗАПИСИ — было бы добавлено: %s ID_PP=%d %s значение=%g\n",
+					r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01.2006 15:04"), r.value)
+				continue
+			}
+
+			if err := writer.InsertPoint(ctx, r.mapping.PointID, r.ts, r.value, 0); err != nil {
+				if IsDuplicateKeyError(err) {
+					stats.Existing++
+					continue
+				}
+				stats.Failed++
+				rangeDBOK = false
+				log.Printf("[синхронизация с ЭС] dirty-range: вставка (%s ID_PP=%d %s): %v\n",
+					r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), err)
+				continue
+			}
+			stats.Inserted++
+			health.MarkESWriteSuccess(cfg.DeviceID, time.Now())
+		}
+
+		if !rangeDBOK {
+			continue
+		}
+
+		completed, err := repo.CompleteESDirtyRange(ctx, dr)
+		if err != nil {
+			stats.Failed++
+			continue
+		}
+		if completed {
+			stats.RangesCompleted++
+		}
+	}
+
+	return stats, nil
 }
 
 // PreviewForceResyncRange performs the same source read and safety

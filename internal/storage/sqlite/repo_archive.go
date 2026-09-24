@@ -57,6 +57,9 @@ CREATE TABLE IF NOT EXISTS archive_vkm_raw (
 	if err != nil {
 		return fmt.Errorf("init archive schema: %w", err)
 	}
+	if err := r.InitESDirtyRangeSchema(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -65,17 +68,40 @@ CREATE TABLE IF NOT EXISTS archive_vkm_raw (
 // of overlapping ranges never create duplicates — the (device, channel,
 // param, ts_hour) tuple is the natural key of an hourly archive point.
 func (r *Repo) SaveHourlyArchive(ctx context.Context, rec storage.HourlyArchiveRecord) error {
-	_, err := r.db.ExecContext(ctx, `
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("save hourly archive begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO archive_hourly (device_id, channel, param, ts_hour, value, unit, quality)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(device_id, channel, param, ts_hour) DO UPDATE SET
     value   = excluded.value,
     unit    = excluded.unit,
     quality = excluded.quality
+WHERE archive_hourly.value IS NOT excluded.value
+   OR archive_hourly.unit IS NOT excluded.unit
+   OR archive_hourly.quality IS NOT excluded.quality
 `, rec.DeviceID, rec.Channel, rec.Param, rec.TsHour, rec.Value, rec.Unit, rec.Quality)
 	if err != nil {
 		return fmt.Errorf("save hourly archive: %w", err)
 	}
+
+	// Queue the ES check even when the local value is byte-for-byte the same.
+	// A forced re-poll can confirm unchanged local data while PointMains still
+	// has an independent gap behind its ordinary cursor. One hourly snapshot
+	// can also influence the following derived interval (Akron V cumulative),
+	// so keep one hour of forward context.
+	if err := enqueueESDirtyRangeTx(ctx, tx, rec.DeviceID, rec.TsHour, rec.TsHour.Add(time.Hour)); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("save hourly archive commit: %w", err)
+	}
+	r.notifyESDirty(rec.DeviceID)
 	return nil
 }
 
@@ -212,15 +238,33 @@ WHERE device_id = ? AND channel = ? AND param = ?
 // повторный сбор того же часа перезаписывает старое значение, как и у
 // SaveHourlyArchive.
 func (r *Repo) SaveVKMRawString(ctx context.Context, deviceID string, pipe int, hourStart time.Time, raw string) error {
-	_, err := r.db.ExecContext(ctx, `
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("save vkm raw string begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, `
 INSERT INTO archive_vkm_raw (device_id, pipe, ts_hour, raw_string)
 VALUES (?, ?, ?, ?)
 ON CONFLICT (device_id, pipe, ts_hour) DO UPDATE SET
     raw_string = excluded.raw_string
+WHERE archive_vkm_raw.raw_string IS NOT excluded.raw_string
 `, deviceID, pipe, hourStart, raw)
 	if err != nil {
 		return fmt.Errorf("save vkm raw string: %w", err)
 	}
+
+	// Same rule as SaveHourlyArchive: a successful forced refresh is enough
+	// reason to re-check ES, even if the local raw string itself did not change.
+	if err := enqueueESDirtyRangeTx(ctx, tx, deviceID, hourStart, hourStart.Add(time.Hour)); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("save vkm raw string commit: %w", err)
+	}
+	r.notifyESDirty(deviceID)
 	return nil
 }
 
