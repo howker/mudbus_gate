@@ -317,7 +317,9 @@ func (s *Server) handleDeviceDelete(w http.ResponseWriter, r *http.Request) {
 
 // vkmChannelJSON is the wire shape for one tag->ЭС-channel mapping row.
 type vkmChannelJSON struct {
-	Tag         string   `json:"tag"` // "ST" | "S" | "T" | "Pi" | "V"
+	PipeNo      int      `json:"pipe_no,omitempty"`
+	SlotNo      int      `json:"slot_no,omitempty"`
+	Tag         string   `json:"tag"` // selected source field
 	ESChannelID int      `json:"es_channel_id"`
 	Factor      float64  `json:"factor"`
 	MinValue    *float64 `json:"min_value"` // null = lower safety limit disabled
@@ -344,6 +346,7 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 		out := make([]vkmChannelJSON, 0, len(rows))
 		for _, c := range rows {
 			out = append(out, vkmChannelJSON{
+				PipeNo: c.PipeNo, SlotNo: c.SlotNo,
 				Tag: c.Tag, ESChannelID: c.ESChannelID, Factor: c.Factor,
 				MinValue: c.MinValue, MaxValue: c.MaxValue,
 			})
@@ -366,6 +369,7 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 		}
 		rows := make([]sqliterepo.VKMChannelRecord, 0, len(body.Channels))
 		channelIDs := make([]int, 0, len(body.Channels))
+		seenChannelIDs := make(map[int]bool)
 		for _, c := range body.Channels {
 			factor := c.Factor
 			if factor == 0 {
@@ -377,11 +381,18 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 						c.Tag, *c.MinValue, *c.MaxValue))
 				return
 			}
+			if c.ESChannelID != 0 && seenChannelIDs[c.ESChannelID] {
+				writeError(w, http.StatusBadRequest,
+					fmt.Sprintf("ID_PP %d указан более одного раза для прибора %q", c.ESChannelID, body.DeviceID))
+				return
+			}
 			rows = append(rows, sqliterepo.VKMChannelRecord{
-				DeviceID: body.DeviceID, Tag: c.Tag, ESChannelID: c.ESChannelID, Factor: factor,
+				DeviceID: body.DeviceID, PipeNo: c.PipeNo, SlotNo: c.SlotNo,
+				Tag: c.Tag, ESChannelID: c.ESChannelID, Factor: factor,
 				MinValue: c.MinValue, MaxValue: c.MaxValue,
 			})
 			if c.ESChannelID != 0 {
+				seenChannelIDs[c.ESChannelID] = true
 				channelIDs = append(channelIDs, c.ESChannelID)
 			}
 		}

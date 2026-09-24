@@ -58,6 +58,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -75,6 +76,7 @@ import (
 type PointMapping struct {
 	Tag     string // тег параметра прибора — см. collectVKMReadings/collectAkronReadings
 	PointID int    // ID_PP в PointMains
+	Pipe    int    // ВКМ: трубопровод 1..10; 0 = использовать legacy Config.Pipe
 	Factor  float64
 	Label   string // человекочитаемое название для лога
 
@@ -393,13 +395,15 @@ func RunEnergosphereSyncWithRepo(ctx context.Context, repo *sqliterepo.Repo, cfg
 	}
 
 	if cfg.Kind == "vkm360" {
-		if n, oldest, newest, found, err := repo.CountVKMRaw(ctx, cfg.DeviceID, cfg.Pipe); err != nil {
-			log.Printf("[синхронизация с ЭС] предупреждение: не смог опросить исходную БД: %v\n", err)
-		} else if !found {
-			log.Printf("[синхронизация с ЭС] ВНИМАНИЕ: в локальной БД нет ни одной записи для прибор=%s труба=%d — опрос прибора собрал данные?\n", cfg.DeviceID, cfg.Pipe)
-		} else {
-			log.Printf("[синхронизация с ЭС] исходная БД: %d записей ВКМ, период с %s по %s\n",
-				n, oldest.Format("02.01.2006 15:04"), newest.Format("02.01.2006 15:04"))
+		for _, pipe := range vkmMappedPipes(cfg) {
+			if n, oldest, newest, found, err := repo.CountVKMRaw(ctx, cfg.DeviceID, pipe); err != nil {
+				log.Printf("[синхронизация с ЭС] предупреждение: не смог опросить исходную БД ВКМ, трубопровод %d: %v\n", pipe, err)
+			} else if !found {
+				log.Printf("[синхронизация с ЭС] ВНИМАНИЕ: в локальной БД нет ни одной записи для прибор=%s труба=%d — опрос прибора собрал данные?\n", cfg.DeviceID, pipe)
+			} else {
+				log.Printf("[синхронизация с ЭС] исходная БД: прибор=%s труба=%d, %d записей ВКМ, период с %s по %s\n",
+					cfg.DeviceID, pipe, n, oldest.Format("02.01.2006 15:04"), newest.Format("02.01.2006 15:04"))
+			}
 		}
 	}
 
@@ -675,30 +679,93 @@ func validatePointReading(r pointReading) error {
 	return nil
 }
 
+func vkmMappedPipes(cfg Config) []int {
+	seen := make(map[int]bool)
+	for _, m := range cfg.Points {
+		pipe := m.Pipe
+		if pipe == 0 {
+			pipe = cfg.Pipe
+		}
+		if pipe == 0 {
+			pipe = 1
+		}
+		if pipe >= 1 && pipe <= 10 {
+			seen[pipe] = true
+		}
+	}
+	if len(seen) == 0 {
+		pipe := cfg.Pipe
+		if pipe < 1 || pipe > 10 {
+			pipe = 1
+		}
+		seen[pipe] = true
+	}
+	out := make([]int, 0, len(seen))
+	for pipe := range seen {
+		out = append(out, pipe)
+	}
+	sort.Ints(out)
+	return out
+}
+
 // collectVKMReadings читает диапазон сырых строк архива ВКМ и извлекает
 // из каждой все теги, перечисленные в cfg.Points — тот же путь, что был
 // и раньше, просто вынесен в отдельную функцию, чтобы runPointSyncOnce
 // мог одинаково работать что с этим источником, что с Akron'овским.
 func collectVKMReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, from, now time.Time) ([]pointReading, error) {
-	rows, err := repo.GetVKMRawStringsRange(ctx, cfg.DeviceID, cfg.Pipe, from, now)
-	if err != nil {
-		return nil, err
+	// A single device may map points from several VKM pipes. Group mappings
+	// first so each physical/raw pipe range is read once per sync pass.
+	byPipe := make(map[int][]PointMapping)
+	for _, m := range cfg.Points {
+		pipe := m.Pipe
+		if pipe == 0 {
+			pipe = cfg.Pipe
+		}
+		if pipe == 0 {
+			pipe = 1
+		}
+		if pipe < 1 || pipe > 10 {
+			return nil, fmt.Errorf("ВКМ: точка ID_PP=%d настроена на недопустимый трубопровод %d", m.PointID, pipe)
+		}
+		byPipe[pipe] = append(byPipe[pipe], m)
 	}
+
+	pipes := make([]int, 0, len(byPipe))
+	for pipe := range byPipe {
+		pipes = append(pipes, pipe)
+	}
+	sort.Ints(pipes)
+
 	var out []pointReading
-	for _, row := range rows {
-		// Сдвиг метки времени применяется ОДИН раз здесь, до всех
-		// дальнейших действий — так он гарантированно одинаков и в
-		// проверке существования точки, и в самой записи, и в строках
-		// лога (иначе легко получить рассинхрон: проверяем одно время,
-		// пишем другое). Зачем этот сдвиг вообще нужен — см.
-		// Config.TimeShiftMinutes.
-		esTime := row.TsHour.Add(time.Duration(cfg.TimeShiftMinutes) * time.Minute)
-		for _, m := range cfg.Points {
-			rawVal, ok := parseVKMTagFloat(row.RawString, m.Tag)
-			if !ok {
-				continue
+	missingWarned := make(map[string]bool)
+	for _, pipe := range pipes {
+		rows, err := repo.GetVKMRawStringsRange(ctx, cfg.DeviceID, pipe, from, now)
+		if err != nil {
+			return nil, fmt.Errorf("чтение сырых строк ВКМ, трубопровод %d: %w", pipe, err)
+		}
+
+		for _, row := range rows {
+			// Apply the configured ES time shift exactly once, preserving the
+			// historical single-pipe semantics for every pipe.
+			esTime := row.TsHour.Add(time.Duration(cfg.TimeShiftMinutes) * time.Minute)
+			for _, m := range byPipe[pipe] {
+				rawVal, ok := parseVKMTagFloat(row.RawString, m.Tag)
+				if !ok {
+					key := fmt.Sprintf("%d/%s", pipe, m.Tag)
+					if !missingWarned[key] {
+						log.Printf("[синхронизация с ЭС] ВНИМАНИЕ: прибор=%s трубопровод=%d: настроенный источник %q отсутствует в сырой строке; ID_PP=%d пока не обновляется\n",
+							cfg.DeviceID, pipe, m.Tag, m.PointID)
+						missingWarned[key] = true
+					}
+					continue
+				}
+				value := rawVal * m.Factor
+				out = append(out, pointReading{
+					mapping: m,
+					ts:      esTime,
+					value:   value,
+				})
 			}
-			out = append(out, pointReading{mapping: m, ts: esTime, value: rawVal * m.Factor})
 		}
 	}
 	return out, nil

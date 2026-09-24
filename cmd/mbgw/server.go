@@ -1436,8 +1436,8 @@ func isPortFree(port int) bool {
 // обоих типов приборов — принимает kind явным параметром (кладётся в
 // cfg.Kind, дальше используется в internal/integration для выбора
 // источника исходных данных). Таблица es_vkm_channels в SQLite физически
-// НЕ ограничена типом прибора (просто device_id/tag/es_channel_id/
-// factor, без привязки к kind — проверено в самой схеме, 2026-08-31),
+// НЕ ограничена типом прибора: она хранит device_id/pipe/slot/source_tag/
+// es_channel_id/factor без привязки к kind. Для не-ВКМ используется pipe 1;
 // так что GetVKMChannels можно смело переиспользовать и для Akron,
 // несмотря на «VKM» в названии — переименовывать сам метод/таблицу не
 // стали, это внутренняя деталь реализации, не видимая оператору.
@@ -1496,7 +1496,7 @@ func buildIntegrationConfig(ctx context.Context, repo *sqliterepo.Repo, deviceID
 			label = ch.Tag
 		}
 		cfg.Points = append(cfg.Points, integration.PointMapping{
-			Tag: ch.Tag, PointID: ch.ESChannelID, Factor: factor, Label: label,
+			Tag: ch.Tag, PointID: ch.ESChannelID, Pipe: ch.PipeNo, Factor: factor, Label: label,
 			MinValue: ch.MinValue, MaxValue: ch.MaxValue,
 		})
 	}

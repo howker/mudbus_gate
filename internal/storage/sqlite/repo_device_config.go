@@ -91,18 +91,21 @@ CREATE TABLE IF NOT EXISTS device_time_corrections (
 CREATE INDEX IF NOT EXISTS idx_device_time_corrections_device_time
     ON device_time_corrections(device_id, corrected_at);
 
--- Per-tag mapping of a ВКМ device's archive values into Энергосфера
--- Mains channels — one row per (device, tag). Read by
--- internal/integration/energosphere_sync.go instead of es_sync.txt's
--- chan_heat/chan_mass/chan_temp/chan_pressure/factor_* keys.
+-- Mapping of device source fields into Энергосфера Mains channels.
+-- For VKM-360 the key is (device, pipe, slot): every pipe exposes four
+-- configurable slots and each slot chooses its source tag independently.
+-- Existing single-pipe installations are migrated to pipe 1.
 CREATE TABLE IF NOT EXISTS es_vkm_channels (
     device_id     TEXT NOT NULL,
-    tag           TEXT NOT NULL,           -- 'ST' | 'S' | 'T' | 'Pi' | 'V'
+    pipe_no       INTEGER NOT NULL DEFAULT 1 CHECK (pipe_no BETWEEN 1 AND 10),
+    slot_no       INTEGER NOT NULL CHECK (slot_no BETWEEN 1 AND 4),
+    source_tag    TEXT NOT NULL,
     es_channel_id INTEGER NOT NULL,
     factor        REAL NOT NULL DEFAULT 1.0,
     min_value     REAL NULL,               -- NULL = lower safety limit disabled
     max_value     REAL NULL,               -- NULL = upper safety limit disabled
-    PRIMARY KEY (device_id, tag)
+    PRIMARY KEY (device_id, pipe_no, slot_no),
+    UNIQUE (device_id, es_channel_id)
 );
 
 -- Single-row table: the one Энергосфера SQL Server connection every
@@ -169,6 +172,129 @@ CREATE TABLE IF NOT EXISTS es_akron_northbound (
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE es_vkm_channels ADD COLUMN min_value REAL NULL`)
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE es_vkm_channels ADD COLUMN max_value REAL NULL`)
 
+	if err := r.migrateESVKMChannelsSchema(ctx); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// migrateESVKMChannelsSchema upgrades the historical
+// (device_id, tag)->ID_PP table to the pipe+slot model. SQLite cannot
+// change a PRIMARY KEY in-place, so the migration is an explicit
+// create/copy/drop/rename transaction. Existing rows stay on pipe 1;
+// their slot numbers are deterministic and no ID_PP is changed.
+func (r *Repo) migrateESVKMChannelsSchema(ctx context.Context) error {
+	cols, err := r.db.QueryContext(ctx, `PRAGMA table_info(es_vkm_channels)`)
+	if err != nil {
+		return fmt.Errorf("inspect es_vkm_channels schema: %w", err)
+	}
+	defer cols.Close()
+
+	columnSet := map[string]bool{}
+	for cols.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var def any
+		if err := cols.Scan(&cid, &name, &typ, &notNull, &def, &pk); err != nil {
+			return fmt.Errorf("inspect es_vkm_channels column: %w", err)
+		}
+		columnSet[name] = true
+	}
+	if err := cols.Err(); err != nil {
+		_ = cols.Close()
+		return fmt.Errorf("inspect es_vkm_channels columns: %w", err)
+	}
+	if err := cols.Close(); err != nil {
+		return fmt.Errorf("close es_vkm_channels schema rows: %w", err)
+	}
+	if columnSet["pipe_no"] && columnSet["slot_no"] && columnSet["source_tag"] {
+		return nil
+	}
+	if !columnSet["tag"] {
+		return fmt.Errorf("migrate es_vkm_channels: unsupported legacy schema")
+	}
+
+	type legacyRow struct {
+		deviceID           string
+		tag                string
+		esChannelID        int
+		factor             float64
+		minValue, maxValue sql.NullFloat64
+	}
+	rows, err := r.db.QueryContext(ctx, `
+SELECT device_id, tag, es_channel_id, factor, min_value, max_value
+FROM es_vkm_channels
+ORDER BY device_id,
+    CASE tag WHEN 'ST' THEN 1 WHEN 'S' THEN 2 WHEN 'T' THEN 3 WHEN 'Pi' THEN 4 ELSE 100 END,
+    tag
+`)
+	if err != nil {
+		return fmt.Errorf("read legacy es_vkm_channels: %w", err)
+	}
+	var legacy []legacyRow
+	for rows.Next() {
+		var v legacyRow
+		if err := rows.Scan(&v.deviceID, &v.tag, &v.esChannelID, &v.factor, &v.minValue, &v.maxValue); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan legacy es_vkm_channels: %w", err)
+		}
+		legacy = append(legacy, v)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close legacy es_vkm_channels rows: %w", err)
+	}
+
+	counts := map[string]int{}
+	for _, v := range legacy {
+		counts[v.deviceID]++
+		if counts[v.deviceID] > 4 {
+			return fmt.Errorf("migrate es_vkm_channels: device %q has %d mappings; pipe 1 supports 4 slots", v.deviceID, counts[v.deviceID])
+		}
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("migrate es_vkm_channels begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE es_vkm_channels_new (
+    device_id     TEXT NOT NULL,
+    pipe_no       INTEGER NOT NULL DEFAULT 1 CHECK (pipe_no BETWEEN 1 AND 10),
+    slot_no       INTEGER NOT NULL CHECK (slot_no BETWEEN 1 AND 4),
+    source_tag    TEXT NOT NULL,
+    es_channel_id INTEGER NOT NULL,
+    factor        REAL NOT NULL DEFAULT 1.0,
+    min_value     REAL NULL,
+    max_value     REAL NULL,
+    PRIMARY KEY (device_id, pipe_no, slot_no),
+    UNIQUE (device_id, es_channel_id)
+)`); err != nil {
+		return fmt.Errorf("create migrated es_vkm_channels: %w", err)
+	}
+
+	slots := map[string]int{}
+	for _, v := range legacy {
+		slots[v.deviceID]++
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO es_vkm_channels_new
+    (device_id, pipe_no, slot_no, source_tag, es_channel_id, factor, min_value, max_value)
+VALUES (?, 1, ?, ?, ?, ?, ?, ?)
+`, v.deviceID, slots[v.deviceID], v.tag, v.esChannelID, v.factor, v.minValue, v.maxValue); err != nil {
+			return fmt.Errorf("copy legacy es_vkm_channels row for %s/%s: %w", v.deviceID, v.tag, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE es_vkm_channels`); err != nil {
+		return fmt.Errorf("drop legacy es_vkm_channels: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE es_vkm_channels_new RENAME TO es_vkm_channels`); err != nil {
+		return fmt.Errorf("rename migrated es_vkm_channels: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("migrate es_vkm_channels commit: %w", err)
+	}
 	return nil
 }
 
@@ -508,10 +634,14 @@ LIMIT ?
 	return out, nil
 }
 
-// VKMChannelRecord is one tag->ЭС-channel mapping row.
+// VKMChannelRecord is one source-field -> ЭС channel mapping row.
+// PipeNo/SlotNo are part of the durable identity. Tag is the selected source
+// field name; the database column is source_tag.
 type VKMChannelRecord struct {
 	DeviceID    string
-	Tag         string // "ST" | "S" | "T" | "Pi" | "V"
+	PipeNo      int
+	SlotNo      int
+	Tag         string
 	ESChannelID int
 	Factor      float64
 	// MinValue/MaxValue are checked AFTER Factor is applied, immediately
@@ -521,19 +651,9 @@ type VKMChannelRecord struct {
 	MaxValue *float64
 }
 
-// SetVKMChannels replaces every channel mapping for a device in one call
-// (delete-then-insert inside a transaction) — the Web UI's "channels"
-// form submits the whole 4-row table for a device at once, not one tag
-// at a time, so this matches that shape instead of requiring 4 separate
-// upsert calls plus a separate "did the operator remove a row" diff.
-// FindChannelConflicts проверяет, не заняты ли уже перечисленные номера
-// каналов ЭС (ID_Channel) КАКИМ-ТО ДРУГИМ прибором (не тем, для которого
-// сейчас сохраняются каналы) — защита от случайной ошибки при ручном
-// вводе номера канала: если один и тот же канал ЭС окажется привязан
-// сразу к двум разным нашим приборам, данные одного будут затирать
-// данные другого в базе Энергосферы, и заметить это сразу непросто.
-// Возвращает карту "номер канала -> ID прибора, которому он уже
-// принадлежит" — пустая карта означает конфликтов нет.
+// FindChannelConflicts checks whether an ID_PP is already assigned to a
+// different device. A UNIQUE(device_id, es_channel_id) constraint separately
+// prevents the same device from assigning one ID_PP to multiple pipe/slots.
 func (r *Repo) FindChannelConflicts(ctx context.Context, deviceID string, channelIDs []int) (map[int]string, error) {
 	conflicts := make(map[int]string)
 	if len(channelIDs) == 0 {
@@ -570,7 +690,57 @@ WHERE es_channel_id IN (%s) AND device_id != ?
 	return conflicts, rows.Err()
 }
 
+// SetVKMChannels atomically replaces every mapping for a device.
+// PipeNo is 1..10 and SlotNo is 1..4. For backward compatibility with old
+// callers, zero PipeNo means pipe 1 and zero SlotNo is assigned to the next
+// free slot of that pipe in input order.
 func (r *Repo) SetVKMChannels(ctx context.Context, deviceID string, rows []VKMChannelRecord) error {
+	if deviceID == "" {
+		return fmt.Errorf("set vkm channels: device id is empty")
+	}
+
+	normalized := make([]VKMChannelRecord, len(rows))
+	nextSlot := map[int]int{}
+	usedSlot := map[[2]int]bool{}
+	usedChannel := map[int]bool{}
+	for i, row := range rows {
+		row.DeviceID = deviceID
+		if row.PipeNo == 0 {
+			row.PipeNo = 1
+		}
+		if row.PipeNo < 1 || row.PipeNo > 10 {
+			return fmt.Errorf("set vkm channels: pipe %d is outside 1..10", row.PipeNo)
+		}
+		if row.SlotNo == 0 {
+			slot := nextSlot[row.PipeNo] + 1
+			for slot <= 4 && usedSlot[[2]int{row.PipeNo, slot}] {
+				slot++
+			}
+			row.SlotNo = slot
+		}
+		if row.SlotNo < 1 || row.SlotNo > 4 {
+			return fmt.Errorf("set vkm channels: pipe %d slot %d is outside 1..4", row.PipeNo, row.SlotNo)
+		}
+		key := [2]int{row.PipeNo, row.SlotNo}
+		if usedSlot[key] {
+			return fmt.Errorf("set vkm channels: duplicate pipe %d slot %d", row.PipeNo, row.SlotNo)
+		}
+		usedSlot[key] = true
+		if row.SlotNo > nextSlot[row.PipeNo] {
+			nextSlot[row.PipeNo] = row.SlotNo
+		}
+		if strings.TrimSpace(row.Tag) == "" {
+			return fmt.Errorf("set vkm channels: pipe %d slot %d has empty source tag", row.PipeNo, row.SlotNo)
+		}
+		if row.ESChannelID != 0 {
+			if usedChannel[row.ESChannelID] {
+				return fmt.Errorf("set vkm channels: ID_PP %d is duplicated within device %q", row.ESChannelID, deviceID)
+			}
+			usedChannel[row.ESChannelID] = true
+		}
+		normalized[i] = row
+	}
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("set vkm channels: begin tx: %w", err)
@@ -580,12 +750,13 @@ func (r *Repo) SetVKMChannels(ctx context.Context, deviceID string, rows []VKMCh
 	if _, err := tx.ExecContext(ctx, `DELETE FROM es_vkm_channels WHERE device_id = ?`, deviceID); err != nil {
 		return fmt.Errorf("set vkm channels: clear existing: %w", err)
 	}
-	for _, row := range rows {
+	for _, row := range normalized {
 		if _, err := tx.ExecContext(ctx, `
-INSERT INTO es_vkm_channels (device_id, tag, es_channel_id, factor, min_value, max_value)
-VALUES (?, ?, ?, ?, ?, ?)
-`, deviceID, row.Tag, row.ESChannelID, row.Factor, row.MinValue, row.MaxValue); err != nil {
-			return fmt.Errorf("set vkm channels: insert %s: %w", row.Tag, err)
+INSERT INTO es_vkm_channels
+    (device_id, pipe_no, slot_no, source_tag, es_channel_id, factor, min_value, max_value)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+`, deviceID, row.PipeNo, row.SlotNo, row.Tag, row.ESChannelID, row.Factor, row.MinValue, row.MaxValue); err != nil {
+			return fmt.Errorf("set vkm channels: insert pipe %d slot %d (%s): %w", row.PipeNo, row.SlotNo, row.Tag, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -594,12 +765,14 @@ VALUES (?, ?, ?, ?, ?, ?)
 	return nil
 }
 
-// GetVKMChannels returns the channel mappings configured for a device
-// (empty slice, not an error, if none are set yet).
+// GetVKMChannels returns mappings ordered exactly as the UI presents them:
+// pipe first, then slot. An empty slice means no mapping is configured.
 func (r *Repo) GetVKMChannels(ctx context.Context, deviceID string) ([]VKMChannelRecord, error) {
 	rows, err := r.db.QueryContext(ctx, `
-SELECT device_id, tag, es_channel_id, factor, min_value, max_value
-FROM es_vkm_channels WHERE device_id = ? ORDER BY tag
+SELECT device_id, pipe_no, slot_no, source_tag, es_channel_id, factor, min_value, max_value
+FROM es_vkm_channels
+WHERE device_id = ?
+ORDER BY pipe_no, slot_no
 `, deviceID)
 	if err != nil {
 		return nil, fmt.Errorf("get vkm channels: %w", err)
@@ -610,7 +783,7 @@ FROM es_vkm_channels WHERE device_id = ? ORDER BY tag
 	for rows.Next() {
 		var v VKMChannelRecord
 		var minValue, maxValue sql.NullFloat64
-		if err := rows.Scan(&v.DeviceID, &v.Tag, &v.ESChannelID, &v.Factor, &minValue, &maxValue); err != nil {
+		if err := rows.Scan(&v.DeviceID, &v.PipeNo, &v.SlotNo, &v.Tag, &v.ESChannelID, &v.Factor, &minValue, &maxValue); err != nil {
 			return nil, fmt.Errorf("scan vkm channel: %w", err)
 		}
 		if minValue.Valid {

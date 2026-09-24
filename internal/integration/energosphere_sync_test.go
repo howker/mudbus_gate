@@ -450,3 +450,42 @@ func TestIVKSyncCursorUsesWallClockSemanticsAcrossLocationChange(t *testing.T) {
 		t.Fatalf("Akron cursor must remain unchanged: want %v, got %v", akronTS, gotAkron)
 	}
 }
+
+func TestCollectVKMReadingsSeparatesMappingsByPipe(t *testing.T) {
+	repo := newIntegrationTestRepo(t)
+	ctx := context.Background()
+	ts := time.Date(2026, 9, 24, 12, 30, 0, 0, time.Local)
+
+	if err := repo.SaveVKMRawString(ctx, "vkm", 1, ts, "T=10;"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveVKMRawString(ctx, "vkm", 2, ts, "T=20;"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := collectVKMReadings(ctx, repo, Config{
+		DeviceID: "vkm",
+		Kind:     "vkm360",
+		Pipe:     1,
+		Points: []PointMapping{
+			{Tag: "T", PointID: 101, Pipe: 1, Factor: 1},
+			{Tag: "T", PointID: 202, Pipe: 2, Factor: 1},
+		},
+	}, ts, ts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 readings, got %d: %#v", len(got), got)
+	}
+	byPoint := map[int]pointReading{}
+	for _, r := range got {
+		byPoint[r.mapping.PointID] = r
+	}
+	if r, ok := byPoint[101]; !ok || r.value != 10 || r.mapping.Pipe != 1 {
+		t.Fatalf("pipe 1 mapping mismatch: %#v", r)
+	}
+	if r, ok := byPoint[202]; !ok || r.value != 20 || r.mapping.Pipe != 2 {
+		t.Fatalf("pipe 2 mapping mismatch: %#v", r)
+	}
+}

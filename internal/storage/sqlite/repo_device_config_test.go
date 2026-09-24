@@ -305,3 +305,78 @@ func TestLastTimeCorrection(t *testing.T) {
 		t.Fatalf("unexpected last correction: %+v", rec)
 	}
 }
+
+func TestESVKMChannelsLegacyMigrationPreservesMappings(t *testing.T) {
+	repo, err := New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	ctx := context.Background()
+
+	if _, err := repo.db.ExecContext(ctx, `
+CREATE TABLE es_vkm_channels (
+    device_id TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    es_channel_id INTEGER NOT NULL,
+    factor REAL NOT NULL DEFAULT 1.0,
+    PRIMARY KEY (device_id, tag)
+);
+INSERT INTO es_vkm_channels (device_id, tag, es_channel_id, factor) VALUES
+    ('vkm1', 'S', 229994, 0.001),
+    ('vkm1', 'ST', 230001, 0.000000000238846);
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := repo.InitDeviceConfigSchema(ctx); err != nil {
+		t.Fatalf("migrate device config schema: %v", err)
+	}
+
+	got, err := repo.GetVKMChannels(ctx, "vkm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 migrated mappings, got %d: %+v", len(got), got)
+	}
+	if got[0].PipeNo != 1 || got[0].SlotNo != 1 || got[0].Tag != "ST" || got[0].ESChannelID != 230001 {
+		t.Fatalf("slot 1 migration mismatch: %+v", got[0])
+	}
+	if got[1].PipeNo != 1 || got[1].SlotNo != 2 || got[1].Tag != "S" || got[1].ESChannelID != 229994 {
+		t.Fatalf("slot 2 migration mismatch: %+v", got[1])
+	}
+}
+
+func TestSetVKMChannelsAllowsSameSourceTagOnDifferentPipes(t *testing.T) {
+	repo := newTestRepoWithDeviceConfig(t)
+	ctx := context.Background()
+
+	err := repo.SetVKMChannels(ctx, "vkm1", []VKMChannelRecord{
+		{PipeNo: 1, SlotNo: 1, Tag: "T", ESChannelID: 101, Factor: 1},
+		{PipeNo: 2, SlotNo: 1, Tag: "T", ESChannelID: 202, Factor: 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := repo.GetVKMChannels(ctx, "vkm1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].PipeNo != 1 || got[1].PipeNo != 2 || got[0].Tag != "T" || got[1].Tag != "T" {
+		t.Fatalf("unexpected mappings: %+v", got)
+	}
+}
+
+func TestSetVKMChannelsRejectsDuplicateIDPPWithinDevice(t *testing.T) {
+	repo := newTestRepoWithDeviceConfig(t)
+	ctx := context.Background()
+
+	err := repo.SetVKMChannels(ctx, "vkm1", []VKMChannelRecord{
+		{PipeNo: 1, SlotNo: 1, Tag: "S", ESChannelID: 101, Factor: 1},
+		{PipeNo: 2, SlotNo: 1, Tag: "T", ESChannelID: 101, Factor: 1},
+	})
+	if err == nil {
+		t.Fatal("want duplicate ID_PP to be rejected")
+	}
+}
