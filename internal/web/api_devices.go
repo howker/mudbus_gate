@@ -64,6 +64,7 @@ type deviceJSON struct {
 	TimeCorrectionMaxStepSeconds    int    `json:"time_correction_max_step_seconds"`
 	TimeCorrectionDailyLimitSeconds int    `json:"time_correction_daily_limit_seconds"`
 	Enabled                         bool   `json:"enabled"`
+	VKMActivePipes                  []int  `json:"vkm_active_pipes,omitempty"`
 	// Overwrite must be explicitly true to upsert over an ID that already
 	// exists. Defense in depth against the 2026-08-23 incident (saving a
 	// new device silently overwrote a different, already-saved one that
@@ -165,7 +166,16 @@ func (s *Server) handleDevices(w http.ResponseWriter, r *http.Request) {
 		}
 		out := make([]deviceJSON, 0, len(list))
 		for _, d := range list {
-			out = append(out, deviceToJSON(d))
+			j := deviceToJSON(d)
+			if d.Kind == "vkm360" {
+				pipes, err := configuredVKMPipes(r.Context(), s.repo, d.ID)
+				if err != nil {
+					log.Printf("[WEB] не удалось прочитать активные трубопроводы ВКМ %s: %v\n", d.ID, err)
+					pipes = []int{1}
+				}
+				j.VKMActivePipes = pipes
+			}
+			out = append(out, j)
 		}
 		writeJSON(w, http.StatusOK, out)
 

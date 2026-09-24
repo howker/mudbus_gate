@@ -10,8 +10,9 @@ import "time"
 // hold single-stream meters and, later, multichannel heat meters without
 // a schema change:
 //
-//	Akron-01 (one pipe, volume):        Channel="",     Param="V"
-//	ВКМ-360  (heat, per pipe, energy):  Channel="ТП1",  Param="E"
+//	Akron-01 (one pipe, volume): Channel="",  Param="V"
+//	ВКМ-360 pipe 1:               Channel="",  Param="S"/"ST"/"T"/"Pi"
+//	ВКМ-360 pipe 2..10:           Channel="2".."10", same param namespace
 //
 // TsHour is WALL-CLOCK time of the meter (the "16:00 17.07.2026" the meter
 // itself stamps on the record), NOT a UTC-shifted instant. The upstream
@@ -33,4 +34,13 @@ type HourlyArchiveRecord struct {
 	Value    float64   // normalized quantity as the meter reported it
 	Unit     string
 	Quality  string
+}
+
+// VKMRawRow is one stored ВКМ-360 archive period: the raw decoded string
+// together with the period-end timestamp it belongs to. The name TsHour is
+// kept for compatibility with archive_vkm_raw's historical column name even
+// though VKM periods are currently 30 minutes.
+type VKMRawRow struct {
+	TsHour    time.Time
+	RawString string
 }

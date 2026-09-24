@@ -452,6 +452,9 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
       <div class="form-row"><label>Прибор</label>
         <select id="ar_device" onchange="onArchiveDeviceChange()"></select>
       </div>
+      <div class="form-row" id="ar_pipe_row" style="display:none;"><label>Трубопровод</label>
+        <select id="ar_pipe"></select>
+      </div>
       <div class="form-row"><label>Период</label>
         <input id="ar_from" type="text" style="width:120px;" placeholder="ГГГГ-ММ-ДД">
         <select id="ar_from_h" style="width:55px;"></select>:<select id="ar_from_m" style="width:55px;"></select>
@@ -758,6 +761,22 @@ function validateTimeCorrectionFields(body) {
 function onArchiveDeviceChange() {
   var deviceId = document.getElementById('ar_device').value;
   var d = findDevice(deviceId);
+
+  var pipeRow = document.getElementById('ar_pipe_row');
+  var pipeSel = document.getElementById('ar_pipe');
+  if (d && d.kind === 'vkm360') {
+    var pipes = d.vkm_active_pipes && d.vkm_active_pipes.length ? d.vkm_active_pipes : [1];
+    var pipeHtml = '';
+    for (var pi = 0; pi < pipes.length; pi++) {
+      pipeHtml += '<option value="' + pipes[pi] + '">Трубопровод ' + pipes[pi] + '</option>';
+    }
+    pipeSel.innerHTML = pipeHtml;
+    pipeRow.style.display = 'block';
+  } else {
+    pipeSel.innerHTML = '';
+    pipeRow.style.display = 'none';
+  }
+
   var showReload = !!(d && (d.kind === 'akron' || d.kind === 'vkm360' || d.kind === 'ivk-ter'));
   document.getElementById('reloadSection').style.display = showReload ? 'block' : 'none';
   // Поле "по" показываем для ВКМ и ИВК-ТЭР. ВКМ адресуется по времени
@@ -1134,10 +1153,15 @@ function archiveQueryString() {
   var from = fromDate + 'T' + document.getElementById('ar_from_h').value + ':' + document.getElementById('ar_from_m').value;
   var to = toDate + 'T' + document.getElementById('ar_to_h').value + ':' + document.getElementById('ar_to_m').value;
   var granularity = document.getElementById('ar_granularity').value;
-  return 'device_id=' + encodeURIComponent(deviceId) +
+  var q = 'device_id=' + encodeURIComponent(deviceId) +
     '&from=' + encodeURIComponent(from) +
     '&to=' + encodeURIComponent(to) +
     '&granularity=' + encodeURIComponent(granularity);
+  var d = findDevice(deviceId);
+  if (d && d.kind === 'vkm360') {
+    q += '&pipe=' + encodeURIComponent(document.getElementById('ar_pipe').value || '1');
+  }
+  return q;
 }
 
 function loadArchiveTable() {

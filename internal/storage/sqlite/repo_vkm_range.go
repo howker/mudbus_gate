@@ -4,16 +4,15 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"mbgw/internal/storage"
 )
 
-// VKMRawRow is one stored ВКМ-360 archive half-hour: the raw (cp1251-decoded,
-// not yet field-parsed) string plus the period timestamp it belongs to.
-// Used by the es-sync command to walk everything collected in a window and
-// push it into the Энергосфера SQL Server database.
-type VKMRawRow struct {
-	TsHour    time.Time
-	RawString string
-}
+// VKMRawRow remains exported from sqlite as an alias for backward
+// compatibility with callers that referenced sqlite.VKMRawRow directly.
+// The canonical type lives in storage so device code can use a narrow
+// pipe-aware range interface without importing the concrete sqlite package.
+type VKMRawRow = storage.VKMRawRow
 
 // GetVKMRawStringsRange returns every stored ВКМ archive row for the device
 // and pipe whose period timestamp falls in [fromTs, toTs], oldest-first.

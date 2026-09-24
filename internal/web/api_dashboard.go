@@ -108,14 +108,19 @@ func (s *Server) handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 			SyncSupported: dev.Kind == "vkm360" || dev.Kind == "akron" || dev.Kind == "ivk-ter" || dev.Kind == "ivk_ter",
 		}
 
-		period, param := archivePeriodAndParamForKind(dev.Kind)
-		if period > 0 {
-			info := s.computeArchiveInfo(r.Context(), dev.ID, param, period, dev.ArchiveAtMinute)
-			st.LagHours = info.LagHours
-			st.LagKnown = info.LagKnown
-			st.LastPeriod = info.LastPeriod
-			st.NextPollAt = info.NextPollAt
+		var info archiveInfo
+		if dev.Kind == "vkm360" {
+			info = s.computeVKMArchiveInfo(r.Context(), dev.ID, dev.ArchiveAtMinute)
+		} else {
+			period, param := archivePeriodAndParamForKind(dev.Kind)
+			if period > 0 {
+				info = s.computeArchiveInfo(r.Context(), dev.ID, param, period, dev.ArchiveAtMinute)
+			}
 		}
+		st.LagHours = info.LagHours
+		st.LagKnown = info.LagKnown
+		st.LastPeriod = info.LastPeriod
+		st.NextPollAt = info.NextPollAt
 
 		if d, ok := drifts[dev.ID]; ok {
 			st.TimeDriftKnown = true
@@ -165,10 +170,8 @@ func (s *Server) handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 // other paths in this project's dependency graph, and this handler only
 // needs two constants, not the whole package).
 //
-//	vkm360: 30 минут (vkmArchivePeriod в internal/device/vkm_hourly.go),
-//	        представительный параметр "S" (масса — есть у любого рабочего
-//	        ВКМ, в отличие от T/Pi, которые могут отсутствовать на
-//	        неподключённой трубе).
+//	VKM is handled separately by computeVKMArchiveInfo: completeness is based
+//	on archive_vkm_raw per active pipe, not on any particular parsed tag.
 //	akron:  1 час, представительный параметр "V" (объём — единственный
 //	        параметр профиля akron01.yaml).
 //
@@ -176,8 +179,6 @@ func (s *Server) handleDashboardStatus(w http.ResponseWriter, r *http.Request) {
 // пропускает расчёт отставания (LagKnown остаётся false).
 func archivePeriodAndParamForKind(kind string) (time.Duration, string) {
 	switch kind {
-	case "vkm360":
-		return 30 * time.Minute, "S"
 	case "akron":
 		return time.Hour, "V"
 	case "ivk-ter", "ivk_ter":
@@ -197,73 +198,76 @@ type archiveInfo struct {
 	NextPollAt string
 }
 
-// computeArchiveInfo считает отставание архива (в часах — см. прежний
-// doc-комментарий ниже, логика не изменилась) И, ДОБАВЛЕНО 2026-08-30 по
-// прямому запросу оператора ("непонятно, когда следующий опрос
-// запланирован"), заодно возвращает:
-//
-//   - LastPeriod — метка последнего периода, реально сохранённого в
-//     archive_hourly (то, что и так уже читаем для отставания — новых
-//     запросов к БД не требуется).
-//   - NextPollAt — ближайшее БУДУЩЕЕ время вида «граница периода +
-//     ArchiveAtMinute», то есть именно то время, когда планировщик
-//     (sched.RegisterWithArchiveAnchor в cmd/mbgw/server.go) реально
-//     запустит следующий опрос архива этого прибора. Считается НАПРЯМУЮ
-//     по формуле, без обращения к самому планировщику — тот же принцип,
-//     что и во всём остальном дашборде: чистая функция от (текущее
-//     время, period, archiveAtMinute), без завязки на внутреннее
-//     состояние работающего процесса.
-//
-// Отставание архива — сколько последних периодов ещё не собрано, в
-// часах. Логика:
-//
-//  1. Находим ГРАНИЦУ последнего периода, который уже точно должен был
-//     закрыться И быть собранным к текущему моменту — обычная граница
-//     сетки (now, округлённое вниз до period) минус ещё один period,
-//     ЕСЛИ мы всё ещё внутри "льготного окна" после самой границы (см.
-//     ниже) — прямой запрос оператора: "проверять нужно не в 00, а
-//     00-07, так как прибор опрашивается чуть позже границы часа".
-//  2. Смотрим, какой период РЕАЛЬНО последний сохранён в archive_hourly
-//     (GetHourlyArchiveDesc с limit=1 — уже отсортировано по убыванию).
-//  3. Разница между ожидаемой границей и реально сохранённой, делённая
-//     на period, и есть отставание — переводим в часы для единообразного
-//     отображения независимо от типа прибора (получасовки ВКМ и часовки
-//     Akron на одной шкале).
-func (s *Server) computeArchiveInfo(ctx context.Context, deviceID, param string, period time.Duration, archiveAtMinute int) archiveInfo {
-	// rawAnchor — РЕАЛЬНОЕ значение минуты-якоря, как его использует сам
-	// планировщик (см. cmd/mbgw/server.go: archiveAtMinute := devRec.
-	// ArchiveAtMinute; if archiveAtMinute < 0 { archiveAtMinute = 5 }).
-	// НЕ то же самое, что grace ниже — тот специально расширен буфером
-	// для решения "просрочено или ещё нет", а NextPollAt должен показывать
-	// ТОЧНОЕ время по расписанию, без этого буфера.
+// archiveScheduleBoundaries computes the last archive boundary that should
+// already have been collected and the exact next scheduled poll time. It uses
+// the same archive-at-minute convention as the scheduler, plus the existing
+// two-minute grace window when deciding whether a just-closed period is late.
+func archiveScheduleBoundaries(period time.Duration, archiveAtMinute int, now time.Time) (lastClosed, nextPollAt time.Time) {
 	rawAnchor := archiveAtMinute
 	if rawAnchor < 0 {
 		rawAnchor = 5
 	}
-	grace := rawAnchor + 2 // небольшой буфер на время самого сетевого опроса, не только на срабатывание тикера
+	grace := rawAnchor + 2
 
-	now := time.Now()
 	currentBoundary := now.Truncate(period)
-
-	lastClosed := currentBoundary
+	lastClosed = currentBoundary
 	if now.Sub(currentBoundary) < time.Duration(grace)*time.Minute {
-		// Ещё не наступило время планового опроса ДАЖЕ для только что
-		// закрывшегося периода — не считаем его просроченным, сдвигаем
-		// ожидаемую границу на один период назад.
 		lastClosed = currentBoundary.Add(-period)
 	}
 
-	// Ближайшее будущее время вида "граница + rawAnchor минут". Если
-	// такое время для ТЕКУЩЕЙ границы уже прошло (или наступает прямо
-	// сейчас) — берём следующую границу.
-	nextPollAt := currentBoundary.Add(time.Duration(rawAnchor) * time.Minute)
+	nextPollAt = currentBoundary.Add(time.Duration(rawAnchor) * time.Minute)
 	if !nextPollAt.After(now) {
 		nextPollAt = currentBoundary.Add(period).Add(time.Duration(rawAnchor) * time.Minute)
 	}
+	return lastClosed, nextPollAt
+}
 
-	info := archiveInfo{
-		NextPollAt: nextPollAt.Format("02.01.2006 15:04:05"),
+// computeVKMArchiveInfo evaluates the worst (oldest) latest period across all
+// active VKM pipes. Presence is based on archive_vkm_raw rather than param S:
+// a gas pipe may not contain S at all, yet its raw archive period is valid and
+// must not be reported as permanently missing.
+func (s *Server) computeVKMArchiveInfo(ctx context.Context, deviceID string, archiveAtMinute int) archiveInfo {
+	const period = 30 * time.Minute
+	now := time.Now()
+	lastClosed, nextPollAt := archiveScheduleBoundaries(period, archiveAtMinute, now)
+	info := archiveInfo{NextPollAt: nextPollAt.Format("02.01.2006 15:04:05")}
+
+	pipes, err := configuredVKMPipes(ctx, s.repo, deviceID)
+	if err != nil || len(pipes) == 0 {
+		return info
 	}
+
+	var oldestLatest time.Time
+	for _, pipe := range pipes {
+		_, _, newest, found, err := s.repo.CountVKMRaw(ctx, deviceID, pipe)
+		if err != nil || !found {
+			return info
+		}
+		if oldestLatest.IsZero() || newest.Before(oldestLatest) {
+			oldestLatest = newest
+		}
+	}
+	if oldestLatest.IsZero() {
+		return info
+	}
+
+	info.LastPeriod = oldestLatest.Format("02.01.2006 15:04")
+	lag := lastClosed.Sub(oldestLatest)
+	if lag < 0 {
+		lag = 0
+	}
+	info.LagHours = -lag.Hours()
+	info.LagKnown = true
+	return info
+}
+
+// computeArchiveInfo calculates archive lag for single-stream devices from
+// the newest parsed archive_hourly row. VKM uses computeVKMArchiveInfo instead
+// because completeness must be checked independently for every active pipe.
+func (s *Server) computeArchiveInfo(ctx context.Context, deviceID, param string, period time.Duration, archiveAtMinute int) archiveInfo {
+	now := time.Now()
+	lastClosed, nextPollAt := archiveScheduleBoundaries(period, archiveAtMinute, now)
+	info := archiveInfo{NextPollAt: nextPollAt.Format("02.01.2006 15:04:05")}
 
 	rows, err := s.repo.GetHourlyArchiveDesc(ctx, deviceID, "", param, 0, 1)
 	if err != nil || len(rows) == 0 {

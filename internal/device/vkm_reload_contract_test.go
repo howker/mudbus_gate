@@ -25,10 +25,10 @@ func TestPersistVKMHourlyOverwritesExistingPeriod(t *testing.T) {
 		"Pi": 41.0,
 	}}
 
-	if got := persistVKMHourly(context.Background(), d, ts, oldRec); got != 4 {
+	if got := persistVKMHourly(context.Background(), d, 1, ts, oldRec); got != 4 {
 		t.Fatalf("first persist saved=%d, want 4", got)
 	}
-	if got := persistVKMHourly(context.Background(), d, ts, newRec); got != 4 {
+	if got := persistVKMHourly(context.Background(), d, 1, ts, newRec); got != 4 {
 		t.Fatalf("second persist saved=%d, want 4", got)
 	}
 

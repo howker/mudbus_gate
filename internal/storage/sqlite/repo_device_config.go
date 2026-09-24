@@ -70,6 +70,15 @@ CREATE TABLE IF NOT EXISTS devices (
     updated_at               DATETIME NOT NULL
 );
 
+-- Active VKM archive pipes. No rows means the backward-compatible legacy
+-- configuration "pipe 1 only". Discovery/UI writes explicit rows once
+-- additional pipes are confirmed. This is configuration, not archive data.
+CREATE TABLE IF NOT EXISTS vkm_active_pipes (
+    device_id TEXT NOT NULL,
+    pipe      INTEGER NOT NULL CHECK (pipe BETWEEN 1 AND 10),
+    PRIMARY KEY (device_id, pipe)
+);
+
 -- История фактически выполненных коррекций часов ВКМ. Нужна для
 -- ограничения суммарного модуля коррекций за скользящие 24 часа.
 -- Записывается только ПОСЛЕ подтверждённой успешной команды коррекции.
@@ -362,6 +371,9 @@ func (r *Repo) DeleteDevice(ctx context.Context, id string) error {
 	}
 	if _, err := r.db.ExecContext(ctx, `DELETE FROM es_vkm_channels WHERE device_id = ?`, id); err != nil {
 		return fmt.Errorf("delete device vkm channels: %w", err)
+	}
+	if _, err := r.db.ExecContext(ctx, `DELETE FROM vkm_active_pipes WHERE device_id = ?`, id); err != nil {
+		return fmt.Errorf("delete device vkm active pipes: %w", err)
 	}
 	if _, err := r.db.ExecContext(ctx, `DELETE FROM es_akron_northbound WHERE device_id = ?`, id); err != nil {
 		return fmt.Errorf("delete device akron northbound: %w", err)

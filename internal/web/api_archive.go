@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 
 	"mbgw/internal/interval"
@@ -138,6 +139,8 @@ type archiveRow struct {
 
 type archiveResponse struct {
 	DeviceID    string       `json:"device_id"`
+	Pipe        int          `json:"pipe,omitempty"`
+	Pipes       []int        `json:"pipes,omitempty"`
 	Params      []string     `json:"params"`       // column order — stable, from devicesParams
 	ParamLabels []string     `json:"param_labels"` // parallel to Params
 	Rows        []archiveRow `json:"rows"`
@@ -209,6 +212,27 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 		return archiveResponse{}, fmt.Errorf("для ИВК-ТЭР пока доступен только режим «Подробно (как хранится)»; группировка будет добавлена после live-проверки семантики архивных полей")
 	}
 
+	archiveChannel := ""
+	selectedPipe := 0
+	var activePipes []int
+	if dev.Kind == "vkm360" {
+		activePipes, err = configuredVKMPipes(r.Context(), s.repo, deviceID)
+		if err != nil {
+			return archiveResponse{}, fmt.Errorf("не удалось прочитать активные трубопроводы ВКМ: %w", err)
+		}
+		selectedPipe = activePipes[0]
+		if pipeStr := r.URL.Query().Get("pipe"); pipeStr != "" {
+			selectedPipe, err = strconv.Atoi(pipeStr)
+			if err != nil || selectedPipe < 1 || selectedPipe > 10 {
+				return archiveResponse{}, fmt.Errorf("параметр pipe должен быть номером трубопровода 1..10")
+			}
+		}
+		if !containsPipe(activePipes, selectedPipe) {
+			return archiveResponse{}, fmt.Errorf("трубопровод %d не отмечен активным для прибора %q", selectedPipe, deviceID)
+		}
+		archiveChannel = vkmArchiveChannel(selectedPipe)
+	}
+
 	params := devicesParams[dev.Kind]
 	labels := make([]string, len(params))
 	for i, p := range params {
@@ -242,7 +266,7 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 			queryFrom = from.Add(-time.Hour)
 		}
 
-		rows, err := s.repo.GetHourlyArchiveRange(r.Context(), deviceID, "", param, queryFrom, to)
+		rows, err := s.repo.GetHourlyArchiveRange(r.Context(), deviceID, archiveChannel, param, queryFrom, to)
 		if err != nil {
 			return archiveResponse{}, fmt.Errorf("чтение архива (%s): %w", param, err)
 		}
@@ -307,7 +331,7 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 		out = append(out, archiveRow{Period: key, Values: converted})
 	}
 
-	return archiveResponse{DeviceID: deviceID, Params: params, ParamLabels: labels, Rows: out}, nil
+	return archiveResponse{DeviceID: deviceID, Pipe: selectedPipe, Pipes: activePipes, Params: params, ParamLabels: labels, Rows: out}, nil
 }
 
 // formatPeriodLabel formats a stored timestamp into this row's bucket
@@ -423,6 +447,9 @@ func (s *Server) handleArchiveExport(w http.ResponseWriter, r *http.Request) {
 	}
 
 	filename := fmt.Sprintf("archive_%s.csv", resp.DeviceID)
+	if resp.Pipe > 0 {
+		filename = fmt.Sprintf("archive_%s_pipe%d.csv", resp.DeviceID, resp.Pipe)
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)

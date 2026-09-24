@@ -22,6 +22,9 @@ func newTestDeviceForVKM(t *testing.T) *Device {
 	if err := repo.InitArchiveSchema(context.Background()); err != nil {
 		t.Fatalf("init archive schema: %v", err)
 	}
+	if err := repo.InitDeviceConfigSchema(context.Background()); err != nil {
+		t.Fatalf("init device config schema: %v", err)
+	}
 	return &Device{ID: "vkm_test", Repo: repo, Lease: lease.New()}
 }
 
@@ -58,7 +61,7 @@ func TestPersistVKMHourly_SavesAllParams(t *testing.T) {
 		},
 	}
 
-	saved := persistVKMHourly(context.Background(), d, hour, rec)
+	saved := persistVKMHourly(context.Background(), d, 1, hour, rec)
 	if saved != 4 {
 		t.Fatalf("expected 4 fields saved (S, ST, T, Pi), got %d", saved)
 	}
@@ -111,7 +114,7 @@ func TestPersistVKMHourly_MissingFieldIsGraceful(t *testing.T) {
 		},
 	}
 
-	saved := persistVKMHourly(context.Background(), d, hour, rec)
+	saved := persistVKMHourly(context.Background(), d, 1, hour, rec)
 	if saved != 1 {
 		t.Fatalf("expected 1 field saved (ST only), got %d", saved)
 	}
@@ -189,5 +192,75 @@ func TestParseVKMPeriodEndTime_NoTimeField(t *testing.T) {
 	raw := "Pi=4.1494e+05Па;S=1230.7Кг;"
 	if _, ok := parseVKMPeriodEndTime(raw); ok {
 		t.Fatal("ожидался ok=false при отсутствии поля Time")
+	}
+}
+
+func TestPersistVKMHourly_SeparatesPipes(t *testing.T) {
+	d := newTestDeviceForVKM(t)
+	ts := time.Date(2026, 9, 24, 12, 30, 0, 0, time.Local)
+
+	pipe1 := archive.ArchiveRecord{Fields: map[string]any{"T": 10.5}}
+	pipe2 := archive.ArchiveRecord{Fields: map[string]any{"T": 20.5}}
+
+	if got := persistVKMHourly(context.Background(), d, 1, ts, pipe1); got != 1 {
+		t.Fatalf("pipe1 saved=%d, want 1", got)
+	}
+	if got := persistVKMHourly(context.Background(), d, 2, ts, pipe2); got != 1 {
+		t.Fatalf("pipe2 saved=%d, want 1", got)
+	}
+
+	rows1, err := d.Repo.GetHourlyArchiveDesc(context.Background(), d.ID, "", "T", 0, 10)
+	if err != nil {
+		t.Fatalf("read pipe1: %v", err)
+	}
+	rows2, err := d.Repo.GetHourlyArchiveDesc(context.Background(), d.ID, "2", "T", 0, 10)
+	if err != nil {
+		t.Fatalf("read pipe2: %v", err)
+	}
+	if len(rows1) != 1 || rows1[0].Value != 10.5 {
+		t.Fatalf("pipe1 rows=%+v, want one value 10.5", rows1)
+	}
+	if len(rows2) != 1 || rows2[0].Value != 20.5 {
+		t.Fatalf("pipe2 rows=%+v, want one value 20.5", rows2)
+	}
+}
+
+func TestMissingVKMPeriods_UsesRawPresenceNotS(t *testing.T) {
+	d := newTestDeviceForVKM(t)
+	ctx := context.Background()
+	start := time.Date(2026, 9, 24, 10, 0, 0, 0, time.Local)
+	label := start.Add(vkmArchivePeriod)
+
+	// A gas pipe may legitimately have no S field. The raw row is the source
+	// of truth that the period was collected and must prevent endless backfill.
+	if err := d.Repo.SaveVKMRawString(ctx, d.ID, 2, label, "Time=x;V=123.4;"); err != nil {
+		t.Fatalf("save raw pipe2: %v", err)
+	}
+
+	missing, err := missingVKMPeriods(ctx, d.Repo, d.ID, 2, start, start)
+	if err != nil {
+		t.Fatalf("missing periods: %v", err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("raw period exists but was reported missing: %+v", missing)
+	}
+}
+
+func TestVKMActivePipesReadsFreshConfiguration(t *testing.T) {
+	d := newTestDeviceForVKM(t)
+	ctx := context.Background()
+	repo := d.Repo.(*sqlite.Repo)
+
+	got := d.vkmActivePipes(ctx)
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("default active pipes=%v, want [1]", got)
+	}
+
+	if err := repo.SetVKMActivePipes(ctx, d.ID, []int{1, 2}); err != nil {
+		t.Fatalf("set active pipes: %v", err)
+	}
+	got = d.vkmActivePipes(ctx)
+	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("active pipes after config change=%v, want [1 2] without restart", got)
 	}
 }

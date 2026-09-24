@@ -115,6 +115,9 @@ func TestDeleteDevice_RemovesChannelsToo(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("set vkm channels: %v", err)
 	}
+	if err := repo.SetVKMActivePipes(ctx, "d1", []int{1, 2}); err != nil {
+		t.Fatalf("set vkm active pipes: %v", err)
+	}
 	if err := repo.SetAkronNorthboundAddr(ctx, "d1", "127.0.0.1:15021"); err != nil {
 		t.Fatalf("set akron northbound addr: %v", err)
 	}
@@ -136,6 +139,13 @@ func TestDeleteDevice_RemovesChannelsToo(t *testing.T) {
 	}
 	if len(chans) != 0 {
 		t.Fatalf("expected channels to be deleted alongside device, got %d rows", len(chans))
+	}
+	pipes, err := repo.GetVKMActivePipes(ctx, "d1")
+	if err != nil {
+		t.Fatalf("get vkm active pipes after delete: %v", err)
+	}
+	if len(pipes) != 0 {
+		t.Fatalf("expected active pipes to be deleted alongside device, got %v", pipes)
 	}
 	addr, found, err := repo.GetAkronNorthboundAddr(ctx, "d1")
 	if err != nil {
