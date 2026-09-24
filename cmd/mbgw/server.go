@@ -546,10 +546,12 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 	// ForceReloadVKMHourly), сам *device.Device своего "типа" не хранит.
 	deviceKinds := make(map[string]string)
 	// esSyncTriggers хранит канал внепланового запуска синхронизации с ЭС
-	// для каждого прибора (см. startESyncForDevice). Он используется только
-	// явным запросом синхронизации с ЭС. Принудительный переопрос архива
-	// намеренно НЕ запускает ЭС: его контракт — прибор -> локальная БД
-	// МодбасШлюза; пересинхронизация с ЭС выполняется отдельной командой.
+	// для каждого поддержанного ENABLED-прибора. ES-worker живёт независимо
+	// от физической регистрации прибора: он читает уже накопленную локальную
+	// БД и перед каждым проходом заново читает настройки ID_PP/множителей.
+	// Принудительный переопрос архива намеренно НЕ запускает ЭС: его контракт
+	// — прибор -> локальная БД МодбасШлюза; пересинхронизация с ЭС остаётся
+	// отдельной командой.
 	esSyncTriggers := make(map[string]chan struct{})
 	// devicesMu защищает три карты выше (devices/deviceKinds/
 	// esSyncTriggers) от одновременного чтения и записи — НУЖНО именно
@@ -607,6 +609,22 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 		log.Println("[INFO] в БД не настроено ни одного прибора — сервер запущен, но опрашивать нечего")
 	}
 
+	// Синхронизация локальной БД -> ЭС НЕ зависит от того, ответил ли
+	// физический прибор именно в момент запуска службы. Это принципиально:
+	// уже собранные ранее архивы должны продолжать уходить в ЭС даже при
+	// временно недоступном southbound-канале. Worker запускается заранее и
+	// остаётся живым даже без настроенных точек; сохранённые позже ID_PP и
+	// множители он подхватит без рестарта службы.
+	for _, devRec := range deviceRecords {
+		if !devRec.Enabled || !supportsDirectESSyncKind(devRec.Kind) {
+			continue
+		}
+		trigger := startESyncForDevice(ctx, repo, devRec.ID, devRec.Kind, dbPath)
+		devicesMu.Lock()
+		esSyncTriggers[devRec.ID] = trigger
+		devicesMu.Unlock()
+	}
+
 	// ИЗМЕНЕНО (2026-08-30, найдено оператором живьём): раньше приборы
 	// регистрировались ПОСЛЕДОВАТЕЛЬНО, один за другим, в одном простом
 	// for-цикле — а внутри каждой итерации дозабор (dev.BackfillArchives)
@@ -643,7 +661,7 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			registerOneDevice(ctx, repo, devRec, leaseMgr, sched, dbPath, &devicesMu, devices, deviceKinds, esSyncTriggers, transports)
+			registerOneDevice(ctx, repo, devRec, leaseMgr, sched, &devicesMu, devices, deviceKinds, transports)
 		}()
 	}
 	wg.Wait()
@@ -758,7 +776,22 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 		trigger, ok := esSyncTriggers[deviceID]
 		devicesMu.Unlock()
 		if !ok {
-			return fmt.Errorf("для прибора %s es-sync не запущен (проверьте подключение к ЭС и точки, либо дождитесь окончания стартовой регистрации приборов)", deviceID)
+			checkCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			devRec, found, readErr := repo.GetDevice(checkCtx, deviceID)
+			if readErr != nil {
+				return fmt.Errorf("не удалось прочитать настройки прибора %s: %w", deviceID, readErr)
+			}
+			if !found {
+				return fmt.Errorf("прибор %s отсутствует в настройках", deviceID)
+			}
+			if !supportsDirectESSyncKind(devRec.Kind) {
+				return fmt.Errorf("синхронизация с ЭС не поддерживается для типа прибора %q (прибор %s)", devRec.Kind, deviceID)
+			}
+			if !devRec.Enabled {
+				return fmt.Errorf("прибор %s отключён (enabled=0): фоновая синхронизация с ЭС не запущена", deviceID)
+			}
+			return fmt.Errorf("фоновая синхронизация с ЭС для прибора %s не запущена; см. журнал запуска службы", deviceID)
 		}
 		select {
 		case trigger <- struct{}{}:
@@ -807,10 +840,17 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 			}
 		}()
 
-		devicesMu.Lock()
-		kind := deviceKinds[deviceID]
-		devicesMu.Unlock()
-		if kind != "vkm360" && kind != "akron" && kind != "ivk-ter" && kind != "ivk_ter" {
+		devRec, deviceFound, deviceErr := repo.GetDevice(ctx, deviceID)
+		if deviceErr != nil {
+			err = fmt.Errorf("чтение настроек прибора %s: %w", deviceID, deviceErr)
+			return
+		}
+		if !deviceFound {
+			err = fmt.Errorf("прибор %s отсутствует в настройках", deviceID)
+			return
+		}
+		kind := devRec.Kind
+		if !supportsDirectESSyncKind(kind) {
 			err = fmt.Errorf("принудительная пересинхронизация с ЭС не поддерживается для типа прибора %q (прибор %s)", kind, deviceID)
 			return
 		}
@@ -1006,7 +1046,7 @@ func archiveScheduleWindow(start, end string) (*scheduler.Window, error) {
 	return &scheduler.Window{StartHour: sh, StartMinute: sm, EndHour: eh, EndMinute: em}, nil
 }
 
-func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqliterepo.DeviceRecord, leaseMgr *lease.LocalLease, sched *scheduler.Scheduler, dbPath string, devicesMu *sync.Mutex, devices map[string]*device.Device, deviceKinds map[string]string, esSyncTriggers map[string]chan struct{}, transports *transportRegistry) {
+func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqliterepo.DeviceRecord, leaseMgr *lease.LocalLease, sched *scheduler.Scheduler, devicesMu *sync.Mutex, devices map[string]*device.Device, deviceKinds map[string]string, transports *transportRegistry) {
 	profilePath := profilePathNextToExe(devRec.Profile)
 	p, err := profile.Parse(profilePath)
 	if err != nil {
@@ -1187,17 +1227,10 @@ func registerOneDevice(ctx context.Context, repo *sqliterepo.Repo, devRec sqlite
 		log.Printf("[ИНФО] прибор %s: проверка и восстановление недостающих архивных данных поставлены в очередь; следующий штатный опрос — по календарному расписанию\n", devRec.ID)
 	}
 
-	// Upstream delivery: VKM, Akron and IVK-TER use the same direct write
-	// path to PointMains. The old Akron device-emulation carrier is not
-	// part of the current `mbgw server` path.
-	switch devRec.Kind {
-	case "akron", "vkm360", "ivk-ter", "ivk_ter":
-		if trigger := startESyncForDevice(ctx, repo, devRec.ID, devRec.Kind, dbPath); trigger != nil {
-			devicesMu.Lock()
-			esSyncTriggers[devRec.ID] = trigger
-			devicesMu.Unlock()
-		}
-	}
+	// ES-worker здесь больше НЕ запускается. Он стартует независимо от
+	// физической регистрации прибора сразу после чтения devices из SQLite,
+	// чтобы временная недоступность прибора при старте не отключала доставку
+	// уже накопленных локальных архивов в ЭС.
 }
 
 // findFreePort returns preferred if it's currently bindable, or the
@@ -1343,26 +1376,29 @@ func buildIntegrationConfig(ctx context.Context, repo *sqliterepo.Repo, deviceID
 	return cfg, true, nil
 }
 
-func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, kind, _ string) chan struct{} {
-	cfg, found, err := buildIntegrationConfig(ctx, repo, deviceID, kind)
-	if err != nil {
-		log.Printf("[ОШИБКА] прибор %s: %v — синхронизация с ЭС не запущена\n", deviceID, err)
-		return nil
+func supportsDirectESSyncKind(kind string) bool {
+	switch kind {
+	case "akron", "vkm360", "ivk-ter", "ivk_ter":
+		return true
+	default:
+		return false
 	}
-	if !found {
-		log.Printf("[ИНФО] прибор %s: подключение к БД ЭС или точки не настроены — синхронизация с ЭС не запущена\n", deviceID)
-		return nil
+}
+
+func startESyncForDevice(ctx context.Context, repo *sqliterepo.Repo, deviceID, kind, _ string) chan struct{} {
+	trigger := make(chan struct{}, 1)
+	load := func(loadCtx context.Context) (integration.Config, bool, error) {
+		return buildIntegrationConfig(loadCtx, repo, deviceID, kind)
 	}
 
-	trigger := make(chan struct{}, 1)
 	go func() {
-		log.Printf("[ОК] синхронизация с ЭС для %s (%s): запуск (сервер БД ЭС=%s, база=%s)\n", deviceID, deviceKindLabelRU(kind), cfg.SQLServer, cfg.SQLDatabase)
+		log.Printf("[ОК] worker синхронизации с ЭС для %s (%s): запущен; настройки перечитываются перед каждым проходом\n",
+			deviceID, deviceKindLabelRU(kind))
 		// В режиме `mbgw server` все фоновые циклы используют ТОТ ЖЕ Repo,
-		// который уже открыт процессом. Отдельный sqliterepo.New для каждого
-		// прибора создавал независимые SQLite connection pools к одному файлу
-		// и в живой работе 07.09.2026 приводил к SQLITE_BUSY во время
-		// параллельного дозабора/синхронизации.
-		if err := integration.RunEnergosphereSyncWithRepo(ctx, repo, cfg, trigger); err != nil {
+		// который уже открыт процессом. Worker не зависит от runtime-регистрации
+		// физического прибора и остаётся живым даже пока точки ЭС ещё не
+		// настроены; изменения ID_PP/множителей подхватываются без рестарта.
+		if err := integration.RunEnergosphereSyncReloadingWithRepo(ctx, repo, load, trigger); err != nil {
 			log.Printf("[ОШИБКА] синхронизация с ЭС %s: %v\n", deviceID, err)
 		}
 	}()

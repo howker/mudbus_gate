@@ -412,6 +412,182 @@ func RunEnergosphereSyncWithRepo(ctx context.Context, repo *sqliterepo.Repo, cfg
 	}
 }
 
+// ConfigLoader returns the current ЭС configuration for one device.
+// found=false is not an error: it means the operator has not configured
+// the connection and/or any PointMains mappings yet. A long-lived worker
+// must stay alive in that state so settings saved later are picked up
+// without restarting mbgw.
+type ConfigLoader func(context.Context) (cfg Config, found bool, err error)
+
+type sqlConnectionKey struct {
+	server   string
+	database string
+	user     string
+	password string
+	port     int
+}
+
+func connectionKey(cfg Config) sqlConnectionKey {
+	return sqlConnectionKey{
+		server:   cfg.SQLServer,
+		database: cfg.SQLDatabase,
+		user:     cfg.SQLUser,
+		password: cfg.SQLPassword,
+		port:     cfg.SQLPort,
+	}
+}
+
+// RunEnergosphereSyncReloadingWithRepo is the production server worker.
+// Unlike RunEnergosphereSyncWithRepo, it reloads the device's mappings and
+// multipliers before EVERY pass. If SQL connection settings change, the old
+// PointMainsWriter is closed and a new one is opened automatically.
+//
+// This deliberately survives an initially incomplete configuration: an
+// enabled device may be physically unavailable at mbgw startup, or its
+// ID_PP mappings may be saved later from /admin. Neither situation should
+// require a service restart merely to start local-DB -> ЭС delivery.
+func RunEnergosphereSyncReloadingWithRepo(ctx context.Context, repo *sqliterepo.Repo, load ConfigLoader, trigger <-chan struct{}) error {
+	if repo == nil {
+		return fmt.Errorf("локальная БД не подключена")
+	}
+	if load == nil {
+		return fmt.Errorf("не задан загрузчик конфигурации синхронизации с ЭС")
+	}
+	if err := repo.InitESSyncCursorSchema(ctx); err != nil {
+		return fmt.Errorf("не удалось подготовить курсор синхронизации с ЭС: %w", err)
+	}
+
+	var writer *PointMainsWriter
+	var writerKey sqlConnectionKey
+	writerConfigured := false
+	defer func() {
+		if writer != nil {
+			_ = writer.Close()
+		}
+	}()
+
+	closeWriter := func() {
+		if writer != nil {
+			_ = writer.Close()
+			writer = nil
+		}
+		writerConfigured = false
+	}
+
+	retryDelay := 5 * time.Second
+	waitFor := time.Duration(0)
+	loggedNotConfigured := false
+
+	for {
+		if waitFor > 0 {
+			timer := time.NewTimer(waitFor)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				log.Println("[синхронизация с ЭС] остановлен")
+				return nil
+			case <-timer.C:
+			case <-trigger:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				log.Println("[синхронизация с ЭС] внеплановая синхронизация по запросу")
+			}
+		} else {
+			select {
+			case <-ctx.Done():
+				log.Println("[синхронизация с ЭС] остановлен")
+				return nil
+			default:
+			}
+		}
+
+		cfg, found, err := load(ctx)
+		if err != nil {
+			closeWriter()
+			log.Printf("[синхронизация с ЭС] не удалось перечитать настройки: %v; повтор через %s\n", err, retryDelay)
+			waitFor = retryDelay
+			if retryDelay < 30*time.Second {
+				retryDelay *= 2
+				if retryDelay > 30*time.Second {
+					retryDelay = 30 * time.Second
+				}
+			}
+			continue
+		}
+		if !found {
+			closeWriter()
+			if !loggedNotConfigured {
+				log.Println("[синхронизация с ЭС] подключение к БД ЭС или точки не настроены; worker остаётся запущен и подхватит настройки без перезапуска службы")
+				loggedNotConfigured = true
+			}
+			retryDelay = 5 * time.Second
+			waitFor = time.Minute
+			continue
+		}
+		loggedNotConfigured = false
+
+		key := connectionKey(cfg)
+		openedNow := false
+		if writer == nil || !writerConfigured || key != writerKey {
+			closeWriter()
+			writer, err = OpenPointMainsWriter(SQLServerConfig{
+				Server:   cfg.SQLServer,
+				Database: cfg.SQLDatabase,
+				User:     cfg.SQLUser,
+				Password: cfg.SQLPassword,
+				Port:     cfg.SQLPort,
+			})
+			if err != nil {
+				log.Printf("[синхронизация с ЭС] не удалось открыть подключение к SQL Server ЭС: %v; повтор через %s\n", err, retryDelay)
+				waitFor = retryDelay
+				if retryDelay < 30*time.Second {
+					retryDelay *= 2
+					if retryDelay > 30*time.Second {
+						retryDelay = 30 * time.Second
+					}
+				}
+				continue
+			}
+			writerKey = key
+			writerConfigured = true
+			openedNow = true
+		}
+
+		pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		pingErr := writer.Ping(pingCtx)
+		cancel()
+		if pingErr != nil {
+			closeWriter()
+			log.Printf("[синхронизация с ЭС] БД ЭС недоступна: %v; повтор через %s\n", pingErr, retryDelay)
+			waitFor = retryDelay
+			if retryDelay < 30*time.Second {
+				retryDelay *= 2
+				if retryDelay > 30*time.Second {
+					retryDelay = 30 * time.Second
+				}
+			}
+			continue
+		}
+
+		retryDelay = 5 * time.Second
+		if openedNow {
+			log.Printf("[синхронизация с ЭС] подключение к БД ЭС успешно: прибор=%s, сервер=%s, база=%s, точек=%d\n",
+				cfg.DeviceID, cfg.SQLServer, cfg.SQLDatabase, len(cfg.Points))
+		}
+		runPointSyncOnce(ctx, repo, writer, cfg)
+		waitFor = cfg.interval()
+	}
+}
+
 // pointReading — одна кандидатная точка на запись: какому PointMapping
 // она соответствует, на какой момент времени и с каким значением.
 // Промежуточное представление между "прочитали из своей локальной базы"
