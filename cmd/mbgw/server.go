@@ -782,6 +782,40 @@ func runServerCore(parentCtx context.Context, onReady func(), runningAsService b
 		}
 	})
 
+	// «Пересканировать трубопроводы» — физически проверяет архивные
+	// экземпляры ВКМ 1..10. Само сканирование НЕ меняет список активных
+	// трубопроводов: пользователь после просмотра результата решает, какие
+	// из найденных труб включить флажком «Опрос». Сканирование read-only:
+	// обычный архив и очередь восстановления ЭС оно не изменяет; найденные
+	// source-tag'и сохраняются отдельно как метаданные discovery.
+	webServer.SetVKMPipeScanner(func(scanCtx context.Context, deviceID string) ([]web.VKMPipeScanResult, error) {
+		devicesMu.Lock()
+		dev, ok := devices[deviceID]
+		kind := deviceKinds[deviceID]
+		devicesMu.Unlock()
+		if !ok {
+			return nil, fmt.Errorf("прибор %s не зарегистрирован в работающей службе", deviceID)
+		}
+		if kind != "vkm360" {
+			return nil, fmt.Errorf("сканирование трубопроводов доступно только для ВКМ-360, тип прибора %q", kind)
+		}
+
+		results, err := dev.DiscoverVKMPipes(scanCtx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]web.VKMPipeScanResult, 0, len(results))
+		for _, result := range results {
+			out = append(out, web.VKMPipeScanResult{
+				PipeNo: result.PipeNo,
+				Status: result.Status,
+				Detail: result.Detail,
+				Raw:    result.Raw,
+			})
+		}
+		return out, nil
+	})
+
 	// «Синхронизировать сейчас» — просит уже работающий цикл es-sync
 	// конкретного прибора сделать внеплановый проход немедленно, не
 	// дожидаясь часового тикера (добавлено 2026-08-27). Неблокирующая

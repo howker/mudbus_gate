@@ -462,9 +462,20 @@ func (s *Server) handleVKMSourceTags(w http.ResponseWriter, r *http.Request) {
 	type pipeTags struct {
 		PipeNo int      `json:"pipe_no"`
 		Found  bool     `json:"found"`
+		Source string   `json:"source,omitempty"`
 		Ts     string   `json:"ts,omitempty"`
 		Tags   []string `json:"tags"`
 	}
+	discoveryRows, err := s.repo.GetVKMPipeDiscovery(r.Context(), deviceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "не удалось прочитать результаты сканирования трубопроводов: "+err.Error())
+		return
+	}
+	discoveryByPipe := make(map[int]sqliterepo.VKMPipeDiscoveryRecord, len(discoveryRows))
+	for _, discovery := range discoveryRows {
+		discoveryByPipe[discovery.PipeNo] = discovery
+	}
+
 	out := make([]pipeTags, 0, 10)
 	for pipe := 1; pipe <= 10; pipe++ {
 		raw, ts, found, err := s.repo.GetLatestVKMRawString(r.Context(), deviceID, pipe)
@@ -474,8 +485,16 @@ func (s *Server) handleVKMSourceTags(w http.ResponseWriter, r *http.Request) {
 		}
 		row := pipeTags{PipeNo: pipe, Found: found, Tags: []string{}}
 		if found {
+			row.Source = "archive"
 			row.Ts = ts.Format("2006-01-02T15:04:05")
 			row.Tags = extractVKMNumericTags(raw)
+		} else if discovery, ok := discoveryByPipe[pipe]; ok && discovery.Status == sqliterepo.VKMDiscoveryAvailable {
+			row.Found = true
+			row.Source = "scan"
+			if !discovery.ScannedAt.IsZero() {
+				row.Ts = discovery.ScannedAt.Format("2006-01-02T15:04:05")
+			}
+			row.Tags = append(row.Tags, discovery.Tags...)
 		}
 		out = append(out, row)
 	}

@@ -2,6 +2,7 @@ package archive
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -207,8 +208,29 @@ func TestMBRequestPollString_NoRecords(t *testing.T) {
 	q := ArchiveQuery{Instance: 1, From: time.Now(), To: time.Now()}
 
 	_, err := r.Read(context.Background(), nil, tx, q)
-	if err == nil {
-		t.Fatal("expected error for no_records status, got nil")
+	if !errors.Is(err, ErrVKMNoRecords) {
+		t.Fatalf("error=%v, want ErrVKMNoRecords", err)
+	}
+}
+
+func TestMBRequestPollString_InvalidPipeHasTypedError(t *testing.T) {
+	tx := &sequentialTransactor{
+		responses: [][]byte{
+			echoWriteSingleResp(),
+			echoWriteSingleResp(),
+			echoWriteMultipleResp(7902, 6),
+			echoWriteMultipleResp(7908, 6),
+			echoWriteSingleResp(),
+			statusResp(vkmArchStatusBadPipe),
+		},
+	}
+
+	r := NewMBRequestPollString()
+	q := ArchiveQuery{Instance: 10, From: time.Now(), To: time.Now()}
+
+	_, err := r.Read(context.Background(), nil, tx, q)
+	if !errors.Is(err, ErrVKMInvalidPipe) {
+		t.Fatalf("error=%v, want ErrVKMInvalidPipe", err)
 	}
 }
 

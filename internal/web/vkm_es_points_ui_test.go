@@ -16,6 +16,9 @@ func TestAdminUIVKMPointEditorHasTenPipesFourSlotsAndES5Toggle(t *testing.T) {
 		"active_pipes",
 		"/api/vkm-source-tags?device_id=",
 		"Обновить параметры из архива",
+		"Пересканировать трубопроводы",
+		"rescanVKMPipes()",
+		"/api/vkm-pipe-discovery",
 	}
 	for _, want := range checks {
 		if !strings.Contains(adminUIHTML, want) {

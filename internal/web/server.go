@@ -13,6 +13,15 @@ import (
 	sqliterepo "mbgw/internal/storage/sqlite"
 )
 
+type VKMPipeScanResult struct {
+	PipeNo int
+	Status string
+	Detail string
+	Raw    string
+}
+
+type VKMPipeScanFunc func(ctx context.Context, deviceID string) ([]VKMPipeScanResult, error)
+
 // Server's repo field is *sqliterepo.Repo (a concrete type), not the
 // storage.Repo interface it used to hold. WHY: the device-config API
 // below (devices/channels/es-connection/akron-northbound) needs the new
@@ -53,6 +62,11 @@ type Server struct {
 	// полную тишину на много минут без единого признака, что вообще
 	// происходит).
 	onForceReload func(ctx context.Context, deviceID string, from, to time.Time, onProgress func(done, total int)) (int, error)
+
+	// onVKMPipeScan performs a live archive-protocol discovery of VKM pipe
+	// numbers 1..10. The web layer persists the returned observation but does
+	// not change the operator-controlled active-pipe list.
+	onVKMPipeScan VKMPipeScanFunc
 
 	// onSyncNow, если задан, просит уже работающий цикл es-sync
 	// конкретного прибора сделать внеплановый проход немедленно — см.
@@ -165,6 +179,10 @@ func (s *Server) SetForceReload(fn func(jobCtx context.Context, deviceID string,
 	s.onForceReload = fn
 }
 
+func (s *Server) SetVKMPipeScanner(fn VKMPipeScanFunc) {
+	s.onVKMPipeScan = fn
+}
+
 // SetSyncNow подключает возможность явно попросить синхронизацию с ЭС
 // сделать внеплановый проход прямо сейчас. Принудительный переопрос архива
 // этот callback НЕ вызывает: локальный переопрос и запись в ЭС разделены.
@@ -235,6 +253,7 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/api/devices/poll-now", s.handleDevicePollNow)
 	mux.HandleFunc("/api/vkm-channels", s.handleVKMChannels)
 	mux.HandleFunc("/api/vkm-source-tags", s.handleVKMSourceTags)
+	mux.HandleFunc("/api/vkm-pipe-discovery", s.handleVKMPipeDiscovery)
 	mux.HandleFunc("/api/vkm-channels/check-history", s.handleCheckChannelHistory)
 	mux.HandleFunc("/api/es-connection", s.handleESConnection)
 	mux.HandleFunc("/api/es-connection/test", s.handleESConnectionTest)

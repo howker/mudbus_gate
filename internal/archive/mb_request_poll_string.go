@@ -3,6 +3,7 @@ package archive
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -43,6 +44,17 @@ const (
 	vkmArchCollectTimeout = 15 * time.Second
 	vkmArchBusyRetryDelay = 500 * time.Millisecond
 	vkmArchBusyMaxWait    = 300 * time.Second
+)
+
+var (
+	// ErrVKMNoRecords means the requested pipe was accepted by the meter,
+	// but this particular time window contains no archive rows. Discovery
+	// must not confuse this with an unsupported/non-existent pipe.
+	ErrVKMNoRecords = errors.New("no records in requested period")
+	// ErrVKMInvalidPipe is the meter's explicit archive status 6. Unlike an
+	// empty period, this is positive evidence that the pipe number is not
+	// supported by the device.
+	ErrVKMInvalidPipe = errors.New("invalid pipe number")
 )
 
 type MBRequestPollString struct{}
@@ -235,7 +247,7 @@ func (r *MBRequestPollString) waitReady(ctx context.Context, tx Transactor) erro
 			case <-time.After(vkmArchPollInterval):
 			}
 		case vkmArchStatusNoRecords:
-			return fmt.Errorf("no records in requested period")
+			return ErrVKMNoRecords
 		case vkmArchStatusExpired:
 			return fmt.Errorf("archive request expired or not accepted")
 		case vkmArchStatusBadStart:
@@ -243,7 +255,7 @@ func (r *MBRequestPollString) waitReady(ctx context.Context, tx Transactor) erro
 		case vkmArchStatusBadEnd:
 			return fmt.Errorf("invalid end time")
 		case vkmArchStatusBadPipe:
-			return fmt.Errorf("invalid pipe number")
+			return ErrVKMInvalidPipe
 		case vkmArchStatusTooLarge:
 			return fmt.Errorf("requested period too large")
 		default:

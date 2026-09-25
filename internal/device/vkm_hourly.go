@@ -293,19 +293,15 @@ func parseVKMPeriodEndTime(raw string) (time.Time, bool) {
 	return vkmRawSecondsEpoch.Add(time.Duration(secs) * time.Second), true
 }
 
-// collectVKMPeriod РґРµР»Р°РµС‚ РћР”РРќ РїРѕР»РЅС‹Р№ С‚Р°РЅРµС† Р·Р°РїРёСЃСЊ/РѕР¶РёРґР°РЅРёРµ/С‡С‚РµРЅРёРµ Р°СЂС…РёРІР°
-// для окна [periodStart, periodStart+vkmArchivePeriod) и сохраняет то, что
-// пришло. Возвращает, сколько из vkmHourlyParams реально сохранено (0 без
-// ошибки — законный исход: у прибора не было данных за этот период).
-//
-// ВАЖНО (2026-08-10): раньше здесь был цикл переспроса при "аномальном"
-// (секундном) формате Time — см. doc-комментарий isVKMTimeAnomalous. Он
-// убран: секундный формат — не брак, а именно то, что нужно сохранить
-// как есть, с первой же попытки, без всякого переспроса.
-func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, pipe int, periodStart time.Time) (int, error) {
+// readVKMPeriodUnlocked performs one archive request for exactly one VKM pipe
+// and one completed half-hour. The caller must already own the device lease.
+// It only reads and decodes the response; persistence is deliberately left to
+// collectVKMPeriod so discovery can probe pipe existence without creating
+// normal archive rows or ES-healing work.
+func (d *Device) readVKMPeriodUnlocked(ctx context.Context, a profile.Archive, pipe int, periodStart time.Time) (archive.ArchiveRecord, bool, error) {
 	reader, ok := archive.Get(a.Strategy)
 	if !ok {
-		return 0, fmt.Errorf("неизвестная стратегия %s", a.Strategy)
+		return archive.ArchiveRecord{}, false, fmt.Errorf("неизвестная стратегия %s", a.Strategy)
 	}
 
 	q := archive.ArchiveQuery{
@@ -317,17 +313,41 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, pipe i
 		Params:    a.Params,
 	}
 
+	records, err := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, q)
+	if err != nil {
+		return archive.ArchiveRecord{}, false, err
+	}
+	if len(records) == 0 {
+		return archive.ArchiveRecord{}, false, nil
+	}
+	return records[0], true, nil
+}
+
+// collectVKMPeriod делает ОДИН полный танец запись/ожидание/чтение архива
+// для окна [periodStart, periodStart+vkmArchivePeriod) и сохраняет то, что
+// пришло. Возвращает, сколько из vkmHourlyParams реально сохранено (0 без
+// ошибки — законный исход: у прибора не было данных за этот период).
+//
+// ВАЖНО (2026-08-10): раньше здесь был цикл переспроса при "аномальном"
+// (секундном) формате Time — см. doc-комментарий isVKMTimeAnomalous. Он
+// убран: секундный формат — не брак, а именно то, что нужно сохранить
+// как есть, с первой же попытки, без всякого переспроса.
+func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, pipe int, periodStart time.Time) (int, error) {
+	// Keep the lease across BOTH the physical read and persistence, exactly as
+	// the pre-discovery implementation did. This prevents another logical
+	// operation for the same device from slipping between a successful read
+	// and the corresponding archive write.
 	release, leaseErr := d.Lease.Acquire(ctx, d.ID, a.ID, 30*time.Second)
 	if leaseErr != nil {
 		return 0, fmt.Errorf("lease: %w", leaseErr)
 	}
 	defer release()
 
-	records, err := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, q)
+	rec, found, err := d.readVKMPeriodUnlocked(ctx, a, pipe, periodStart)
 	if err != nil {
 		return 0, err
 	}
-	if len(records) == 0 {
+	if !found {
 		return 0, nil
 	}
 
@@ -341,18 +361,17 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, pipe i
 	// Метка при сохранении (и сырой строки, и разобранных полей) —
 	// КОНЕЦ периода (periodStart+vkmArchivePeriod), не его начало — см.
 	// подробное объяснение в doc-комментарии persistVKMHourly. Сам
-	// запрос к прибору (q.From/q.To выше) по-прежнему построен от
-	// НАЧАЛА periodStart — это два разных, не связанных использования
-	// одной переменной: одно для окна запроса, другое для подписи
-	// результата.
+	// запрос к прибору по-прежнему построен от НАЧАЛА periodStart — это
+	// два разных, не связанных использования одной переменной: одно для
+	// окна запроса, другое для подписи результата.
 	//
-	// records[0].Raw сохраняется здесь БУКВАЛЬНО как пришло от прибора
+	// rec.Raw сохраняется здесь БУКВАЛЬНО как пришло от прибора
 	// (parseTaggedString ничего в нём не меняет, кроме обрезки нулевых
 	// байт) — northbound должен отдавать его в ЭС так же нетронуто, без
 	// собственных текстовых преобразований (strip_headers/expand_exponent/
 	// field_scale и т.п. — см. историю в vkm_config.go).
 	periodLabel := periodStart.Add(vkmArchivePeriod)
-	if err := d.Repo.SaveVKMRawString(ctx, d.ID, q.Instance, periodLabel, string(records[0].Raw)); err != nil {
+	if err := d.Repo.SaveVKMRawString(ctx, d.ID, pipe, periodLabel, string(rec.Raw)); err != nil {
 		log.Printf("[%s] VKM трубопровод %d, период %s: ошибка сохранения сырой строки: %v\n",
 			d.ID, pipe, periodLabel.Format("02.01.2006 15:04"), err)
 	}
@@ -362,7 +381,7 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, pipe i
 	// "расхождение времени прибора" нельзя: именно это давало ложное
 	// стабильное +0 сек на дашборде. До подтверждения безопасного
 	// read-only чтения текущих часов ВКМ этот путь дрейф не публикует.
-	return persistVKMHourly(ctx, d, pipe, periodLabel, records[0]), nil
+	return persistVKMHourly(ctx, d, pipe, periodLabel, rec), nil
 }
 
 // pollVKMHourlyLatest — обычный плановый опрос архива ВКМ (аналог часового

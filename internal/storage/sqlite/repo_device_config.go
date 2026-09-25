@@ -79,6 +79,19 @@ CREATE TABLE IF NOT EXISTS vkm_active_pipes (
     PRIMARY KEY (device_id, pipe)
 );
 
+-- Last physical discovery result for every VKM pipe number. This is
+-- observational metadata only: discovery never silently changes
+-- vkm_active_pipes, so the operator remains in control of polling.
+CREATE TABLE IF NOT EXISTS vkm_pipe_discovery (
+    device_id  TEXT NOT NULL,
+    pipe       INTEGER NOT NULL CHECK (pipe BETWEEN 1 AND 10),
+    status     TEXT NOT NULL CHECK (status IN ('available','absent','uncertain','error')),
+    detail     TEXT NOT NULL DEFAULT '',
+    tags_json  TEXT NOT NULL DEFAULT '[]',
+    scanned_at DATETIME NOT NULL,
+    PRIMARY KEY (device_id, pipe)
+);
+
 -- История фактически выполненных коррекций часов ВКМ. Нужна для
 -- ограничения суммарного модуля коррекций за скользящие 24 часа.
 -- Записывается только ПОСЛЕ подтверждённой успешной команды коррекции.
@@ -171,6 +184,10 @@ CREATE TABLE IF NOT EXISTS es_akron_northbound (
 	// does not invent or silently enforce any engineering range.
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE es_vkm_channels ADD COLUMN min_value REAL NULL`)
 	_, _ = r.db.ExecContext(ctx, `ALTER TABLE es_vkm_channels ADD COLUMN max_value REAL NULL`)
+
+	// Forward-compatible with any development DB that may have seen an
+	// earlier discovery-table draft before source-tag persistence was added.
+	_, _ = r.db.ExecContext(ctx, `ALTER TABLE vkm_pipe_discovery ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'`)
 
 	if err := r.migrateESVKMChannelsSchema(ctx); err != nil {
 		return err
@@ -500,6 +517,9 @@ func (r *Repo) DeleteDevice(ctx context.Context, id string) error {
 	}
 	if _, err := r.db.ExecContext(ctx, `DELETE FROM vkm_active_pipes WHERE device_id = ?`, id); err != nil {
 		return fmt.Errorf("delete device vkm active pipes: %w", err)
+	}
+	if _, err := r.db.ExecContext(ctx, `DELETE FROM vkm_pipe_discovery WHERE device_id = ?`, id); err != nil {
+		return fmt.Errorf("delete device vkm pipe discovery: %w", err)
 	}
 	if _, err := r.db.ExecContext(ctx, `DELETE FROM es_akron_northbound WHERE device_id = ?`, id); err != nil {
 		return fmt.Errorf("delete device akron northbound: %w", err)

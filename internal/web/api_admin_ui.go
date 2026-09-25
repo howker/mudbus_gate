@@ -303,8 +303,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         </table>
       </div>
       <div id="channelsVKMWrap" style="display:none;">
-        <p class="small-note">Флажок «Опрос» задаёт трубопроводы, которые шлюз реально читает. Параметры в выпадающих списках берутся из последней сохранённой сырой строки каждого трубопровода. Если трубопровод только что включён, сначала сохраните настройки и выполните архивный опрос/переопрос, затем нажмите «Обновить параметры из архива».</p>
-        <p><button class="btn secondary" type="button" onclick="refreshVKMSourceTags()">Обновить параметры из архива</button></p>
+        <p class="small-note">Флажок «Опрос» задаёт трубопроводы, которые шлюз реально читает. «Пересканировать трубопроводы» физически проверяет архивные экземпляры 1–10, но сам флажки не меняет. Пустой архивный период не считается отсутствием трубопровода: шлюз проверяет соседний завершённый период. Параметры в выпадающих списках берутся из последней архивной строки, а для ещё не опрашиваемой найденной трубы — из результата сканирования.</p>
+        <p><button class="btn secondary" type="button" onclick="rescanVKMPipes()">Пересканировать трубопроводы</button> <button class="btn secondary" type="button" onclick="refreshVKMSourceTags()">Обновить параметры из архива</button></p>
         <div id="vkmPipeGroups"></div>
       </div>
       <p><button class="btn" onclick="saveChannels()">Сохранить точки</button></p>
@@ -541,6 +541,7 @@ var editingOriginalKind = null; // set by editDevice(), cleared by resetDeviceFo
 var channelSafetyByTag = {}; // non-VKM legacy rows keep backend min/max even though that compact table does not expose them.
 var vkmChannelBySlot = {};   // key "pipe:slot" -> saved mapping row
 var vkmSourceTagsByPipe = {}; // pipe -> tags parsed from the newest raw archive row
+var vkmPipeDiscoveryByPipe = {}; // pipe -> last persisted physical discovery result
 
 function loadProfiles() {
   var xhr = new XMLHttpRequest();
@@ -2511,15 +2512,13 @@ function renderVKMPipeGroups() {
   for (var pipe = 1; pipe <= 10; pipe++) {
     var expanded = pipe === 1 || active[pipe] || vkmPipeHasMapping(pipe);
     var meta = vkmSourceTagsByPipe[pipe];
-    var note = 'Архивная строка ещё не сохранена — показан базовый набор параметров.';
-    if (meta && meta.found) {
-      note = 'Параметры из последней архивной строки' + (meta.ts ? ' (' + meta.ts.replace('T', ' ') + ')' : '') + '.';
-    }
+    var note = vkmPipeSourceNote(meta);
     html += '<div style="border:1px solid #3e3e42;margin:10px 0;background:#1e1e1e;">' +
       '<div style="padding:8px 10px;background:#333337;">' +
       '<button type="button" class="btn secondary" style="width:180px;text-align:left;" onclick="toggleVKMPipe(' + pipe + ')">' +
       '<span id="ch_pipe_' + pipe + '_arrow">' + (expanded ? '▼' : '▶') + '</span> Трубопровод ' + pipe + '</button>' +
       '<label style="margin-left:12px;color:#cccccc;"><input id="ch_pipe_' + pipe + '_active" type="checkbox"' + (active[pipe] ? ' checked' : '') + '> Опрос</label>' +
+      '<span id="ch_pipe_' + pipe + '_scan" style="margin-left:12px;color:#bdbdbd;">' + vkmPipeDiscoveryLabel(vkmPipeDiscoveryByPipe[pipe]) + '</span>' +
       '</div>' +
       '<div id="ch_pipe_' + pipe + '_body" style="display:' + (expanded ? 'block' : 'none') + ';padding:8px 10px;">' +
       '<div id="ch_pipe_' + pipe + '_source_note" class="small-note">' + note + '</div>' +
@@ -2553,6 +2552,76 @@ function toggleVKMPipe(pipe) {
   if (arrow) { arrow.innerText = open ? '▶' : '▼'; }
 }
 
+function vkmPipeSourceNote(meta) {
+  if (!meta || !meta.found) { return 'Архивная строка ещё не сохранена — показан базовый набор параметров.'; }
+  if (meta.source === 'scan') {
+    return 'Параметры из последнего сканирования' + (meta.ts ? ' (' + meta.ts.replace('T', ' ') + ')' : '') + '.';
+  }
+  return 'Параметры из последней архивной строки' + (meta.ts ? ' (' + meta.ts.replace('T', ' ') + ')' : '') + '.';
+}
+
+function vkmPipeDiscoveryLabel(meta) {
+  if (!meta || !meta.status) { return 'не сканировался'; }
+  if (meta.status === 'available') { return 'найден'; }
+  if (meta.status === 'absent') { return 'не поддерживается'; }
+  if (meta.status === 'uncertain') { return 'нет записей — не определено'; }
+  return 'ошибка сканирования';
+}
+
+function applyVKMPipeDiscovery(rows) {
+  vkmPipeDiscoveryByPipe = {};
+  for (var i = 0; i < rows.length; i++) { vkmPipeDiscoveryByPipe[rows[i].pipe_no] = rows[i]; }
+  for (var pipe = 1; pipe <= 10; pipe++) {
+    var el = document.getElementById('ch_pipe_' + pipe + '_scan');
+    if (el) { el.innerText = vkmPipeDiscoveryLabel(vkmPipeDiscoveryByPipe[pipe]); }
+  }
+}
+
+function loadVKMPipeDiscovery() {
+  var deviceId = document.getElementById('ch_device').value;
+  if (!deviceId || currentChannelsKind() !== 'vkm360') { return; }
+  var xhr = new XMLHttpRequest();
+  xhr.open('GET', '/api/vkm-pipe-discovery?device_id=' + encodeURIComponent(deviceId), true);
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4 || xhr.status !== 200) { return; }
+    var rows = [];
+    try { rows = JSON.parse(xhr.responseText) || []; } catch (e) {}
+    applyVKMPipeDiscovery(rows);
+  };
+  xhr.send();
+}
+
+function rescanVKMPipes() {
+  var deviceId = document.getElementById('ch_device').value;
+  if (!deviceId || currentChannelsKind() !== 'vkm360') { return; }
+  showMsg('channelsMsg', true, 'Сканирую трубопроводы 1–10. Флажки «Опрос» останутся без изменений...');
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/vkm-pipe-discovery', true);
+  xhr.setRequestHeader('Content-Type', 'application/json');
+  xhr.onreadystatechange = function() {
+    if (xhr.readyState !== 4) { return; }
+    if (xhr.status !== 200) {
+      var errData = {};
+      try { errData = JSON.parse(xhr.responseText); } catch (e) {}
+      showMsg('channelsMsg', false, 'Сканирование не выполнено: ' + (errData.error || ('HTTP ' + xhr.status)));
+      return;
+    }
+    var rows = [];
+    try { rows = JSON.parse(xhr.responseText) || []; } catch (e2) {}
+    applyVKMPipeDiscovery(rows);
+    var available = 0, absent = 0, uncertain = 0, errors = 0;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].status === 'available') { available++; }
+      else if (rows[i].status === 'absent') { absent++; }
+      else if (rows[i].status === 'uncertain') { uncertain++; }
+      else { errors++; }
+    }
+    showMsg('channelsMsg', true, 'Сканирование завершено: найдено ' + available + ', не поддерживается ' + absent + ', не определено ' + uncertain + ', ошибок ' + errors + '. Флажки «Опрос» не изменены.');
+    refreshVKMSourceTags();
+  };
+  xhr.send(JSON.stringify({ device_id: deviceId }));
+}
+
 function applyVKMSourceTags(rows) {
   vkmSourceTagsByPipe = {};
   for (var i = 0; i < rows.length; i++) { vkmSourceTagsByPipe[rows[i].pipe_no] = rows[i]; }
@@ -2560,9 +2629,7 @@ function applyVKMSourceTags(rows) {
     var meta = vkmSourceTagsByPipe[pipe];
     var noteEl = document.getElementById('ch_pipe_' + pipe + '_source_note');
     if (noteEl) {
-      noteEl.innerText = (meta && meta.found) ?
-        ('Параметры из последней архивной строки' + (meta.ts ? ' (' + meta.ts.replace('T', ' ') + ')' : '') + '.') :
-        'Архивная строка ещё не сохранена — показан базовый набор параметров.';
+      noteEl.innerText = vkmPipeSourceNote(meta);
     }
     for (var slot = 1; slot <= 4; slot++) {
       var sel = document.getElementById('ch_p' + pipe + '_s' + slot + '_tag');
@@ -2612,6 +2679,7 @@ function loadChannels() {
   channelSafetyByTag = {};
   vkmChannelBySlot = {};
   vkmSourceTagsByPipe = {};
+  vkmPipeDiscoveryByPipe = {};
   renderChannelsTable(kind);
   if (!deviceId) { return; }
 
@@ -2626,6 +2694,7 @@ function loadChannels() {
       }
       renderVKMPipeGroups();
       refreshVKMSourceTags();
+      loadVKMPipeDiscovery();
       return;
     }
 
