@@ -7,25 +7,33 @@ a database after the new migration has run.
 
 ## Before first start of the new executable
 
-1. Stop the MBGW Windows service.
-2. Make an offline copy of the SQLite database file used by the service.
-3. Keep the previous `mbgw.exe` together with that database copy until the new
-   version has passed startup, archive polling and ES synchronization checks.
+1. Stop the MBGW Windows service and confirm that it is actually stopped.
+2. Make an offline copy of the SQLite database **together with its WAL sidecar
+   files if they still exist**. A stopped service may still leave
+   `mbgw_server.db-wal` and `mbgw_server.db-shm`; the `.db` file alone is not
+   guaranteed to contain the latest committed transactions.
+3. Keep the previous `mbgw.exe` together with that complete database backup
+   until the new version has passed startup, archive polling and ES
+   synchronization checks.
 
 Example (adjust service name and DB path to the object):
 
 ```powershell
-Stop-Service mbgw; Copy-Item C:\mbgw\mbgw_server.db C:\mbgw\backup\mbgw_server_pre_p0.db -Force
+Stop-Service mbgw; while((Get-Service mbgw).Status -ne 'Stopped'){ Start-Sleep -Milliseconds 200 }; New-Item C:\mbgw\backup\pre_p0 -ItemType Directory -Force | Out-Null; Copy-Item C:\mbgw\mbgw_server.db* C:\mbgw\backup\pre_p0\ -Force
 ```
 
-Do not copy a live SQLite database while the service is writing to it.
+Do not copy a live SQLite database while the service is writing to it. If
+`-wal`/`-shm` are absent after a clean stop, copying the `.db` alone is fine.
+If they are present, keep them in the same backup set as the `.db`.
 
 ## Rollback
 
-Rollback is **the previous executable plus the pre-P0 database copy**:
+Rollback is **the previous executable plus the complete pre-P0 database
+backup set**. Never leave WAL/SHM files created by the new database next to the
+restored old `.db`: SQLite may try to apply an unrelated WAL to it.
 
 ```powershell
-Stop-Service mbgw; Copy-Item C:\mbgw\backup\mbgw_server_pre_p0.db C:\mbgw\mbgw_server.db -Force; Copy-Item C:\mbgw\backup\mbgw.exe C:\mbgw\mbgw.exe -Force; Start-Service mbgw
+Stop-Service mbgw; while((Get-Service mbgw).Status -ne 'Stopped'){ Start-Sleep -Milliseconds 200 }; Remove-Item C:\mbgw\mbgw_server.db-wal,C:\mbgw\mbgw_server.db-shm -Force -ErrorAction SilentlyContinue; Copy-Item C:\mbgw\backup\pre_p0\mbgw_server.db* C:\mbgw\ -Force; Copy-Item C:\mbgw\backup\mbgw.exe C:\mbgw\mbgw.exe -Force; Start-Service mbgw
 ```
 
 Archive rows collected only after the P0 migration are not present in the

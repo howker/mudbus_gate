@@ -11,6 +11,7 @@ import (
 
 	"mbgw/internal/archive"
 	"mbgw/internal/dbg"
+	"mbgw/internal/errs"
 	"mbgw/internal/health"
 	"mbgw/internal/profile"
 	"mbgw/internal/storage"
@@ -411,7 +412,11 @@ type vkmCatchUpCollectFunc func(ctx context.Context, pipe int, periodStart time.
 // runVKMCatchUpAt contains the scheduler catch-up policy independently from
 // physical I/O, making delayed-tick/no-record behaviour regression-testable.
 func runVKMCatchUpAt(ctx context.Context, now time.Time, depthHours int, pipes []int, missingFn vkmCatchUpMissingFunc, collectFn vkmCatchUpCollectFunc) error {
-	if depthHours <= 0 {
+	// Scheduled catch-up is deliberately capped at one day. The configured
+	// BackfillMaxDepthHours may be hundreds of hours for startup/manual
+	// recovery; reusing that depth on every scheduler tick would make an
+	// unreachable VKM monopolize a shared bus for many minutes or hours.
+	if depthHours <= 0 || depthHours > vkmDefaultBackfillDepthHours {
 		depthHours = vkmDefaultBackfillDepthHours
 	}
 	last := now.Truncate(vkmArchivePeriod).Add(-vkmArchivePeriod)
@@ -426,9 +431,16 @@ func runVKMCatchUpAt(ctx context.Context, now time.Time, depthHours int, pipes [
 				return err
 			}
 			_, err := collectFn(ctx, pipe, periodStart)
-			if err != nil && !errors.Is(err, archive.ErrVKMNoRecords) {
-				// One bad period must not make later missing periods disappear.
-				continue
+			if err != nil {
+				if isVKMCatchUpCommunicationError(err) {
+					// The device/line is unavailable. Stop this pipe immediately
+					// instead of replaying every missing period through the same
+					// transport timeout/retry cycle. Other pipes still get one try.
+					break
+				}
+				// No-record and meter/data-level errors are period-local: leave
+				// the gap visible (or suppressed by its marker) and continue so
+				// one bad historical period does not hide later good periods.
 			}
 			select {
 			case <-ctx.Done():
@@ -438,6 +450,41 @@ func runVKMCatchUpAt(ctx context.Context, now time.Time, depthHours int, pipes [
 		}
 	}
 	return nil
+}
+
+// isVKMCatchUpCommunicationError identifies failures where retrying another
+// historical period cannot help because the physical/protocol path itself is
+// unavailable. Lower layers wrap the shared sentinels for normal I/O errors;
+// the string fallbacks cover older protocol errors that predate those
+// sentinels (notably CRC/frame/deadline messages) without changing their
+// public contracts in this focused P0 patch.
+func isVKMCatchUpCommunicationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, errs.ErrTimeout) ||
+		errors.Is(err, errs.ErrClosed) ||
+		errors.Is(err, errs.ErrTransport) ||
+		errors.Is(err, errs.ErrLease) ||
+		errors.Is(err, errs.ErrAuth) ||
+		errors.Is(err, errs.ErrBusy) ||
+		errors.Is(err, errs.ErrCRC) ||
+		errors.Is(err, errs.ErrFrame) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"timeout", "deadline exceeded", "invalid crc", "crc mismatch",
+		"rtu frame", "tcp frame", "not open", "transport",
+		"transaction id mismatch", "unit id mismatch", "modbus exception",
+		"response too short", "byte count mismatch", "function mismatch",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // pollVKMHourlyLatest is now a bounded catch-up pass. A delayed scheduler tick
@@ -455,6 +502,7 @@ func (d *Device) pollVKMHourlyLatest(ctx context.Context, a profile.Archive) {
 		},
 		func(ctx context.Context, pipe int, periodStart time.Time) (int, error) {
 			saved, err := d.collectVKMPeriod(ctx, a, pipe, periodStart)
+			health.MarkPollProgress(d.ID, time.Now())
 			if err != nil {
 				if errors.Is(err, archive.ErrVKMNoRecords) {
 					dbg.Printf("[%s] VKM архив %s, трубопровод %d: период %s: прибор подтвердил отсутствие записи\n",

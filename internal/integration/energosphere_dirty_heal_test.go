@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	sqliterepo "mbgw/internal/storage/sqlite"
 )
 
 type fakeInsertOnlyWriter struct {
@@ -186,16 +188,56 @@ func TestDirtyHealerIsolatesESFailureAndClosesSourceRange(t *testing.T) {
 		t.Fatalf("want one durable point failure, got %d", n)
 	}
 
+	// Retry is intentionally NOT immediate: persistent failures are scheduled
+	// with backoff instead of hitting ES and the service log every pass.
 	okWriter := &fakeInsertOnlyWriter{}
 	stats, err = healESDirtyRanges(ctx, repo, okWriter, cfg, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Inserted != 1 {
-		t.Fatalf("isolated point was not retried: %+v", stats)
+	if stats.Inserted != 0 || len(okWriter.inserted) != 0 {
+		t.Fatalf("isolated point retried before backoff expired: %+v %#v", stats, okWriter.inserted)
 	}
-	if n, _ := repo.CountESDirtyPointFailures(ctx, "vkm"); n != 0 {
-		t.Fatalf("point failure queue must drain after recovery, got %d", n)
+	if n, _ := repo.CountESDirtyPointFailures(ctx, "vkm"); n != 1 {
+		t.Fatalf("point failure must remain queued during backoff, got %d", n)
+	}
+}
+
+func TestResolveDirtyFailureUsesCurrentMappingAndArchiveValue(t *testing.T) {
+	ctx := context.Background()
+	repo := newIntegrationTestRepo(t)
+	ts := time.Date(2026, 9, 24, 13, 30, 0, 0, time.Local)
+
+	// The failure snapshot was created under an old ID_PP/factor/value. The
+	// operator then corrected both the mapping and the local archive. Retry
+	// must use ONLY the current configuration and current archive.
+	if err := repo.SaveVKMRawString(ctx, "vkm-remap", 1, ts, "S=9;"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{
+		DeviceID: "vkm-remap", Pipe: 1, Kind: "vkm360",
+		Points: []PointMapping{{Tag: "S", PointID: 8003, Factor: 2, Label: "масса"}},
+	}
+	failure := sqliterepo.ESDirtyPointFailure{
+		DeviceID: "vkm-remap", PointID: 7003, Ts: ts, Value: 7.5,
+		SourcePipe: 1, SourceTag: "S",
+	}
+	r, found, err := resolveDirtyFailureReading(ctx, repo, cfg, failure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("current source mapping must resolve")
+	}
+	if r.mapping.PointID != 8003 || r.value != 18 {
+		t.Fatalf("retry used stale snapshot: point=%d value=%g want point=8003 value=18", r.mapping.PointID, r.value)
+	}
+
+	// If the source mapping is removed, retry must be retired rather than
+	// falling back to the stale target ID/value.
+	cfg.Points = nil
+	if _, found, err := resolveDirtyFailureReading(ctx, repo, cfg, failure); err != nil || found {
+		t.Fatalf("removed mapping must not resolve: found=%v err=%v", found, err)
 	}
 }
 

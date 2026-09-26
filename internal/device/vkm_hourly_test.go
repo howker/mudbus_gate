@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"mbgw/internal/archive"
+	"mbgw/internal/errs"
 	"mbgw/internal/lease"
 	"mbgw/internal/storage/sqlite"
 )
@@ -299,6 +300,40 @@ func TestVKMCatchUpDelayedSeventyMinutesReadsAllMissingPeriodsOnAllPipes(t *test
 				t.Fatalf("got[%d]=%q want %q (all=%v)", i*len(want)+j, got[i*len(want)+j], wantKey, got)
 			}
 		}
+	}
+}
+
+func TestVKMCatchUpStopsEachPipeAfterCommunicationFailureAndCapsDepth(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 26, 12, 10, 0, 0, time.Local)
+	last := time.Date(2026, 9, 26, 11, 30, 0, 0, time.Local)
+	periods := []time.Time{last.Add(-time.Hour), last.Add(-30 * time.Minute), last}
+
+	missingCalls := 0
+	collectCalls := 0
+	err := runVKMCatchUpAt(ctx, now, 648, []int{1, 2},
+		func(_ context.Context, pipe int, from, to time.Time) ([]time.Time, error) {
+			missingCalls++
+			if to != last {
+				t.Fatalf("pipe %d last=%v want %v", pipe, to, last)
+			}
+			if got := to.Sub(from); got != 23*time.Hour+30*time.Minute {
+				t.Fatalf("scheduled catch-up depth=%v want 23h30m (24h/48 half-hours)", got)
+			}
+			return append([]time.Time(nil), periods...), nil
+		},
+		func(_ context.Context, pipe int, periodStart time.Time) (int, error) {
+			collectCalls++
+			return 0, fmt.Errorf("pipe %d %s: %w", pipe, periodStart.Format("15:04"), errs.ErrTimeout)
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missingCalls != 2 {
+		t.Fatalf("missing calls=%d want 2", missingCalls)
+	}
+	if collectCalls != 2 {
+		t.Fatalf("unreachable meter must get one failed period per pipe, calls=%d want 2", collectCalls)
 	}
 }
 

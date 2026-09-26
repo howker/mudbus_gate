@@ -7,6 +7,23 @@ import (
 	"time"
 )
 
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
 type blockingWriter struct {
 	started chan struct{}
 	release chan struct{}
@@ -45,7 +62,7 @@ func TestNonBlockingWriterDoesNotBlockCaller(t *testing.T) {
 }
 
 func TestNonBlockingWriterCopiesInput(t *testing.T) {
-	var dst bytes.Buffer
+	var dst lockedBuffer
 	w := newNonBlockingWriter(&dst, 4)
 	p := []byte("исходная строка\n")
 	_, _ = w.Write(p)

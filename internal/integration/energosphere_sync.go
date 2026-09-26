@@ -679,6 +679,58 @@ func validatePointReading(r pointReading) error {
 	return nil
 }
 
+func dirtyFailureSourcePipe(cfg Config, m PointMapping) int {
+	pipe := m.Pipe
+	if cfg.Kind == "" || cfg.Kind == "vkm360" {
+		if pipe == 0 {
+			pipe = cfg.Pipe
+		}
+		if pipe == 0 {
+			pipe = 1
+		}
+	}
+	return pipe
+}
+
+// resolveDirtyFailureReading reconstructs a failed point from the CURRENT
+// mapping and CURRENT local archive. The stored point ID/value in the retry
+// row are diagnostic snapshots only and are never trusted for a retry write.
+// This prevents an operator mapping/factor correction from causing stale data
+// to be inserted into a now unrelated Energosphere ID_PP.
+func resolveDirtyFailureReading(ctx context.Context, repo *sqliterepo.Repo, cfg Config, f sqliterepo.ESDirtyPointFailure) (pointReading, bool, error) {
+	if strings.TrimSpace(f.SourceTag) == "" {
+		return pointReading{}, false, nil
+	}
+
+	var current *PointMapping
+	for i := range cfg.Points {
+		m := &cfg.Points[i]
+		if m.Tag != f.SourceTag || dirtyFailureSourcePipe(cfg, *m) != f.SourcePipe {
+			continue
+		}
+		if current != nil {
+			return pointReading{}, false, fmt.Errorf("неоднозначная текущая привязка источника pipe=%d tag=%q", f.SourcePipe, f.SourceTag)
+		}
+		current = m
+	}
+	if current == nil {
+		return pointReading{}, false, nil
+	}
+
+	retryCfg := cfg
+	retryCfg.Points = []PointMapping{*current}
+	readings, err := collectReadingsForESRange(ctx, repo, retryCfg, f.Ts, f.Ts)
+	if err != nil {
+		return pointReading{}, false, err
+	}
+	for _, r := range readings {
+		if r.mapping.PointID == current.PointID && r.ts.Equal(f.Ts) {
+			return r, true, nil
+		}
+	}
+	return pointReading{}, false, nil
+}
+
 func vkmMappedPipes(cfg Config) []int {
 	seen := make(map[int]bool)
 	for _, m := range cfg.Points {
@@ -1329,29 +1381,63 @@ func healESDirtyRanges(ctx context.Context, repo *sqliterepo.Repo, writer insert
 		opsLeft = 64
 	}
 
-	// Retry isolated poison points first, but with a small bounded slice of the
-	// overall budget. A bad ID_PP therefore stays visible/persistent without
-	// forcing every healthy range behind it to be scanned again.
+	// Retry isolated poison points first, but only after their persisted
+	// backoff expires. Before touching ES, reconstruct every point from the
+	// CURRENT source mapping and local archive; stored Value/PointID are never
+	// replayed blindly after an operator changes ID_PP or Factor.
 	failures, err := repo.ListESDirtyPointFailures(ctx, cfg.DeviceID, 64)
 	if err != nil {
 		return stats, err
 	}
+	retryFailed := 0
+	retryDropped := 0
 	for _, f := range failures {
 		if time.Now().After(passDeadline) || opsLeft <= 0 {
-			return stats, nil
+			break
 		}
 		opsLeft--
-		present, err := writer.PointExists(ctx, f.PointID, f.Ts)
-		if err == nil && present {
+
+		r, found, resolveErr := resolveDirtyFailureReading(ctx, repo, cfg, f)
+		if resolveErr != nil {
+			stats.Failed++
+			retryFailed++
+			f.LastError = resolveErr.Error()
+			_ = repo.RecordESDirtyPointFailure(ctx, f)
+			continue
+		}
+		if !found {
+			// Mapping was removed/changed beyond recognition, or this is a
+			// legacy first-P0 row with no source identity. There is no safe
+			// target to retry, so retire it instead of writing stale data.
+			_ = repo.CompleteESDirtyPointFailure(ctx, f)
+			retryDropped++
+			continue
+		}
+		if err := validatePointReading(r); err != nil {
+			stats.Blocked++
+			retryFailed++
+			if r.mapping.PointID != f.PointID {
+				_ = repo.CompleteESDirtyPointFailure(ctx, f)
+			}
+			_ = repo.RecordESDirtyPointFailure(ctx, sqliterepo.ESDirtyPointFailure{
+				DeviceID: cfg.DeviceID, PointID: r.mapping.PointID, Ts: r.ts, Value: r.value,
+				State: f.State, SourcePipe: dirtyFailureSourcePipe(cfg, r.mapping), SourceTag: r.mapping.Tag,
+				LastError: err.Error(),
+			})
+			continue
+		}
+
+		present, writeErr := writer.PointExists(ctx, r.mapping.PointID, r.ts)
+		if writeErr == nil && present {
 			_ = repo.CompleteESDirtyPointFailure(ctx, f)
 			stats.Existing++
 			continue
 		}
-		if err == nil && !cfg.DryRun {
-			err = writer.InsertPoint(ctx, f.PointID, f.Ts, f.Value, f.State)
-			if err == nil || IsDuplicateKeyError(err) {
+		if writeErr == nil && !cfg.DryRun {
+			writeErr = writer.InsertPoint(ctx, r.mapping.PointID, r.ts, r.value, f.State)
+			if writeErr == nil || IsDuplicateKeyError(writeErr) {
 				_ = repo.CompleteESDirtyPointFailure(ctx, f)
-				if err == nil {
+				if writeErr == nil {
 					stats.Inserted++
 					health.MarkESWriteSuccess(cfg.DeviceID, time.Now())
 				} else {
@@ -1360,17 +1446,30 @@ func healESDirtyRanges(ctx context.Context, repo *sqliterepo.Repo, writer insert
 				continue
 			}
 		}
+
 		stats.Failed++
+		retryFailed++
 		msg := "dry-run: запись отложена"
-		if err != nil {
-			msg = err.Error()
+		if writeErr != nil {
+			msg = writeErr.Error()
+		}
+		if r.mapping.PointID != f.PointID {
+			_ = repo.CompleteESDirtyPointFailure(ctx, f)
 		}
 		_ = repo.RecordESDirtyPointFailure(ctx, sqliterepo.ESDirtyPointFailure{
-			DeviceID: cfg.DeviceID, PointID: f.PointID, Ts: f.Ts, Value: f.Value,
-			State: f.State, LastError: msg,
+			DeviceID: cfg.DeviceID, PointID: r.mapping.PointID, Ts: r.ts, Value: r.value,
+			State: f.State, SourcePipe: dirtyFailureSourcePipe(cfg, r.mapping), SourceTag: r.mapping.Tag,
+			LastError: msg,
 		})
-		log.Printf("[синхронизация с ЭС] dirty-point АЛАРМ: ID_PP=%d %s, попыток=%d: %s\n",
-			f.PointID, f.Ts.Format("02.01 15:04"), f.Attempts+1, msg)
+	}
+	if retryFailed > 0 {
+		log.Printf("[синхронизация с ЭС] dirty-point АЛАРМ: %d изолированных точек всё ещё не восстановлены; повтор отложен по backoff\n", retryFailed)
+	}
+	if retryDropped > 0 {
+		log.Printf("[синхронизация с ЭС] dirty-point: снято %d устаревших retry-записей без действующей текущей привязки\n", retryDropped)
+	}
+	if time.Now().After(passDeadline) || opsLeft <= 0 {
+		return stats, nil
 	}
 
 	ranges, err := repo.ListESDirtyRanges(ctx, cfg.DeviceID, limit)
@@ -1444,7 +1543,8 @@ func healESDirtyRanges(ctx context.Context, repo *sqliterepo.Repo, writer insert
 			stats.Failed++
 			if recErr := repo.RecordESDirtyPointFailure(ctx, sqliterepo.ESDirtyPointFailure{
 				DeviceID: cfg.DeviceID, PointID: r.mapping.PointID, Ts: r.ts,
-				Value: r.value, State: 0, LastError: err.Error(),
+				Value: r.value, State: 0, SourcePipe: dirtyFailureSourcePipe(cfg, r.mapping),
+				SourceTag: r.mapping.Tag, LastError: err.Error(),
 			}); recErr != nil {
 				return stats, recErr
 			}
