@@ -1,14 +1,15 @@
 package modbus
 
 import (
-    "bytes"
-    "context"
-    "encoding/hex"
-    "strings"
-    "testing"
-    "time"
+	"bytes"
+	"context"
+	"encoding/hex"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
 
-    "mbgw/internal/transport"
+	"mbgw/internal/transport"
 )
 
 // parseHex removes spaces from golden vector literals.
@@ -27,23 +28,23 @@ type stubTransport struct {
 func (s *stubTransport) Open(ctx context.Context) error { return nil }
 
 func (s *stubTransport) Send(ctx context.Context, frame []byte) error {
-        s.lastReq = append([]byte(nil), frame...)
-        return nil
+	s.lastReq = append([]byte(nil), frame...)
+	return nil
 }
 
 func (s *stubTransport) Receive(ctx context.Context, timeout time.Duration) ([]byte, error) {
-        if s.err != nil {
-                return nil, s.err
-        }
-        return append([]byte(nil), s.resp...), nil
+	if s.err != nil {
+		return nil, s.err
+	}
+	return append([]byte(nil), s.resp...), nil
 }
 
 func (s *stubTransport) Close() error {
-        return nil
+	return nil
 }
 
 func (s *stubTransport) Info() transport.Params {
-        return transport.Params{Retries: 1}
+	return transport.Params{Retries: 1}
 }
 
 func TestCRC16_Golden(t *testing.T) {
@@ -257,25 +258,123 @@ func TestBuildWriteMultipleRegistersPDU(t *testing.T) {
 }
 
 func TestBuildArchive65IndexPDU_Golden(t *testing.T) {
-    // prtkl_Modbus_pril_1.pdf, Приложение А: запрос по индексу 6 записей
-    // массива 1, начиная со 100-й, устройство 17.
-    // Full frame incl. device addr+CRC: 11 41 00 01 00 06 00 00 64
-    // (addr/CRC are framing, not part of the PDU) - PDU is: 41 00 01 00 06 00 00 64
-    got := BuildArchive65IndexPDU(1, 6, 100)
-    want := []byte{0x41, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x64}
-    if !bytes.Equal(got, want) {
-        t.Fatalf("got % X, want % X", got, want)
-    }
+	// prtkl_Modbus_pril_1.pdf, Приложение А: запрос по индексу 6 записей
+	// массива 1, начиная со 100-й, устройство 17.
+	// Full frame incl. device addr+CRC: 11 41 00 01 00 06 00 00 64
+	// (addr/CRC are framing, not part of the PDU) - PDU is: 41 00 01 00 06 00 00 64
+	got := BuildArchive65IndexPDU(1, 6, 100)
+	want := []byte{0x41, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, 0x64}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("got % X, want % X", got, want)
+	}
 }
 
 func TestBuildArchive65TimePDU_Golden(t *testing.T) {
-    // prtkl_Modbus_pril_1.pdf: запрос по времени 6 записей массива 1 с
-    // 10-12-1998 13:12:00, устройство 17.
-    // PDU: 41 00 01 00 06 01 00 0C 0D 0A 0C 62
-    tm := time.Date(1998, time.December, 10, 13, 12, 0, 0, time.UTC)
-    got := BuildArchive65TimePDU(1, 6, tm)
-    want := []byte{0x41, 0x00, 0x01, 0x00, 0x06, 0x01, 0x00, 0x0C, 0x0D, 0x0A, 0x0C, 0x62}
-    if !bytes.Equal(got, want) {
-        t.Fatalf("got % X, want % X", got, want)
-    }
+	// prtkl_Modbus_pril_1.pdf: запрос по времени 6 записей массива 1 с
+	// 10-12-1998 13:12:00, устройство 17.
+	// PDU: 41 00 01 00 06 01 00 0C 0D 0A 0C 62
+	tm := time.Date(1998, time.December, 10, 13, 12, 0, 0, time.UTC)
+	got := BuildArchive65TimePDU(1, 6, tm)
+	want := []byte{0x41, 0x00, 0x01, 0x00, 0x06, 0x01, 0x00, 0x0C, 0x0D, 0x0A, 0x0C, 0x62}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("got % X, want % X", got, want)
+	}
+}
+
+type queuedTransport struct {
+	responses [][]byte
+	lastReq   []byte
+	flushed   int
+}
+
+func (q *queuedTransport) Open(context.Context) error { return nil }
+func (q *queuedTransport) Close() error               { return nil }
+func (q *queuedTransport) Info() transport.Params {
+	return transport.Params{Retries: 1, ResponseTimeout: 50 * time.Millisecond}
+}
+func (q *queuedTransport) Send(_ context.Context, frame []byte) error {
+	q.lastReq = append([]byte(nil), frame...)
+	return nil
+}
+func (q *queuedTransport) Receive(_ context.Context, _ time.Duration) ([]byte, error) {
+	if len(q.responses) == 0 {
+		return nil, fmt.Errorf("test timeout")
+	}
+	f := q.responses[0]
+	q.responses = q.responses[1:]
+	return append([]byte(nil), f...), nil
+}
+func (q *queuedTransport) ResetInputBuffer() error { q.flushed++; return nil }
+
+func TestTransactRTUDiscardsForeignAddressThenAcceptsOwn(t *testing.T) {
+	req := BuildReadPDUWithQtyMust(t, "HR", 100, 2)
+	foreign := BuildRTUFrame(1, []byte{0x03, 0x04, 0, 1, 0, 2})
+	own := BuildRTUFrame(2, []byte{0x03, 0x04, 0, 3, 0, 4})
+	tr := &queuedTransport{responses: [][]byte{foreign, own}}
+
+	got, err := Transact(context.Background(), tr, false, 0, 2, req)
+	if err != nil {
+		t.Fatalf("Transact: %v", err)
+	}
+	if !bytes.Equal(got, []byte{0x03, 0x04, 0, 3, 0, 4}) {
+		t.Fatalf("accepted PDU=%x", got)
+	}
+	if tr.flushed != 1 {
+		t.Fatalf("input flushes=%d, want 1", tr.flushed)
+	}
+}
+
+func TestTransactRTURejectsWrongReadByteCount(t *testing.T) {
+	req := BuildReadPDUWithQtyMust(t, "HR", 100, 2)
+	bad := BuildRTUFrame(2, []byte{0x03, 0x02, 0, 3})
+	tr := &queuedTransport{responses: [][]byte{bad}}
+	if _, err := Transact(context.Background(), tr, false, 0, 2, req); err == nil || !strings.Contains(err.Error(), "byte count mismatch") {
+		t.Fatalf("err=%v, want byte count mismatch", err)
+	}
+}
+
+func TestTransactRTUDiscardsWrongFunctionThenAcceptsOwn(t *testing.T) {
+	req := BuildReadPDUWithQtyMust(t, "HR", 100, 2)
+	wrongFunc := BuildRTUFrame(2, []byte{0x04, 0x04, 0, 1, 0, 2})
+	own := BuildRTUFrame(2, []byte{0x03, 0x04, 0, 3, 0, 4})
+	tr := &queuedTransport{responses: [][]byte{wrongFunc, own}}
+	got, err := Transact(context.Background(), tr, false, 0, 2, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0] != 0x03 {
+		t.Fatalf("accepted wrong function: %x", got)
+	}
+}
+
+func TestTransactRTUCustomFunctionBindsResponseFunction(t *testing.T) {
+	req := []byte{0x41, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00}
+	wrongFunc := BuildRTUFrame(2, []byte{0x65, 0x00})
+	own := BuildRTUFrame(2, []byte{0x41, 0x00})
+	tr := &queuedTransport{responses: [][]byte{wrongFunc, own}}
+	got, err := Transact(context.Background(), tr, false, 0, 2, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte{0x41, 0x00}) {
+		t.Fatalf("accepted PDU=%x, want custom function 0x41 response", got)
+	}
+}
+
+func TestTransactRTUOnlyForeignFramesEndsWithError(t *testing.T) {
+	req := BuildReadPDUWithQtyMust(t, "HR", 100, 2)
+	foreign := BuildRTUFrame(1, []byte{0x03, 0x04, 0, 1, 0, 2})
+	tr := &queuedTransport{responses: [][]byte{foreign}}
+	if got, err := Transact(context.Background(), tr, false, 0, 2, req); err == nil || got != nil {
+		t.Fatalf("got=%x err=%v, want no accepted response", got, err)
+	}
+}
+
+func BuildReadPDUWithQtyMust(t *testing.T, space string, addr int, qty uint16) []byte {
+	t.Helper()
+	pdu, err := BuildReadPDUWithQty(space, addr, qty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pdu
 }

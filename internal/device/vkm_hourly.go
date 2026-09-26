@@ -2,6 +2,7 @@ package device
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -80,6 +81,12 @@ type vkmActivePipeStore interface {
 
 type vkmRawRangeStore interface {
 	GetVKMRawStringsRange(ctx context.Context, deviceID string, pipe int, fromTs, toTs time.Time) ([]storage.VKMRawRow, error)
+}
+
+type vkmNoRecordStore interface {
+	MarkVKMNoRecords(ctx context.Context, deviceID string, pipe int, ts time.Time, retryAfter time.Time) error
+	VKMNoRecordsSuppressed(ctx context.Context, deviceID string, pipe int, ts, now time.Time) (bool, error)
+	ClearVKMNoRecords(ctx context.Context, deviceID string, pipe int, ts time.Time) error
 }
 
 // vkmActivePipes reads the durable active-pipe set on every archive operation
@@ -337,18 +344,30 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, pipe i
 	// the pre-discovery implementation did. This prevents another logical
 	// operation for the same device from slipping between a successful read
 	// and the corresponding archive write.
-	release, leaseErr := d.Lease.Acquire(ctx, d.ID, a.ID, 30*time.Second)
+	release, leaseErr := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
 	if leaseErr != nil {
 		return 0, fmt.Errorf("lease: %w", leaseErr)
 	}
 	defer release()
 
 	rec, found, err := d.readVKMPeriodUnlocked(ctx, a, pipe, periodStart)
+	periodLabel := periodStart.Add(vkmArchivePeriod)
 	if err != nil {
+		if errors.Is(err, archive.ErrVKMNoRecords) {
+			if store, ok := d.Repo.(vkmNoRecordStore); ok {
+				_ = store.MarkVKMNoRecords(ctx, d.ID, pipe, periodLabel, time.Now().Add(6*time.Hour))
+			}
+		}
 		return 0, err
 	}
 	if !found {
-		return 0, nil
+		if store, ok := d.Repo.(vkmNoRecordStore); ok {
+			_ = store.MarkVKMNoRecords(ctx, d.ID, pipe, periodLabel, time.Now().Add(6*time.Hour))
+		}
+		return 0, archive.ErrVKMNoRecords
+	}
+	if store, ok := d.Repo.(vkmNoRecordStore); ok {
+		_ = store.ClearVKMNoRecords(ctx, d.ID, pipe, periodLabel)
 	}
 
 	// Сырую строку сохраняем отдельно от разобранных полей — она нужна
@@ -370,7 +389,6 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, pipe i
 	// байт) — northbound должен отдавать его в ЭС так же нетронуто, без
 	// собственных текстовых преобразований (strip_headers/expand_exponent/
 	// field_scale и т.п. — см. историю в vkm_config.go).
-	periodLabel := periodStart.Add(vkmArchivePeriod)
 	if err := d.Repo.SaveVKMRawString(ctx, d.ID, pipe, periodLabel, string(rec.Raw)); err != nil {
 		log.Printf("[%s] VKM трубопровод %d, период %s: ошибка сохранения сырой строки: %v\n",
 			d.ID, pipe, periodLabel.Format("02.01.2006 15:04"), err)
@@ -387,18 +405,71 @@ func (d *Device) collectVKMPeriod(ctx context.Context, a profile.Archive, pipe i
 // pollVKMHourlyLatest — обычный плановый опрос архива ВКМ (аналог часового
 // тика PollArchives у Акрона). Запрашивает последний ПОЛНОСТЬЮ завершённый
 // получасовой период.
-func (d *Device) pollVKMHourlyLatest(ctx context.Context, a profile.Archive) {
-	periodStart := time.Now().Truncate(vkmArchivePeriod).Add(-vkmArchivePeriod)
-	for _, pipe := range d.vkmActivePipes(ctx) {
-		saved, err := d.collectVKMPeriod(ctx, a, pipe, periodStart)
-		if err != nil {
-			log.Printf("[%s] VKM архив %s, трубопровод %d: период %s: ошибка: %v\n",
-				d.ID, a.ID, pipe, periodStart.Add(vkmArchivePeriod).Format("02.01.2006 15:04"), err)
-			continue
-		}
-		log.Printf("[%s] VKM архив %s, трубопровод %d: период %s: сохранено полей: %d/%d\n",
-			d.ID, a.ID, pipe, periodStart.Add(vkmArchivePeriod).Format("02.01.2006 15:04"), saved, len(vkmHourlyParams))
+type vkmCatchUpMissingFunc func(ctx context.Context, pipe int, from, to time.Time) ([]time.Time, error)
+type vkmCatchUpCollectFunc func(ctx context.Context, pipe int, periodStart time.Time) (int, error)
+
+// runVKMCatchUpAt contains the scheduler catch-up policy independently from
+// physical I/O, making delayed-tick/no-record behaviour regression-testable.
+func runVKMCatchUpAt(ctx context.Context, now time.Time, depthHours int, pipes []int, missingFn vkmCatchUpMissingFunc, collectFn vkmCatchUpCollectFunc) error {
+	if depthHours <= 0 {
+		depthHours = vkmDefaultBackfillDepthHours
 	}
+	last := now.Truncate(vkmArchivePeriod).Add(-vkmArchivePeriod)
+	from := last.Add(-time.Duration(depthHours*2-1) * vkmArchivePeriod)
+	for _, pipe := range pipes {
+		missing, err := missingFn(ctx, pipe, from, last)
+		if err != nil {
+			return err
+		}
+		for _, periodStart := range missing {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			_, err := collectFn(ctx, pipe, periodStart)
+			if err != nil && !errors.Is(err, archive.ErrVKMNoRecords) {
+				// One bad period must not make later missing periods disappear.
+				continue
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+	}
+	return nil
+}
+
+// pollVKMHourlyLatest is now a bounded catch-up pass. A delayed scheduler tick
+// therefore reads every missing completed half-hour in the configured depth,
+// rather than only whichever period happens to be "latest" when it finally runs.
+func (d *Device) pollVKMHourlyLatest(ctx context.Context, a profile.Archive) {
+	depthHours := d.BackfillMaxDepthHours
+	if depthHours <= 0 {
+		depthHours = vkmDefaultBackfillDepthHours
+	}
+	pipes := d.vkmActivePipes(ctx)
+	_ = runVKMCatchUpAt(ctx, time.Now(), depthHours, pipes,
+		func(ctx context.Context, pipe int, from, to time.Time) ([]time.Time, error) {
+			return missingVKMPeriods(ctx, d.Repo, d.ID, pipe, from, to)
+		},
+		func(ctx context.Context, pipe int, periodStart time.Time) (int, error) {
+			saved, err := d.collectVKMPeriod(ctx, a, pipe, periodStart)
+			if err != nil {
+				if errors.Is(err, archive.ErrVKMNoRecords) {
+					dbg.Printf("[%s] VKM архив %s, трубопровод %d: период %s: прибор подтвердил отсутствие записи\n",
+						d.ID, a.ID, pipe, periodStart.Add(vkmArchivePeriod).Format("02.01.2006 15:04"))
+				} else {
+					log.Printf("[%s] VKM архив %s, трубопровод %d: период %s: ошибка: %v\n",
+						d.ID, a.ID, pipe, periodStart.Add(vkmArchivePeriod).Format("02.01.2006 15:04"), err)
+				}
+				return saved, err
+			}
+			log.Printf("[%s] VKM архив %s, трубопровод %d: период %s: сохранено полей: %d/%d\n",
+				d.ID, a.ID, pipe, periodStart.Add(vkmArchivePeriod).Format("02.01.2006 15:04"), saved, len(vkmHourlyParams))
+			return saved, nil
+		},
+	)
 }
 
 // missingVKMPeriods находит получасовые периоды в [from, to] (from/to —
@@ -438,9 +509,19 @@ func missingVKMPeriods(ctx context.Context, repo storage.Repo, deviceID string, 
 	var missing []time.Time
 	for t := from; !t.After(to); t = t.Add(vkmArchivePeriod) {
 		label := t.Add(vkmArchivePeriod)
-		if !present[label.Unix()] {
-			missing = append(missing, t)
+		if present[label.Unix()] {
+			continue
 		}
+		if store, ok := repo.(vkmNoRecordStore); ok {
+			suppressed, err := store.VKMNoRecordsSuppressed(ctx, deviceID, pipe, label, time.Now())
+			if err != nil {
+				return nil, err
+			}
+			if suppressed {
+				continue
+			}
+		}
+		missing = append(missing, t)
 	}
 	return missing, nil
 }
@@ -488,8 +569,13 @@ func (d *Device) backfillVKMHourly(ctx context.Context, a profile.Archive, opts 
 
 			saved, err := d.collectVKMPeriod(ctx, a, pipe, period)
 			if err != nil {
-				log.Printf("[%s] VKM дозабор %s, трубопровод %d: период %s: ошибка: %v\n",
-					d.ID, a.ID, pipe, period.Add(vkmArchivePeriod).Format("02.01.2006 15:04"), err)
+				if errors.Is(err, archive.ErrVKMNoRecords) {
+					dbg.Printf("[%s] VKM дозабор %s, трубопровод %d: период %s: прибор подтвердил отсутствие записи\n",
+						d.ID, a.ID, pipe, period.Add(vkmArchivePeriod).Format("02.01.2006 15:04"))
+				} else {
+					log.Printf("[%s] VKM дозабор %s, трубопровод %d: период %s: ошибка: %v\n",
+						d.ID, a.ID, pipe, period.Add(vkmArchivePeriod).Format("02.01.2006 15:04"), err)
+				}
 				continue
 			}
 			if saved > 0 {

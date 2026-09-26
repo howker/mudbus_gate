@@ -2,11 +2,45 @@ package device
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"time"
 
+	"mbgw/internal/archive"
 	"mbgw/internal/profile"
 )
+
+type vkmForceCollectFunc func(ctx context.Context, pipe int, periodStart time.Time) (int, error)
+
+func forceReloadVKMPeriods(ctx context.Context, pipes []int, from, to time.Time, collect vkmForceCollectFunc, onProgress func(done, total int)) (int, error) {
+	periodStart := from.Truncate(vkmArchivePeriod)
+	periods := int(to.Sub(periodStart)/vkmArchivePeriod) + 1
+	if periods < 0 {
+		periods = 0
+	}
+	totalRequests := periods * len(pipes)
+	totalSaved := 0
+	doneCount := 0
+	for !periodStart.After(to) {
+		for _, pipe := range pipes {
+			if err := ctx.Err(); err != nil {
+				return totalSaved, err
+			}
+			saved, err := collect(ctx, pipe, periodStart)
+			if err != nil && !errors.Is(err, archive.ErrVKMNoRecords) {
+				return totalSaved, fmt.Errorf("трубопровод %d, период %s: ошибка чтения у прибора: %w", pipe, periodStart.Format("02.01.2006 15:04"), err)
+			}
+			totalSaved += saved
+			doneCount++
+			if onProgress != nil {
+				onProgress(doneCount, totalRequests)
+			}
+		}
+		periodStart = periodStart.Add(vkmArchivePeriod)
+	}
+	return totalSaved, nil
+}
 
 // ForceReloadVKMHourly принудительно перечитывает архив ВКМ у самого
 // прибора за период [from, to] и ПЕРЕЗАПИСЫВАЕТ уже сохранённые записи —
@@ -47,36 +81,13 @@ func (d *Device) ForceReloadVKMHourly(ctx context.Context, from, to time.Time, o
 		to = lastCompletedPeriodStart
 	}
 
-	periodStart := from.Truncate(vkmArchivePeriod)
-	periods := int(to.Sub(periodStart)/vkmArchivePeriod) + 1
-	if periods < 0 {
-		periods = 0
-	}
 	pipes := d.vkmActivePipes(ctx)
-	totalRequests := periods * len(pipes)
-
-	totalSaved := 0
-	doneCount := 0
-	for !periodStart.After(to) {
-		for _, pipe := range pipes {
-			select {
-			case <-ctx.Done():
-				return totalSaved, ctx.Err()
-			default:
-			}
-
-			saved, err := d.collectVKMPeriod(ctx, a, pipe, periodStart)
-			if err != nil {
-				return totalSaved, fmt.Errorf("трубопровод %d, период %s: ошибка чтения у прибора: %w", pipe, periodStart.Format("02.01.2006 15:04"), err)
-			}
-			totalSaved += saved
-			doneCount++
-			if onProgress != nil {
-				onProgress(doneCount, totalRequests)
-			}
+	return forceReloadVKMPeriods(ctx, pipes, from, to, func(ctx context.Context, pipe int, periodStart time.Time) (int, error) {
+		saved, err := d.collectVKMPeriod(ctx, a, pipe, periodStart)
+		if errors.Is(err, archive.ErrVKMNoRecords) {
+			log.Printf("[%s] VKM принудительный переопрос: трубопровод %d, период %s — прибор подтвердил отсутствие записи; переопрос продолжается\n",
+				d.ID, pipe, periodStart.Format("02.01.2006 15:04"))
 		}
-		periodStart = periodStart.Add(vkmArchivePeriod)
-	}
-
-	return totalSaved, nil
+		return saved, err
+	}, onProgress)
 }

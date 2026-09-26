@@ -139,48 +139,51 @@ func TestVKMRawChangeQueuesImmediateDirtySignal(t *testing.T) {
 	}
 }
 
-func TestDirtyRangesMergeOverlappingArchivePeriods(t *testing.T) {
+func TestDirtyRangesStayBoundedAndDoNotMergeAdjacentPeriods(t *testing.T) {
 	ctx := context.Background()
 	r := newTestRepo(t)
 
 	t13 := time.Date(2026, 9, 24, 13, 0, 0, 0, time.UTC)
-	save := func(ts time.Time, value float64) {
-		t.Helper()
+	for i := 0; i < 3; i++ {
 		if err := r.SaveHourlyArchive(ctx, storage.HourlyArchiveRecord{
-			DeviceID: "akron_merge",
-			Param:    "V",
-			TsHour:   ts,
-			Value:    value,
-			Unit:     "m3",
+			DeviceID: "akron_ranges", Param: "V", TsHour: t13.Add(time.Duration(i) * time.Hour), Value: 100 + float64(i), Unit: "m3",
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-
-	// Each save marks [ts, ts+1h]. Touching ranges must collapse into one
-	// durable interval, so a long backfill does not create thousands of rows.
-	save(t13, 100)
-	save(t13.Add(time.Hour), 110)
-	save(t13.Add(2*time.Hour), 120)
-
-	ranges, err := r.ListESDirtyRanges(ctx, "akron_merge", 10)
+	ranges, err := r.ListESDirtyRanges(ctx, "akron_ranges", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ranges) != 1 {
-		t.Fatalf("want one merged range, got %d: %#v", len(ranges), ranges)
+	if len(ranges) != 3 {
+		t.Fatalf("adjacent periods must stay separate, got %d: %#v", len(ranges), ranges)
 	}
-	if !ranges[0].From.Equal(t13) || !ranges[0].To.Equal(t13.Add(3*time.Hour)) {
-		t.Fatalf("unexpected merged bounds: %#v", ranges[0])
+	for _, dr := range ranges {
+		if dr.To.Sub(dr.From) > esDirtyMaxRangeDuration {
+			t.Fatalf("oversized range: %#v", dr)
+		}
 	}
+}
 
-	// A genuinely disjoint repair stays separate.
-	save(t13.Add(5*time.Hour), 150)
-	ranges, err = r.ListESDirtyRanges(ctx, "akron_merge", 10)
+func TestOldLongDirtyRangeIsSplitBeforeFirstPass(t *testing.T) {
+	ctx := context.Background()
+	r := newTestRepo(t)
+	from := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
+	to := from.Add(3 * 24 * time.Hour)
+	if _, err := r.db.ExecContext(ctx, `INSERT INTO es_dirty_ranges(device_id,from_ts,to_ts,version,queued_at) VALUES(?,?,?,?,?)`,
+		"legacy-long", from, to, 7, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	ranges, err := r.ListESDirtyRanges(ctx, "legacy-long", 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ranges) != 2 {
-		t.Fatalf("want two disjoint ranges, got %d: %#v", len(ranges), ranges)
+	if len(ranges) <= 1 {
+		t.Fatalf("legacy long range was not split: %#v", ranges)
+	}
+	for _, dr := range ranges {
+		if dr.To.Sub(dr.From) > esDirtyMaxRangeDuration {
+			t.Fatalf("split chunk still too large: %#v", dr)
+		}
 	}
 }

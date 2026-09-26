@@ -894,43 +894,15 @@ func (d *Device) PollArchives(ctx context.Context) {
 		// завершившийся календарный час через TIME-доступ. Это тот же контракт,
 		// который уже используется принудительным переопросом диапазона.
 		if a.Strategy == "mb_func65" {
-			now := time.Now()
-			wantedHour := func65WallClockHour(now)
-			query := func65LatestQueryAt(d, a, now)
-
-			release, leaseErr := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
-			if leaseErr != nil {
-				log.Printf("[%s] архив %s: не удалось занять прибор: %v\n", d.ID, a.ID, leaseErr)
-				continue
+			// Scheduled function-65 polling is a bounded catch-up, not a single
+			// "latest hour" read. If the scheduler ran late or the bus was busy,
+			// every missing completed storage hour inside the configured depth is
+			// retried. backfillFunc65Hourly releases the lease between hours.
+			depth := d.BackfillMaxDepthHours
+			if depth <= 0 || depth > 24 {
+				depth = 24
 			}
-			records, readErr := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, query)
-			release()
-			if readErr != nil {
-				log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: ошибка чтения часа %s: %v\n", d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"), readErr)
-				continue
-			}
-
-			matched := make([]archive.ArchiveRecord, 0, len(records))
-			for _, rec := range records {
-				if err := validateFunc65Record(rec); err != nil {
-					log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: некорректная запись: %v\n", d.ID, a.ID, err)
-					continue
-				}
-				gotHour := func65WallClockHour(func65StorageHour(a, rec.RecordTS))
-				if !gotHour.Equal(wantedHour) {
-					log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: при запросе часа %s прибор вернул запись за %s; запись не сохранена\n",
-						d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"), gotHour.Format("02.01.2006 15:04"))
-					continue
-				}
-				matched = append(matched, rec)
-			}
-
-			saved := persistFunc65Hourly(ctx, d.Repo, d.ID, a, matched)
-			if saved > 0 {
-				health.MarkArchiveSuccess(d.ID, time.Now())
-			}
-			log.Printf("[%s] архив %s ИВК/ВЗЛЁТ: запрошен час %s, получено записей %d, сохранено полей %d\n",
-				d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"), len(records), saved)
+			d.backfillFunc65Hourly(ctx, a, BackfillOptions{MaxDepthHours: depth})
 			continue
 		}
 

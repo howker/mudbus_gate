@@ -1,10 +1,12 @@
 package merkuriy
-import (
-"context"
-"fmt"
 
-"mbgw/internal/protocol/modbus"
-"mbgw/internal/transport"
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"mbgw/internal/protocol/modbus"
+	"mbgw/internal/transport"
 )
 
 // Transact sends a Merkuriy frame through the given (already-open)
@@ -14,52 +16,89 @@ import (
 // transports; for TCP/optical transports the same Send/Receive contract
 // applies uniformly.
 func Transact(ctx context.Context, tr transport.Transport, frame []byte) ([]byte, error) {
-    if tr == nil {
-        return nil, fmt.Errorf("nil transport")
-    }
-    if err := tr.Send(ctx, frame); err != nil {
-        return nil, err
-    }
-    timeout := tr.Info().ResponseTimeout
-    return tr.Receive(ctx, timeout)
+	if tr == nil {
+		return nil, fmt.Errorf("nil transport")
+	}
+	if len(frame) < 3 {
+		return nil, fmt.Errorf("merkuriy request frame too short")
+	}
+	if err := transport.ResetInputBuffer(tr); err != nil {
+		return nil, fmt.Errorf("reset input buffer: %w", err)
+	}
+	if err := tr.Send(ctx, frame); err != nil {
+		return nil, err
+	}
+	timeout := tr.Info().ResponseTimeout
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	wantAddr := frame[0]
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("merkuriy response deadline exceeded")
+		}
+		resp, err := tr.Receive(ctx, remaining)
+		if err != nil {
+			return nil, err
+		}
+		addr, _, err := ParseResponse(resp)
+		if err != nil {
+			return nil, err
+		}
+		if addr != wantAddr {
+			// Delayed response from another meter on the shared bus.
+			continue
+		}
+		return resp, nil
+	}
 }
+
 // BuildFrame builds a Merkuriy channel frame:
 // [addr 1B][code 1B][param 0..1B][ext 0..1B][data N][CRC16-modbus 2B]
 func BuildFrame(addr byte, code byte, payload []byte) []byte {
-body := make([]byte, 0, 2+len(payload)+2)
-body = append(body, addr, code)
-body = append(body, payload...)
-crc := modbus.CRC16(body)
-body = append(body, byte(crc&0xFF), byte(crc>>8))
-return body
+	body := make([]byte, 0, 2+len(payload)+2)
+	body = append(body, addr, code)
+	body = append(body, payload...)
+	crc := modbus.CRC16(body)
+	body = append(body, byte(crc&0xFF), byte(crc>>8))
+	return body
 }
+
 // ParseFrame validates CRC and returns addr, code, data (without CRC).
 func ParseFrame(frame []byte) (addr byte, code byte, data []byte, err error) {
-if len(frame) < 4 {
-return 0, 0, nil, fmt.Errorf("merkuriy frame too short")
+	if len(frame) < 4 {
+		return 0, 0, nil, fmt.Errorf("merkuriy frame too short")
+	}
+	body := frame[:len(frame)-2]
+	calcCRC := modbus.CRC16(body)
+	frameCRC := uint16(frame[len(frame)-2]) | (uint16(frame[len(frame)-1]) << 8)
+	if calcCRC != frameCRC {
+		return 0, 0, nil, fmt.Errorf("invalid CRC")
+	}
+	return frame[0], frame[1], frame[2 : len(frame)-2], nil
 }
-body := frame[:len(frame)-2]
-calcCRC := modbus.CRC16(body)
-frameCRC := uint16(frame[len(frame)-2]) | (uint16(frame[len(frame)-1]) << 8)
-if calcCRC != frameCRC {
-return 0, 0, nil, fmt.Errorf("invalid CRC")
-}
-return frame[0], frame[1], frame[2 : len(frame)-2], nil
-}
+
 // BuildTestLink builds cmd 0x00 test-link frame (addr).
 func BuildTestLink(addr byte) []byte {
-return BuildFrame(addr, 0x00, nil)
+	return BuildFrame(addr, 0x00, nil)
 }
+
 // BuildOpenChannel builds cmd 0x01 open-channel frame: addr, level, 6-byte password.
 func BuildOpenChannel(addr byte, level byte, password [6]byte) []byte {
-payload := make([]byte, 0, 7)
-payload = append(payload, level)
-payload = append(payload, password[:]...)
-return BuildFrame(addr, 0x01, payload)
+	payload := make([]byte, 0, 7)
+	payload = append(payload, level)
+	payload = append(payload, password[:]...)
+	return BuildFrame(addr, 0x01, payload)
 }
+
 // BuildCloseChannel builds cmd 0x02 close-channel frame.
 func BuildCloseChannel(addr byte) []byte {
-return BuildFrame(addr, 0x02, nil)
+	return BuildFrame(addr, 0x02, nil)
 }
 
 // BuildReadRelative builds a command 0x16 "relative addressing mode" read
@@ -74,7 +113,8 @@ return BuildFrame(addr, 0x02, nil)
 // Wire format: [addr 1B][code=0x16][memNumber 1B][offset 2B big-endian]
 // [count 1B][CRC16-modbus 2B]. Golden vector (section 4.6 worked example,
 // device addr 0x80, memory #3, offset 1, 1 record):
-//   80 16 03 00 01 01 96 0C
+//
+//	80 16 03 00 01 01 96 0C
 //
 // NOTE: this builds a COMPLETE frame (address+CRC included) - correct
 // only for direct raw-transport calls like MerkuriySession's own
@@ -86,9 +126,9 @@ return BuildFrame(addr, 0x02, nil)
 // double-frames the request and silently breaks on the wire (this bit
 // the archive strategy in exactly this way; see BuildReadRelativePDU).
 func BuildReadRelative(addr byte, memNumber byte, offset uint16, count byte) []byte {
-    payload := make([]byte, 0, 4)
-    payload = append(payload, memNumber, byte(offset>>8), byte(offset&0xFF), count)
-    return BuildFrame(addr, 0x16, payload)
+	payload := make([]byte, 0, 4)
+	payload = append(payload, memNumber, byte(offset>>8), byte(offset&0xFF), count)
+	return BuildFrame(addr, 0x16, payload)
 }
 
 // BuildReadRelativePDU builds the bare PDU (no address, no CRC) for a
@@ -96,7 +136,7 @@ func BuildReadRelative(addr byte, memNumber byte, offset uint16, count byte) []b
 // which adds address+CRC itself (RTU framing) exactly once. See
 // BuildReadRelative's doc comment for why this distinction matters.
 func BuildReadRelativePDU(memNumber byte, offset uint16, count byte) []byte {
-    return []byte{0x16, memNumber, byte(offset >> 8), byte(offset & 0xFF), count}
+	return []byte{0x16, memNumber, byte(offset >> 8), byte(offset & 0xFF), count}
 }
 
 // ParseResponse validates CRC and returns addr and the full data field of
@@ -114,14 +154,14 @@ func BuildReadRelativePDU(memNumber byte, offset uint16, count byte) []byte {
 // field by one byte. Use ParseResponse for those; ParseFrame remains as-is
 // for the three channel-control commands it already correctly serves.
 func ParseResponse(frame []byte) (addr byte, data []byte, err error) {
-    if len(frame) < 3 {
-        return 0, nil, fmt.Errorf("merkuriy response too short")
-    }
-    body := frame[:len(frame)-2]
-    calcCRC := modbus.CRC16(body)
-    frameCRC := uint16(frame[len(frame)-2]) | (uint16(frame[len(frame)-1]) << 8)
-    if calcCRC != frameCRC {
-        return 0, nil, fmt.Errorf("invalid CRC")
-    }
-    return frame[0], frame[1 : len(frame)-2], nil
+	if len(frame) < 3 {
+		return 0, nil, fmt.Errorf("merkuriy response too short")
+	}
+	body := frame[:len(frame)-2]
+	calcCRC := modbus.CRC16(body)
+	frameCRC := uint16(frame[len(frame)-2]) | (uint16(frame[len(frame)-1]) << 8)
+	if calcCRC != frameCRC {
+		return 0, nil, fmt.Errorf("invalid CRC")
+	}
+	return frame[0], frame[1 : len(frame)-2], nil
 }

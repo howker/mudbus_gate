@@ -2,10 +2,12 @@ package device
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"mbgw/internal/archive"
+	"mbgw/internal/lease"
 )
 
 func discoveryStatusMap(results []VKMPipeDiscoveryResult) map[int]string {
@@ -102,5 +104,43 @@ func TestDiscoverVKMPipesCapacityTen(t *testing.T) {
 		if result.Status != VKMPipeDiscoveryAvailable {
 			t.Fatalf("pipe%d=%q, want available", result.PipeNo, result.Status)
 		}
+	}
+}
+
+func TestDiscoveryReleasesLeaseBetweenPipesSoScheduledPollCanInterleave(t *testing.T) {
+	ctx := context.Background()
+	l := lease.New()
+	const deviceID = "vkm-lease"
+	scheduledAcquired := false
+
+	_, err := discoverVKMPipesWithLeaseAt(ctx, time.Date(2026, 9, 26, 10, 5, 0, 0, time.Local),
+		func(ctx context.Context, pipe int) (func(), error) {
+			release, err := l.Acquire(ctx, deviceID, fmt.Sprintf("discovery-%d", pipe), time.Minute)
+			if err != nil {
+				return nil, err
+			}
+			return func() {
+				release()
+				if pipe == 1 {
+					scheduledRelease, schedErr := l.Acquire(ctx, deviceID, "scheduled-archive-xx05", time.Minute)
+					if schedErr != nil {
+						t.Fatalf("scheduled poll could not interleave between pipes: %v", schedErr)
+					}
+					scheduledAcquired = true
+					scheduledRelease()
+				}
+			}, nil
+		},
+		func(_ context.Context, pipe int, _ time.Time) (string, error) {
+			if pipe <= 2 {
+				return fmt.Sprintf("pipe%d", pipe), nil
+			}
+			return "", archive.ErrVKMInvalidPipe
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !scheduledAcquired {
+		t.Fatal("scheduled poll never acquired lease between discovery pipes")
 	}
 }

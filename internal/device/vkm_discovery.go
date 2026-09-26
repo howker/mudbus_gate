@@ -38,63 +38,73 @@ type vkmDiscoveryReadFunc func(ctx context.Context, pipe int, periodStart time.T
 // explicit protocol status "invalid pipe number" proves absence. "No records"
 // causes one retry against the adjacent previous completed period; if both are
 // empty the result stays uncertain rather than disabling anything.
-func discoverVKMPipesAt(ctx context.Context, now time.Time, read vkmDiscoveryReadFunc) ([]VKMPipeDiscoveryResult, error) {
+func discoverOneVKMPipeAt(ctx context.Context, now time.Time, pipe int, read vkmDiscoveryReadFunc) (VKMPipeDiscoveryResult, error) {
 	latest := now.Truncate(vkmArchivePeriod).Add(-vkmArchivePeriod)
 	previous := latest.Add(-vkmArchivePeriod)
-	results := make([]VKMPipeDiscoveryResult, 0, vkmMaxPipe-vkmMinPipe+1)
-
-	for pipe := vkmMinPipe; pipe <= vkmMaxPipe; pipe++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-
-		raw, err := read(ctx, pipe, latest)
-		switch {
-		case err == nil:
-			results = append(results, VKMPipeDiscoveryResult{
-				PipeNo: pipe,
-				Status: VKMPipeDiscoveryAvailable,
-				Detail: fmt.Sprintf("архив ответил за период до %s", latest.Add(vkmArchivePeriod).Format("02.01.2006 15:04")),
-				Raw:    raw,
-			})
-			continue
-		case errors.Is(err, archive.ErrVKMInvalidPipe):
-			results = append(results, VKMPipeDiscoveryResult{PipeNo: pipe, Status: VKMPipeDiscoveryAbsent, Detail: err.Error()})
-			continue
-		case errors.Is(err, archive.ErrVKMNoRecords):
-			// An empty latest period proves nothing about pipe existence. Retry
-			// the adjacent completed period before calling the result uncertain.
-		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-			return nil, err
-		default:
-			results = append(results, VKMPipeDiscoveryResult{PipeNo: pipe, Status: VKMPipeDiscoveryError, Detail: err.Error()})
-			continue
-		}
-
-		raw, err = read(ctx, pipe, previous)
-		switch {
-		case err == nil:
-			results = append(results, VKMPipeDiscoveryResult{
-				PipeNo: pipe,
-				Status: VKMPipeDiscoveryAvailable,
-				Detail: fmt.Sprintf("архив ответил за предыдущий период до %s", previous.Add(vkmArchivePeriod).Format("02.01.2006 15:04")),
-				Raw:    raw,
-			})
-		case errors.Is(err, archive.ErrVKMInvalidPipe):
-			results = append(results, VKMPipeDiscoveryResult{PipeNo: pipe, Status: VKMPipeDiscoveryAbsent, Detail: err.Error()})
-		case errors.Is(err, archive.ErrVKMNoRecords):
-			results = append(results, VKMPipeDiscoveryResult{
-				PipeNo: pipe,
-				Status: VKMPipeDiscoveryUncertain,
-				Detail: "нет записей в двух соседних завершённых периодах",
-			})
-		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-			return nil, err
-		default:
-			results = append(results, VKMPipeDiscoveryResult{PipeNo: pipe, Status: VKMPipeDiscoveryError, Detail: err.Error()})
-		}
+	if err := ctx.Err(); err != nil {
+		return VKMPipeDiscoveryResult{}, err
 	}
 
+	raw, err := read(ctx, pipe, latest)
+	switch {
+	case err == nil:
+		return VKMPipeDiscoveryResult{PipeNo: pipe, Status: VKMPipeDiscoveryAvailable,
+			Detail: fmt.Sprintf("архив ответил за период до %s", latest.Add(vkmArchivePeriod).Format("02.01.2006 15:04")), Raw: raw}, nil
+	case errors.Is(err, archive.ErrVKMInvalidPipe):
+		return VKMPipeDiscoveryResult{PipeNo: pipe, Status: VKMPipeDiscoveryAbsent, Detail: err.Error()}, nil
+	case errors.Is(err, archive.ErrVKMNoRecords):
+		// Retry adjacent completed period while still holding this pipe's lease.
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return VKMPipeDiscoveryResult{}, err
+	default:
+		return VKMPipeDiscoveryResult{PipeNo: pipe, Status: VKMPipeDiscoveryError, Detail: err.Error()}, nil
+	}
+
+	raw, err = read(ctx, pipe, previous)
+	switch {
+	case err == nil:
+		return VKMPipeDiscoveryResult{PipeNo: pipe, Status: VKMPipeDiscoveryAvailable,
+			Detail: fmt.Sprintf("архив ответил за предыдущий период до %s", previous.Add(vkmArchivePeriod).Format("02.01.2006 15:04")), Raw: raw}, nil
+	case errors.Is(err, archive.ErrVKMInvalidPipe):
+		return VKMPipeDiscoveryResult{PipeNo: pipe, Status: VKMPipeDiscoveryAbsent, Detail: err.Error()}, nil
+	case errors.Is(err, archive.ErrVKMNoRecords):
+		return VKMPipeDiscoveryResult{PipeNo: pipe, Status: VKMPipeDiscoveryUncertain,
+			Detail: "нет записей в двух соседних завершённых периодах"}, nil
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return VKMPipeDiscoveryResult{}, err
+	default:
+		return VKMPipeDiscoveryResult{PipeNo: pipe, Status: VKMPipeDiscoveryError, Detail: err.Error()}, nil
+	}
+}
+
+func discoverVKMPipesAt(ctx context.Context, now time.Time, read vkmDiscoveryReadFunc) ([]VKMPipeDiscoveryResult, error) {
+	results := make([]VKMPipeDiscoveryResult, 0, vkmMaxPipe-vkmMinPipe+1)
+	for pipe := vkmMinPipe; pipe <= vkmMaxPipe; pipe++ {
+		res, err := discoverOneVKMPipeAt(ctx, now, pipe, read)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, res)
+	}
+	return results, nil
+}
+
+type vkmDiscoveryAcquireFunc func(ctx context.Context, pipe int) (func(), error)
+
+func discoverVKMPipesWithLeaseAt(ctx context.Context, now time.Time, acquire vkmDiscoveryAcquireFunc, read vkmDiscoveryReadFunc) ([]VKMPipeDiscoveryResult, error) {
+	results := make([]VKMPipeDiscoveryResult, 0, vkmMaxPipe-vkmMinPipe+1)
+	for pipe := vkmMinPipe; pipe <= vkmMaxPipe; pipe++ {
+		release, err := acquire(ctx, pipe)
+		if err != nil {
+			return nil, err
+		}
+		res, probeErr := discoverOneVKMPipeAt(ctx, now, pipe, read)
+		release() // mandatory yield point before the next pipe
+		if probeErr != nil {
+			return nil, probeErr
+		}
+		results = append(results, res)
+	}
 	return results, nil
 }
 
@@ -118,25 +128,22 @@ func (d *Device) DiscoverVKMPipes(ctx context.Context) ([]VKMPipeDiscoveryResult
 	}
 	a := d.Profile.Archives[archiveIndex]
 
-	// Hold one logical device lease for the whole scan. Without this, a
-	// scheduled poll could slip between two pipe probes and turn a perfectly
-	// healthy pipe into a transient "lease busy" discovery result. The normal
-	// physical-I/O lock still serializes access with other devices sharing the
-	// same COM/TCP-serial channel.
-	release, err := d.acquireLeaseWithRetry(ctx, "vkm_pipe_discovery", 3*time.Minute)
-	if err != nil {
-		return nil, fmt.Errorf("сканирование трубопроводов: %w", err)
-	}
-	defer release()
-
-	return discoverVKMPipesAt(ctx, time.Now(), func(readCtx context.Context, pipe int, periodStart time.Time) (string, error) {
-		rec, found, err := d.readVKMPeriodUnlocked(readCtx, a, pipe, periodStart)
-		if err != nil {
-			return "", err
-		}
-		if !found {
-			return "", archive.ErrVKMNoRecords
-		}
-		return string(rec.Raw), nil
-	})
+	return discoverVKMPipesWithLeaseAt(ctx, time.Now(),
+		func(acquireCtx context.Context, pipe int) (func(), error) {
+			release, err := d.acquireLeaseWithRetry(acquireCtx, fmt.Sprintf("vkm_pipe_discovery_%d", pipe), 45*time.Second)
+			if err != nil {
+				return nil, fmt.Errorf("сканирование трубопровода %d: %w", pipe, err)
+			}
+			return release, nil
+		},
+		func(readCtx context.Context, pipe int, periodStart time.Time) (string, error) {
+			rec, found, err := d.readVKMPeriodUnlocked(readCtx, a, pipe, periodStart)
+			if err != nil {
+				return "", err
+			}
+			if !found {
+				return "", archive.ErrVKMNoRecords
+			}
+			return string(rec.Raw), nil
+		})
 }

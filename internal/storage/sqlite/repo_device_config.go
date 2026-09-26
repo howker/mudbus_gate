@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -111,7 +112,7 @@ CREATE INDEX IF NOT EXISTS idx_device_time_corrections_device_time
 CREATE TABLE IF NOT EXISTS es_vkm_channels (
     device_id     TEXT NOT NULL,
     pipe_no       INTEGER NOT NULL DEFAULT 1 CHECK (pipe_no BETWEEN 1 AND 10),
-    slot_no       INTEGER NOT NULL CHECK (slot_no BETWEEN 1 AND 4),
+    slot_no       INTEGER NOT NULL CHECK (slot_no >= 1),
     source_tag    TEXT NOT NULL,
     es_channel_id INTEGER NOT NULL,
     factor        REAL NOT NULL DEFAULT 1.0,
@@ -226,7 +227,18 @@ func (r *Repo) migrateESVKMChannelsSchema(ctx context.Context) error {
 		return fmt.Errorf("close es_vkm_channels schema rows: %w", err)
 	}
 	if columnSet["pipe_no"] && columnSet["slot_no"] && columnSet["source_tag"] {
-		return nil
+		var createSQL string
+		if err := r.db.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type='table' AND name='es_vkm_channels'`).Scan(&createSQL); err != nil {
+			return fmt.Errorf("inspect es_vkm_channels create SQL: %w", err)
+		}
+		// D1-D3 already used pipe+slot columns but put the VKM-specific four-slot
+		// limit into the global table CHECK. Rebuild that already-migrated form
+		// too; CREATE TABLE IF NOT EXISTS cannot relax an existing CHECK.
+		normalizedSQL := strings.ToLower(strings.Join(strings.Fields(createSQL), " "))
+		if !strings.Contains(normalizedSQL, "slot_no between 1 and 4") {
+			return nil
+		}
+		return r.rebuildESVKMChannelsWithoutGlobalSlotCap(ctx)
 	}
 	if !columnSet["tag"] {
 		return fmt.Errorf("migrate es_vkm_channels: unsupported legacy schema")
@@ -262,14 +274,6 @@ ORDER BY device_id,
 		return fmt.Errorf("close legacy es_vkm_channels rows: %w", err)
 	}
 
-	counts := map[string]int{}
-	for _, v := range legacy {
-		counts[v.deviceID]++
-		if counts[v.deviceID] > 4 {
-			return fmt.Errorf("migrate es_vkm_channels: device %q has %d mappings; pipe 1 supports 4 slots", v.deviceID, counts[v.deviceID])
-		}
-	}
-
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("migrate es_vkm_channels begin: %w", err)
@@ -280,7 +284,7 @@ ORDER BY device_id,
 CREATE TABLE es_vkm_channels_new (
     device_id     TEXT NOT NULL,
     pipe_no       INTEGER NOT NULL DEFAULT 1 CHECK (pipe_no BETWEEN 1 AND 10),
-    slot_no       INTEGER NOT NULL CHECK (slot_no BETWEEN 1 AND 4),
+    slot_no       INTEGER NOT NULL CHECK (slot_no >= 1),
     source_tag    TEXT NOT NULL,
     es_channel_id INTEGER NOT NULL,
     factor        REAL NOT NULL DEFAULT 1.0,
@@ -311,6 +315,48 @@ VALUES (?, 1, ?, ?, ?, ?, ?, ?)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("migrate es_vkm_channels commit: %w", err)
+	}
+	return nil
+}
+
+func (r *Repo) rebuildESVKMChannelsWithoutGlobalSlotCap(ctx context.Context) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("rebuild es_vkm_channels begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `
+CREATE TABLE es_vkm_channels_new (
+    device_id     TEXT NOT NULL,
+    pipe_no       INTEGER NOT NULL DEFAULT 1 CHECK (pipe_no BETWEEN 1 AND 10),
+    slot_no       INTEGER NOT NULL CHECK (slot_no >= 1),
+    source_tag    TEXT NOT NULL,
+    es_channel_id INTEGER NOT NULL,
+    factor        REAL NOT NULL DEFAULT 1.0,
+    min_value     REAL NULL,
+    max_value     REAL NULL,
+    PRIMARY KEY (device_id, pipe_no, slot_no),
+    UNIQUE (device_id, es_channel_id)
+)`); err != nil {
+		return fmt.Errorf("create relaxed es_vkm_channels: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO es_vkm_channels_new
+    (device_id, pipe_no, slot_no, source_tag, es_channel_id, factor, min_value, max_value)
+SELECT device_id, pipe_no, slot_no, source_tag, es_channel_id, factor, min_value, max_value
+FROM es_vkm_channels
+`); err != nil {
+		return fmt.Errorf("copy relaxed es_vkm_channels: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DROP TABLE es_vkm_channels`); err != nil {
+		return fmt.Errorf("drop constrained es_vkm_channels: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `ALTER TABLE es_vkm_channels_new RENAME TO es_vkm_channels`); err != nil {
+		return fmt.Errorf("rename relaxed es_vkm_channels: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("rebuild es_vkm_channels commit: %w", err)
 	}
 	return nil
 }
@@ -714,7 +760,7 @@ WHERE es_channel_id IN (%s) AND device_id != ?
 // set before a transaction starts. Keeping validation outside the transaction
 // lets SetVKMChannelsAndActivePipes update both channel mappings and the active
 // pipe list atomically without duplicating the mapping rules.
-func normalizeVKMChannels(deviceID string, rows []VKMChannelRecord) ([]VKMChannelRecord, error) {
+func normalizeVKMChannels(deviceID string, rows []VKMChannelRecord, maxSlotsPerPipe int) ([]VKMChannelRecord, error) {
 	if deviceID == "" {
 		return nil, fmt.Errorf("set vkm channels: device id is empty")
 	}
@@ -733,13 +779,16 @@ func normalizeVKMChannels(deviceID string, rows []VKMChannelRecord) ([]VKMChanne
 		}
 		if row.SlotNo == 0 {
 			slot := nextSlot[row.PipeNo] + 1
-			for slot <= 4 && usedSlot[[2]int{row.PipeNo, slot}] {
+			for usedSlot[[2]int{row.PipeNo, slot}] {
 				slot++
 			}
 			row.SlotNo = slot
 		}
-		if row.SlotNo < 1 || row.SlotNo > 4 {
-			return nil, fmt.Errorf("set vkm channels: pipe %d slot %d is outside 1..4", row.PipeNo, row.SlotNo)
+		if row.SlotNo < 1 {
+			return nil, fmt.Errorf("set vkm channels: pipe %d slot %d must be >= 1", row.PipeNo, row.SlotNo)
+		}
+		if maxSlotsPerPipe > 0 && row.SlotNo > maxSlotsPerPipe {
+			return nil, fmt.Errorf("set vkm channels: pipe %d slot %d is outside 1..%d", row.PipeNo, row.SlotNo, maxSlotsPerPipe)
 		}
 		key := [2]int{row.PipeNo, row.SlotNo}
 		if usedSlot[key] {
@@ -779,12 +828,35 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	return nil
 }
 
+func (r *Repo) vkmChannelSlotLimit(ctx context.Context, deviceID string) (int, error) {
+	var kind string
+	err := r.db.QueryRowContext(ctx, `SELECT kind FROM devices WHERE id = ?`, deviceID).Scan(&kind)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Legacy/tests may configure mappings before inserting a device.
+			// Keep the generic storage path permissive; the VKM-specific UI path
+			// below still enforces exactly four slots per pipe.
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read device kind for channel validation: %w", err)
+	}
+	if kind == "vkm360" {
+		return 4, nil
+	}
+	return 0, nil
+}
+
 // SetVKMChannels atomically replaces every mapping for a device.
-// PipeNo is 1..10 and SlotNo is 1..4. For backward compatibility with old
-// callers, zero PipeNo means pipe 1 and zero SlotNo is assigned to the next
-// free slot of that pipe in input order.
+// PipeNo is 1..10. VKM-360 is limited to four slots per pipe; other device
+// kinds (for example IVK-TER) may use additional sequential slots. For backward
+// compatibility, zero PipeNo means pipe 1 and zero SlotNo is assigned to the
+// next free slot of that pipe in input order.
 func (r *Repo) SetVKMChannels(ctx context.Context, deviceID string, rows []VKMChannelRecord) error {
-	normalized, err := normalizeVKMChannels(deviceID, rows)
+	limit, err := r.vkmChannelSlotLimit(ctx, deviceID)
+	if err != nil {
+		return err
+	}
+	normalized, err := normalizeVKMChannels(deviceID, rows, limit)
 	if err != nil {
 		return err
 	}
@@ -809,7 +881,7 @@ func (r *Repo) SetVKMChannels(ctx context.Context, deviceID string, rows []VKMCh
 // archive engine in one SQLite transaction, so an interrupted save can never
 // leave mappings and polling configuration describing different pipes.
 func (r *Repo) SetVKMChannelsAndActivePipes(ctx context.Context, deviceID string, rows []VKMChannelRecord, pipes []int) error {
-	normalizedChannels, err := normalizeVKMChannels(deviceID, rows)
+	normalizedChannels, err := normalizeVKMChannels(deviceID, rows, 4)
 	if err != nil {
 		return err
 	}

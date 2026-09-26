@@ -1318,6 +1318,60 @@ func healESDirtyRanges(ctx context.Context, repo *sqliterepo.Repo, writer insert
 	if writer == nil {
 		return stats, fmt.Errorf("запись в ЭС не подключена")
 	}
+	if limit <= 0 {
+		limit = 256
+	}
+
+	// Hard per-pass budget: healing must never monopolize the ES sync loop.
+	passDeadline := time.Now().Add(5 * time.Second)
+	opsLeft := limit * 4
+	if opsLeft < 64 {
+		opsLeft = 64
+	}
+
+	// Retry isolated poison points first, but with a small bounded slice of the
+	// overall budget. A bad ID_PP therefore stays visible/persistent without
+	// forcing every healthy range behind it to be scanned again.
+	failures, err := repo.ListESDirtyPointFailures(ctx, cfg.DeviceID, 64)
+	if err != nil {
+		return stats, err
+	}
+	for _, f := range failures {
+		if time.Now().After(passDeadline) || opsLeft <= 0 {
+			return stats, nil
+		}
+		opsLeft--
+		present, err := writer.PointExists(ctx, f.PointID, f.Ts)
+		if err == nil && present {
+			_ = repo.CompleteESDirtyPointFailure(ctx, f)
+			stats.Existing++
+			continue
+		}
+		if err == nil && !cfg.DryRun {
+			err = writer.InsertPoint(ctx, f.PointID, f.Ts, f.Value, f.State)
+			if err == nil || IsDuplicateKeyError(err) {
+				_ = repo.CompleteESDirtyPointFailure(ctx, f)
+				if err == nil {
+					stats.Inserted++
+					health.MarkESWriteSuccess(cfg.DeviceID, time.Now())
+				} else {
+					stats.Existing++
+				}
+				continue
+			}
+		}
+		stats.Failed++
+		msg := "dry-run: запись отложена"
+		if err != nil {
+			msg = err.Error()
+		}
+		_ = repo.RecordESDirtyPointFailure(ctx, sqliterepo.ESDirtyPointFailure{
+			DeviceID: cfg.DeviceID, PointID: f.PointID, Ts: f.Ts, Value: f.Value,
+			State: f.State, LastError: msg,
+		})
+		log.Printf("[синхронизация с ЭС] dirty-point АЛАРМ: ID_PP=%d %s, попыток=%d: %s\n",
+			f.PointID, f.Ts.Format("02.01 15:04"), f.Attempts+1, msg)
+	}
 
 	ranges, err := repo.ListESDirtyRanges(ctx, cfg.DeviceID, limit)
 	if err != nil {
@@ -1328,16 +1382,15 @@ func healESDirtyRanges(ctx context.Context, repo *sqliterepo.Repo, writer insert
 		if err := ctx.Err(); err != nil {
 			return stats, err
 		}
+		if time.Now().After(passDeadline) || opsLeft <= 0 {
+			break
+		}
 		stats.RangesChecked++
 
 		sourceFrom := dr.From
 		sourceTo := dr.To
 		switch cfg.Kind {
 		case "ivk-ter", "ivk_ter":
-			// archive_hourly keeps IVK calendar fields with Location=UTC,
-			// although they are local wall-clock. Rebuild the queue bounds
-			// in the server's wall-clock location before using the same
-			// collector as the normal ES path.
 			sourceFrom = wallClockInLocation(sourceFrom, time.Local)
 			sourceTo = wallClockInLocation(sourceTo, time.Local)
 		}
@@ -1352,10 +1405,11 @@ func healESDirtyRanges(ctx context.Context, repo *sqliterepo.Repo, writer insert
 
 		rangeDBOK := true
 		for _, r := range readings {
+			if time.Now().After(passDeadline) || opsLeft <= 0 {
+				return stats, nil
+			}
+			opsLeft--
 			if err := validatePointReading(r); err != nil {
-				// Invalid source data is not retried forever here. If the
-				// archive row is later repaired, Save* re-dirties this range;
-				// until then, refusing the write is the safe terminal action.
 				stats.Blocked++
 				log.Printf("[синхронизация с ЭС] dirty-range: БЛОКИРОВКА (%s ID_PP=%d %s): %v\n",
 					r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), err)
@@ -1363,45 +1417,44 @@ func healESDirtyRanges(ctx context.Context, repo *sqliterepo.Repo, writer insert
 			}
 
 			present, err := writer.PointExists(ctx, r.mapping.PointID, r.ts)
-			if err != nil {
-				stats.Failed++
-				rangeDBOK = false
-				log.Printf("[синхронизация с ЭС] dirty-range: проверка (%s ID_PP=%d %s): %v\n",
-					r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), err)
-				continue
-			}
-			if present {
-				// Never update an existing ES value automatically.
+			if err == nil && present {
 				stats.Existing++
 				continue
 			}
-
-			if cfg.DryRun {
+			if err == nil && cfg.DryRun {
+				stats.Failed++
 				rangeDBOK = false
-				log.Printf("[синхронизация с ЭС] dirty-range ПРОВЕРКА БЕЗ ЗАПИСИ — было бы добавлено: %s ID_PP=%d %s значение=%g\n",
-					r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01.2006 15:04"), r.value)
 				continue
 			}
-
-			if err := writer.InsertPoint(ctx, r.mapping.PointID, r.ts, r.value, 0); err != nil {
+			if err == nil {
+				err = writer.InsertPoint(ctx, r.mapping.PointID, r.ts, r.value, 0)
+				if err == nil {
+					stats.Inserted++
+					health.MarkESWriteSuccess(cfg.DeviceID, time.Now())
+					continue
+				}
 				if IsDuplicateKeyError(err) {
 					stats.Existing++
 					continue
 				}
-				stats.Failed++
-				rangeDBOK = false
-				log.Printf("[синхронизация с ЭС] dirty-range: вставка (%s ID_PP=%d %s): %v\n",
-					r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), err)
-				continue
 			}
-			stats.Inserted++
-			health.MarkESWriteSuccess(cfg.DeviceID, time.Now())
+
+			// Isolate a failing point. The source range can still close, while this
+			// exact point remains in a durable bounded retry/alarm queue.
+			stats.Failed++
+			if recErr := repo.RecordESDirtyPointFailure(ctx, sqliterepo.ESDirtyPointFailure{
+				DeviceID: cfg.DeviceID, PointID: r.mapping.PointID, Ts: r.ts,
+				Value: r.value, State: 0, LastError: err.Error(),
+			}); recErr != nil {
+				return stats, recErr
+			}
+			log.Printf("[синхронизация с ЭС] dirty-range: точка вынесена в отдельный retry/alarm (%s ID_PP=%d %s): %v\n",
+				r.mapping.Label, r.mapping.PointID, r.ts.Format("02.01 15:04"), err)
 		}
 
 		if !rangeDBOK {
 			continue
 		}
-
 		completed, err := repo.CompleteESDirtyRange(ctx, dr)
 		if err != nil {
 			stats.Failed++

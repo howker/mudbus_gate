@@ -133,9 +133,14 @@ func TestPoller_ArchiveTask_Dispatched(t *testing.T) {
 		},
 		Archives: []profile.Archive{
 			{
-				ID:       "hourly",
-				Strategy: "mb_func65",
-				Params:   map[string]any{"archive_type": 0},
+				ID:               "hourly",
+				Strategy:         "mb_func65",
+				Params:           map[string]any{"archive_type": 0},
+				BufferDepthHours: 1,
+				RecordLayout: []profile.RecordField{
+					{Offset: 0, Name: "archive_time", Type: "uint32", Epoch: "1970-01-01"},
+					{Offset: 4, Name: "v_plus", Type: "float", Unit: "m3"},
+				},
 			},
 		},
 	}

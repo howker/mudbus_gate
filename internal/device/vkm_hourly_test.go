@@ -2,6 +2,7 @@ package device
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -262,5 +263,69 @@ func TestVKMActivePipesReadsFreshConfiguration(t *testing.T) {
 	got = d.vkmActivePipes(ctx)
 	if len(got) != 2 || got[0] != 1 || got[1] != 2 {
 		t.Fatalf("active pipes after config change=%v, want [1 2] without restart", got)
+	}
+}
+
+func TestVKMCatchUpDelayedSeventyMinutesReadsAllMissingPeriodsOnAllPipes(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 26, 12, 10, 0, 0, time.Local)
+	want := []time.Time{
+		time.Date(2026, 9, 26, 10, 30, 0, 0, time.Local),
+		time.Date(2026, 9, 26, 11, 0, 0, 0, time.Local),
+		time.Date(2026, 9, 26, 11, 30, 0, 0, time.Local),
+	}
+	var got []string
+	err := runVKMCatchUpAt(ctx, now, 24, []int{1, 2},
+		func(_ context.Context, pipe int, from, to time.Time) ([]time.Time, error) {
+			if to != time.Date(2026, 9, 26, 11, 30, 0, 0, time.Local) {
+				t.Fatalf("last completed=%v", to)
+			}
+			return append([]time.Time(nil), want...), nil
+		},
+		func(_ context.Context, pipe int, periodStart time.Time) (int, error) {
+			got = append(got, fmt.Sprintf("%d/%s", pipe, periodStart.Format("15:04")))
+			return 1, nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want)*2 {
+		t.Fatalf("collected=%v, want %d periods", got, len(want)*2)
+	}
+	for i, pipe := range []int{1, 2} {
+		for j, period := range want {
+			wantKey := fmt.Sprintf("%d/%s", pipe, period.Format("15:04"))
+			if got[i*len(want)+j] != wantKey {
+				t.Fatalf("got[%d]=%q want %q (all=%v)", i*len(want)+j, got[i*len(want)+j], wantKey, got)
+			}
+		}
+	}
+}
+
+func TestMissingVKMPeriodsSkipsConfirmedNoRecordsUntilRetryTime(t *testing.T) {
+	d := newTestDeviceForVKM(t)
+	ctx := context.Background()
+	repo := d.Repo.(*sqlite.Repo)
+	start := time.Date(2026, 9, 26, 10, 0, 0, 0, time.Local)
+	label := start.Add(vkmArchivePeriod)
+	if err := repo.MarkVKMNoRecords(ctx, d.ID, 1, label, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	missing, err := missingVKMPeriods(ctx, d.Repo, d.ID, 1, start, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("confirmed no-record period must be suppressed, got %v", missing)
+	}
+	if err := repo.MarkVKMNoRecords(ctx, d.ID, 1, label, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	missing, err = missingVKMPeriods(ctx, d.Repo, d.ID, 1, start, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(missing) != 1 || !missing[0].Equal(start) {
+		t.Fatalf("expired no-record marker must permit rare retry, got %v", missing)
 	}
 }

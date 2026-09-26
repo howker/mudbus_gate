@@ -53,6 +53,19 @@ CREATE TABLE IF NOT EXISTS archive_vkm_raw (
     raw_string TEXT NOT NULL,
     PRIMARY KEY (device_id, pipe, ts_hour)
 );
+
+-- A meter can explicitly confirm that a valid pipe has no archive row for a
+-- period. Remember that terminal answer so regular catch-up does not hammer the
+-- same empty half-hour every scheduler tick. retry_after provides a rare
+-- recheck in case device history is later repaired.
+CREATE TABLE IF NOT EXISTS vkm_no_records (
+    device_id  TEXT NOT NULL,
+    pipe       INTEGER NOT NULL,
+    ts_hour    DATETIME NOT NULL,
+    confirmed_at DATETIME NOT NULL,
+    retry_after  DATETIME NOT NULL,
+    PRIMARY KEY (device_id, pipe, ts_hour)
+);
 `)
 	if err != nil {
 		return fmt.Errorf("init archive schema: %w", err)
@@ -61,6 +74,38 @@ CREATE TABLE IF NOT EXISTS archive_vkm_raw (
 		return err
 	}
 	return nil
+}
+
+// MarkVKMNoRecords records an explicit meter answer "no records" for one
+// period label (the end timestamp used by archive_vkm_raw).
+func (r *Repo) MarkVKMNoRecords(ctx context.Context, deviceID string, pipe int, ts time.Time, retryAfter time.Time) error {
+	_, err := r.db.ExecContext(ctx, `
+INSERT INTO vkm_no_records (device_id, pipe, ts_hour, confirmed_at, retry_after)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(device_id, pipe, ts_hour) DO UPDATE SET
+    confirmed_at=excluded.confirmed_at, retry_after=excluded.retry_after
+`, deviceID, pipe, ts, time.Now(), retryAfter)
+	if err != nil {
+		return fmt.Errorf("mark vkm no-records: %w", err)
+	}
+	return nil
+}
+
+func (r *Repo) VKMNoRecordsSuppressed(ctx context.Context, deviceID string, pipe int, ts, now time.Time) (bool, error) {
+	var retryAfter time.Time
+	err := r.db.QueryRowContext(ctx, `SELECT retry_after FROM vkm_no_records WHERE device_id=? AND pipe=? AND ts_hour=?`, deviceID, pipe, ts).Scan(&retryAfter)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read vkm no-records marker: %w", err)
+	}
+	return retryAfter.After(now), nil
+}
+
+func (r *Repo) ClearVKMNoRecords(ctx context.Context, deviceID string, pipe int, ts time.Time) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM vkm_no_records WHERE device_id=? AND pipe=? AND ts_hour=?`, deviceID, pipe, ts)
+	return err
 }
 
 // SaveHourlyArchive upserts one hourly record. Re-collecting the same hour

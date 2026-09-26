@@ -9,10 +9,14 @@ import (
 )
 
 type fakeInsertOnlyWriter struct {
-	existing       map[string]bool
-	inserted       []fakeInsertedPoint
-	pointExistsErr error
-	insertErr      error
+	existing          map[string]bool
+	inserted          []fakeInsertedPoint
+	pointExistsErr    error
+	insertErr         error
+	pointExistsErrFor map[string]error
+	insertErrFor      map[string]error
+	existsCalls       int
+	insertCalls       int
 }
 
 type fakeInsertedPoint struct {
@@ -27,6 +31,10 @@ func fakePointKey(pointID int, ts time.Time) string {
 }
 
 func (w *fakeInsertOnlyWriter) PointExists(_ context.Context, pointID int, ts time.Time) (bool, error) {
+	w.existsCalls++
+	if err := w.pointExistsErrFor[fakePointKey(pointID, ts)]; err != nil {
+		return false, err
+	}
 	if w.pointExistsErr != nil {
 		return false, w.pointExistsErr
 	}
@@ -37,6 +45,10 @@ func (w *fakeInsertOnlyWriter) PointExists(_ context.Context, pointID int, ts ti
 }
 
 func (w *fakeInsertOnlyWriter) InsertPoint(_ context.Context, pointID int, ts time.Time, value float64, state int) error {
+	w.insertCalls++
+	if err := w.insertErrFor[fakePointKey(pointID, ts)]; err != nil {
+		return err
+	}
 	if w.insertErr != nil {
 		return w.insertErr
 	}
@@ -149,7 +161,7 @@ func TestDirtyHealerNeverOverwritesExistingESPoint(t *testing.T) {
 	}
 }
 
-func TestDirtyHealerKeepsRangePendingOnESFailure(t *testing.T) {
+func TestDirtyHealerIsolatesESFailureAndClosesSourceRange(t *testing.T) {
 	ctx := context.Background()
 	repo := newIntegrationTestRepo(t)
 	ts := time.Date(2026, 9, 24, 13, 30, 0, 0, time.Local)
@@ -157,48 +169,63 @@ func TestDirtyHealerKeepsRangePendingOnESFailure(t *testing.T) {
 	if err := repo.SaveVKMRawString(ctx, "vkm", 1, ts, "S=7.5;"); err != nil {
 		t.Fatal(err)
 	}
-
-	cfg := Config{
-		DeviceID: "vkm",
-		Pipe:     1,
-		Kind:     "vkm360",
-		Points: []PointMapping{
-			{Tag: "S", PointID: 7003, Factor: 1, Label: "масса"},
-		},
-	}
+	cfg := Config{DeviceID: "vkm", Pipe: 1, Kind: "vkm360", Points: []PointMapping{{Tag: "S", PointID: 7003, Factor: 1, Label: "масса"}}}
 
 	failing := &fakeInsertOnlyWriter{pointExistsErr: errors.New("ЭС недоступна")}
 	stats, err := healESDirtyRanges(ctx, repo, failing, cfg, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Failed != 1 || stats.RangesCompleted != 0 {
-		t.Fatalf("unexpected failure stats: %+v", stats)
+	if stats.Failed != 1 || stats.RangesCompleted != 1 {
+		t.Fatalf("unexpected failure isolation stats: %+v", stats)
 	}
-	n, err := repo.CountESDirtyRanges(ctx, "vkm")
-	if err != nil {
-		t.Fatal(err)
+	if n, _ := repo.CountESDirtyRanges(ctx, "vkm"); n != 0 {
+		t.Fatalf("source range must close after point isolation, got %d", n)
 	}
-	if n != 1 {
-		t.Fatalf("failed ES check must leave dirty range durable, got %d", n)
+	if n, _ := repo.CountESDirtyPointFailures(ctx, "vkm"); n != 1 {
+		t.Fatalf("want one durable point failure, got %d", n)
 	}
 
-	// Once ES is available again, the same durable item is processed and
-	// removed without needing another local archive write.
 	okWriter := &fakeInsertOnlyWriter{}
 	stats, err = healESDirtyRanges(ctx, repo, okWriter, cfg, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.Inserted != 1 || stats.RangesCompleted != 1 {
-		t.Fatalf("unexpected recovery stats: %+v", stats)
+	if stats.Inserted != 1 {
+		t.Fatalf("isolated point was not retried: %+v", stats)
 	}
-	n, err = repo.CountESDirtyRanges(ctx, "vkm")
+	if n, _ := repo.CountESDirtyPointFailures(ctx, "vkm"); n != 0 {
+		t.Fatalf("point failure queue must drain after recovery, got %d", n)
+	}
+}
+
+func TestDirtyHealerThreeDaysOnePoisonPointDoesNotHoldHealthyWork(t *testing.T) {
+	ctx := context.Background()
+	repo := newIntegrationTestRepo(t)
+	base := time.Date(2026, 9, 20, 0, 30, 0, 0, time.Local)
+	const pointID = 7333
+	for i := 0; i < 3*48; i++ {
+		ts := base.Add(time.Duration(i) * 30 * time.Minute)
+		if err := repo.SaveVKMRawString(ctx, "vkm3d", 1, ts, fmt.Sprintf("S=%d;", i+1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	poisonTS := base.Add(20 * 30 * time.Minute)
+	writer := &fakeInsertOnlyWriter{pointExistsErrFor: map[string]error{fakePointKey(pointID, poisonTS): errors.New("bad ID_PP")}}
+	cfg := Config{DeviceID: "vkm3d", Pipe: 1, Kind: "vkm360", Points: []PointMapping{{Tag: "S", PointID: pointID, Factor: 1, Label: "масса"}}}
+
+	stats, err := healESDirtyRanges(ctx, repo, writer, cfg, 256)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 0 {
-		t.Fatalf("dirty range must drain after ES recovery, got %d", n)
+	if stats.RangesCompleted == 0 || len(writer.inserted) == 0 {
+		t.Fatalf("healthy work did not progress: %+v", stats)
+	}
+	if writer.existsCalls > 1024 {
+		t.Fatalf("per-pass ES request budget exceeded: existsCalls=%d", writer.existsCalls)
+	}
+	if n, _ := repo.CountESDirtyPointFailures(ctx, "vkm3d"); n != 1 {
+		t.Fatalf("want one isolated poison point, got %d", n)
 	}
 }
 

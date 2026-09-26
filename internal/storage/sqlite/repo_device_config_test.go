@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -420,5 +421,137 @@ func TestSetVKMChannelsAndActivePipesUpdatesBoth(t *testing.T) {
 	}
 	if rows[1].PipeNo != 2 || rows[1].Tag != "V" || rows[1].ESChannelID != 202 {
 		t.Fatalf("pipe2 mapping=%+v", rows[1])
+	}
+}
+
+func TestESVKMChannelsMigrationAllowsNineIVKSlotsIsIdempotentAndKeepsCursor(t *testing.T) {
+	repo := newTestRepoWithDeviceConfig(t)
+	ctx := context.Background()
+
+	if err := repo.UpsertDevice(ctx, DeviceRecord{ID: "ivk1", Kind: "ivk-ter", ArchiveAtMinute: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.InitESSyncCursorSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cursorTS := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	if err := repo.SetESSyncCursor(ctx, "ivk1", 5001, cursorTS); err != nil {
+		t.Fatal(err)
+	}
+
+	// Recreate the pre-D1 tag-keyed table to exercise the real upgrade path.
+	if _, err := repo.db.ExecContext(ctx, `DROP TABLE es_vkm_channels`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.db.ExecContext(ctx, `
+CREATE TABLE es_vkm_channels (
+    device_id TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    es_channel_id INTEGER NOT NULL,
+    factor REAL NOT NULL DEFAULT 1.0,
+    min_value REAL NULL,
+    max_value REAL NULL,
+    PRIMARY KEY (device_id, tag)
+)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 9; i++ {
+		if _, err := repo.db.ExecContext(ctx, `INSERT INTO es_vkm_channels(device_id,tag,es_channel_id,factor) VALUES(?,?,?,1)`,
+			"ivk1", fmt.Sprintf("P%d", i), 5000+i); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := repo.InitDeviceConfigSchema(ctx); err != nil {
+		t.Fatalf("migration with 9 IVK points failed: %v", err)
+	}
+	got, err := repo.GetVKMChannels(ctx, "ivk1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 9 {
+		t.Fatalf("migrated mappings=%d, want 9", len(got))
+	}
+	for i, row := range got {
+		if row.PipeNo != 1 || row.SlotNo != i+1 {
+			t.Fatalf("mapping[%d]=%+v, want pipe=1 slot=%d", i, row, i+1)
+		}
+	}
+	if last, found, err := repo.GetESSyncCursor(ctx, "ivk1", 5001); err != nil || !found || !last.Equal(cursorTS) {
+		t.Fatalf("cursor after migration: last=%v found=%v err=%v", last, found, err)
+	}
+
+	// Migration must be idempotent and must not renumber rows/cursors.
+	if err := repo.InitDeviceConfigSchema(ctx); err != nil {
+		t.Fatalf("second InitDeviceConfigSchema: %v", err)
+	}
+	got2, err := repo.GetVKMChannels(ctx, "ivk1")
+	if err != nil || len(got2) != 9 {
+		t.Fatalf("idempotent mappings=%d err=%v", len(got2), err)
+	}
+	if last, found, err := repo.GetESSyncCursor(ctx, "ivk1", 5001); err != nil || !found || !last.Equal(cursorTS) {
+		t.Fatalf("cursor after second init: last=%v found=%v err=%v", last, found, err)
+	}
+
+	// Generic storage path allows IVK to keep all nine points on fresh schema.
+	rows := make([]VKMChannelRecord, 0, 9)
+	for i := 1; i <= 9; i++ {
+		rows = append(rows, VKMChannelRecord{PipeNo: 1, SlotNo: i, Tag: fmt.Sprintf("P%d", i), ESChannelID: 6000 + i, Factor: 1})
+	}
+	if err := repo.SetVKMChannels(ctx, "ivk1", rows); err != nil {
+		t.Fatalf("fresh-schema IVK 9 points rejected: %v", err)
+	}
+
+	if err := repo.UpsertDevice(ctx, DeviceRecord{ID: "vkm5", Kind: "vkm360", ArchiveAtMinute: -1}); err != nil {
+		t.Fatal(err)
+	}
+	vkmRows := make([]VKMChannelRecord, 0, 5)
+	for i := 1; i <= 5; i++ {
+		vkmRows = append(vkmRows, VKMChannelRecord{PipeNo: 1, SlotNo: i, Tag: fmt.Sprintf("T%d", i), ESChannelID: 7000 + i, Factor: 1})
+	}
+	if err := repo.SetVKMChannels(ctx, "vkm5", vkmRows); err == nil {
+		t.Fatal("VKM fifth slot must still be rejected")
+	}
+}
+
+func TestESVKMChannelsRebuildsAlreadyD1ConstrainedSchema(t *testing.T) {
+	repo := newTestRepoWithDeviceConfig(t)
+	ctx := context.Background()
+	if err := repo.UpsertDevice(ctx, DeviceRecord{ID: "ivk-d1", Kind: "ivk-ter", ArchiveAtMinute: -1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.db.ExecContext(ctx, `DROP TABLE es_vkm_channels`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.db.ExecContext(ctx, `
+CREATE TABLE es_vkm_channels (
+ device_id TEXT NOT NULL,
+ pipe_no INTEGER NOT NULL DEFAULT 1 CHECK (pipe_no BETWEEN 1 AND 10),
+ slot_no INTEGER NOT NULL CHECK (slot_no BETWEEN 1 AND 4),
+ source_tag TEXT NOT NULL,
+ es_channel_id INTEGER NOT NULL,
+ factor REAL NOT NULL DEFAULT 1.0,
+ min_value REAL NULL,
+ max_value REAL NULL,
+ PRIMARY KEY(device_id,pipe_no,slot_no),
+ UNIQUE(device_id,es_channel_id)
+)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 4; i++ {
+		if _, err := repo.db.ExecContext(ctx, `INSERT INTO es_vkm_channels VALUES(?,?,?,?,?,?,NULL,NULL)`,
+			"ivk-d1", 1, i, fmt.Sprintf("P%d", i), 8000+i, 1.0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.InitDeviceConfigSchema(ctx); err != nil {
+		t.Fatalf("relax D1 schema: %v", err)
+	}
+	rows := make([]VKMChannelRecord, 0, 9)
+	for i := 1; i <= 9; i++ {
+		rows = append(rows, VKMChannelRecord{PipeNo: 1, SlotNo: i, Tag: fmt.Sprintf("P%d", i), ESChannelID: 8100 + i, Factor: 1})
+	}
+	if err := repo.SetVKMChannels(ctx, "ivk-d1", rows); err != nil {
+		t.Fatalf("already-D1 database still rejects IVK slot 5..9: %v", err)
 	}
 }

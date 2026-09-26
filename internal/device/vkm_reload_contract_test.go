@@ -46,3 +46,35 @@ func TestPersistVKMHourlyOverwritesExistingPeriod(t *testing.T) {
 		t.Fatalf("S timestamp=%v, want %v", rows[0].TsHour, ts)
 	}
 }
+
+func TestForceReloadVKMContinuesPastNoRecords(t *testing.T) {
+	ctx := context.Background()
+	from := time.Date(2026, 9, 26, 9, 0, 0, 0, time.Local)
+	to := from.Add(2 * vkmArchivePeriod)
+	var calls []time.Time
+	progress := 0
+
+	saved, err := forceReloadVKMPeriods(ctx, []int{1}, from, to,
+		func(_ context.Context, _ int, periodStart time.Time) (int, error) {
+			calls = append(calls, periodStart)
+			if periodStart.Equal(from.Add(vkmArchivePeriod)) {
+				return 0, archive.ErrVKMNoRecords
+			}
+			return 4, nil
+		},
+		func(done, total int) {
+			progress = done
+			if total != 3 {
+				t.Fatalf("total=%d want 3", total)
+			}
+		})
+	if err != nil {
+		t.Fatalf("no-record period must not abort range: %v", err)
+	}
+	if len(calls) != 3 || progress != 3 {
+		t.Fatalf("calls=%v progress=%d, want all 3 periods", calls, progress)
+	}
+	if saved != 8 {
+		t.Fatalf("saved=%d want 8", saved)
+	}
+}

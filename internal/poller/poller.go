@@ -142,7 +142,10 @@ func (p *Poller) Run(ctx context.Context) {
 	ticker := time.NewTicker(p.tickEvery)
 	defer ticker.Stop()
 
-	log.Printf("[опрос] запуск (%d приборов, тик %v)\n", len(p.devices), p.tickEvery)
+	p.devicesMu.RLock()
+	deviceCount := len(p.devices)
+	p.devicesMu.RUnlock()
+	log.Printf("[опрос] запуск (%d приборов, тик %v)\n", deviceCount, p.tickEvery)
 
 	for {
 		select {
