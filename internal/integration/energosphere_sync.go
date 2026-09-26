@@ -66,6 +66,7 @@ import (
 	"mbgw/internal/health"
 	"mbgw/internal/interval"
 	sqliterepo "mbgw/internal/storage/sqlite"
+	"mbgw/internal/vkmraw"
 )
 
 // PointMapping — одна точка ЭС (ID_PP в PointMains), в которую пишем
@@ -670,12 +671,9 @@ func validatePointReading(r pointReading) error {
 	if math.IsNaN(r.value) || math.IsInf(r.value, 0) {
 		return fmt.Errorf("неконечное значение %g", r.value)
 	}
-	if r.mapping.MinValue != nil && r.value < *r.mapping.MinValue {
-		return fmt.Errorf("значение %g ниже минимума %g", r.value, *r.mapping.MinValue)
-	}
-	if r.mapping.MaxValue != nil && r.value > *r.mapping.MaxValue {
-		return fmt.Errorf("значение %g выше максимума %g", r.value, *r.mapping.MaxValue)
-	}
+	// Historical min/max channel limits are intentionally ignored. They were
+	// a UI-added safety layer that could permanently block a valid commercial
+	// point and stall cursor progress. NaN/Inf remains the hard safety barrier.
 	return nil
 }
 
@@ -801,7 +799,7 @@ func collectVKMReadings(ctx context.Context, repo *sqliterepo.Repo, cfg Config, 
 			// historical single-pipe semantics for every pipe.
 			esTime := row.TsHour.Add(time.Duration(cfg.TimeShiftMinutes) * time.Minute)
 			for _, m := range byPipe[pipe] {
-				rawVal, ok := parseVKMTagFloat(row.RawString, m.Tag)
+				rawVal, ok := vkmraw.Float(row.RawString, m.Tag)
 				if !ok {
 					key := fmt.Sprintf("%d/%s", pipe, m.Tag)
 					if !missingWarned[key] {
@@ -1688,48 +1686,8 @@ func ForceResyncRange(ctx context.Context, repo *sqliterepo.Repo, writer *PointM
 	return updated, inserted, failed, nil
 }
 
-// parseVKMTagFloat extracts one tag's numeric value from a raw ВКМ archive
-// string ("tag{header}=value unit;…"). Same convention the northbound
-// carriers' parsers use; duplicated here (tiny, self-contained) so
-// integration has no dependency on the northbound package.
+// parseVKMTagFloat is kept as a narrow compatibility wrapper for older tests/callers.
+// The actual raw VKM parser is shared with the archive UI in internal/vkmraw.
 func parseVKMTagFloat(raw, tag string) (float64, bool) {
-	for _, entry := range strings.Split(raw, ";") {
-		eq := strings.Index(entry, "=")
-		if eq < 0 {
-			continue
-		}
-		if entry[:eq] != tag {
-			continue
-		}
-		rest := entry[eq+1:]
-		headerLen := 0
-		if len(rest) > 0 && (rest[0] == '{' || rest[0] == '<') {
-			closeCh := byte('}')
-			if rest[0] == '<' {
-				closeCh = '>'
-			}
-			if idx := strings.IndexByte(rest, closeCh); idx >= 0 {
-				headerLen = idx + 1
-			}
-		}
-		valuePart := strings.TrimSpace(rest[headerLen:])
-		numEnd := 0
-		for numEnd < len(valuePart) {
-			c := valuePart[numEnd]
-			if (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E' {
-				numEnd++
-			} else {
-				break
-			}
-		}
-		if numEnd == 0 {
-			return 0, false
-		}
-		f, err := strconv.ParseFloat(valuePart[:numEnd], 64)
-		if err != nil {
-			return 0, false
-		}
-		return f, true
-	}
-	return 0, false
+	return vkmraw.Float(raw, tag)
 }

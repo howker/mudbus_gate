@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
-	"mbgw/internal/storage"
 	sqliterepo "mbgw/internal/storage/sqlite"
 )
 
@@ -42,28 +42,15 @@ func newVKMMultipipeWebTestServer(t *testing.T) (*Server, *sqliterepo.Repo) {
 	return NewServer(repo, 0), repo
 }
 
-func TestLoadArchiveTableVKMSelectsPipeChannel(t *testing.T) {
+func TestLoadArchiveTableVKMSelectsPipeRawArchive(t *testing.T) {
 	s, repo := newVKMMultipipeWebTestServer(t)
 	ctx := context.Background()
 	ts := time.Date(2026, 9, 24, 12, 30, 0, 0, time.Local)
-
-	for _, tc := range []struct {
-		channel string
-		value   float64
-	}{
-		{channel: "", value: 101.5},
-		{channel: "2", value: 202.5},
-	} {
-		if err := repo.SaveHourlyArchive(ctx, storage.HourlyArchiveRecord{
-			DeviceID: "vkm_multi",
-			Channel:  tc.channel,
-			Param:    "T",
-			TsHour:   ts,
-			Value:    tc.value,
-			Unit:     "C",
-		}); err != nil {
-			t.Fatalf("save channel %q: %v", tc.channel, err)
-		}
+	if err := repo.SaveVKMRawString(ctx, "vkm_multi", 1, ts, "T={Температура }101.5°C;"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SaveVKMRawString(ctx, "vkm_multi", 2, ts, "V={Объём газа ст.у. }12.25м³;T={Температура }202.5°C;Pi=<Давление *>420000Па;"); err != nil {
+		t.Fatal(err)
 	}
 
 	req := httptest.NewRequest("GET", "/api/archive?device_id=vkm_multi&from=2026-09-24T12:00&to=2026-09-24T13:00&granularity=raw&pipe=2", nil)
@@ -77,13 +64,44 @@ func TestLoadArchiveTableVKMSelectsPipeChannel(t *testing.T) {
 	if len(resp.Rows) != 1 {
 		t.Fatalf("rows=%d, want 1", len(resp.Rows))
 	}
+	if got := resp.Rows[0].Values["V"]; got != 12.25 {
+		t.Fatalf("pipe 2 V=%v, want 12.25", got)
+	}
 	if got := resp.Rows[0].Values["T"]; got != 202.5 {
 		t.Fatalf("pipe 2 T=%v, want 202.5 (pipe 1 value must not leak)", got)
+	}
+	wantParams := map[string]bool{"V": true, "T": true, "Pi": true}
+	for _, p := range resp.Params {
+		delete(wantParams, p)
+	}
+	if len(wantParams) != 0 {
+		t.Fatalf("missing dynamic params: %v; got %v", wantParams, resp.Params)
+	}
+	joined := strings.Join(resp.ParamLabels, "|")
+	if !strings.Contains(joined, "Объём газа ст.у., м³") || !strings.Contains(joined, "Давление, Па") {
+		t.Fatalf("labels=%v, want meter headers/units", resp.ParamLabels)
 	}
 
 	bad := httptest.NewRequest("GET", "/api/archive?device_id=vkm_multi&from=2026-09-24T12:00&to=2026-09-24T13:00&granularity=raw&pipe=3", nil)
 	if _, err := s.loadArchiveTable(bad); err == nil {
 		t.Fatal("inactive pipe 3 unexpectedly accepted")
+	}
+}
+
+func TestLoadArchiveTableVKMKeepsMassHeatConversions(t *testing.T) {
+	s, repo := newVKMMultipipeWebTestServer(t)
+	ts := time.Date(2026, 9, 24, 12, 30, 0, 0, time.Local)
+	if err := repo.SaveVKMRawString(context.Background(), "vkm_multi", 1, ts,
+		"S={Масса теплонос. }2000кг;ST={Тепловая энергия }4.1868e+09Дж;"); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest("GET", "/api/archive?device_id=vkm_multi&from=2026-09-24T12:00&to=2026-09-24T13:00&granularity=raw&pipe=1", nil)
+	resp, err := s.loadArchiveTable(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Rows) != 1 || resp.Rows[0].Values["S"] != 2 || resp.Rows[0].Values["ST"] < 0.999999999 || resp.Rows[0].Values["ST"] > 1.000000001 {
+		t.Fatalf("converted row=%+v", resp.Rows)
 	}
 }
 
@@ -198,5 +216,31 @@ func TestHandleVKMChannelsSavesActivePipesWithMappings(t *testing.T) {
 	}
 	if len(rows) != 2 || rows[0].PipeNo != 1 || rows[1].PipeNo != 2 {
 		t.Fatalf("saved mappings=%+v", rows)
+	}
+}
+
+func TestHandleVKMChannelsClearsLegacyMinMax(t *testing.T) {
+	s, repo := newVKMMultipipeWebTestServer(t)
+	body := []byte(`{
+		"device_id":"vkm_multi",
+		"active_pipes":[1],
+		"force":true,
+		"channels":[{"pipe_no":1,"slot_no":1,"tag":"V","es_channel_id":777,"factor":1,"min_value":10,"max_value":20}]
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/vkm-channels", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	s.handleVKMChannels(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	rows, err := repo.GetVKMChannels(context.Background(), "vkm_multi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows=%+v", rows)
+	}
+	if rows[0].MinValue != nil || rows[0].MaxValue != nil {
+		t.Fatalf("legacy min/max must be cleared on save: %+v", rows[0])
 	}
 }

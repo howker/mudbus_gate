@@ -18,6 +18,11 @@ type BackfillOptions struct {
 	// bounded only by the device's physical buffer). >0 → variant "Б"
 	// (never reach further back than this many hours).
 	MaxDepthHours int
+
+	// SkipLatest is used only by the scheduled IVK-TЭР path after it has
+	// already performed the mandatory live read of the newest completed hour.
+	// Startup/manual backfill leaves this false.
+	SkipLatest bool
 }
 
 // BackfillArchives performs a deep, paged history catch-up for every

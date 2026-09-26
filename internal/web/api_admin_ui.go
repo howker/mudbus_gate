@@ -303,8 +303,8 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
         </table>
       </div>
       <div id="channelsVKMWrap" style="display:none;">
-        <p class="small-note">Флажок «Опрос» задаёт трубопроводы, которые шлюз реально читает. «Пересканировать трубопроводы» физически проверяет архивные экземпляры 1–10, но сам флажки не меняет. Пустой архивный период не считается отсутствием трубопровода: шлюз проверяет соседний завершённый период. Параметры в выпадающих списках берутся из последней архивной строки, а для ещё не опрашиваемой найденной трубы — из результата сканирования.</p>
-        <p><button class="btn secondary" type="button" onclick="rescanVKMPipes()">Пересканировать трубопроводы</button> <button class="btn secondary" type="button" onclick="refreshVKMSourceTags()">Обновить параметры из архива</button></p>
+        <p class="small-note">«Пересканировать трубопроводы» — проверить доступные трубопроводы прибора. Флажки «Опрос» автоматически не изменяются. «Обновить список параметров» — заново определить доступные параметры найденных трубопроводов.</p>
+        <p><button class="btn secondary" type="button" onclick="rescanVKMPipes()">Пересканировать трубопроводы</button> <button class="btn secondary" type="button" onclick="refreshVKMSourceTags()">Обновить список параметров</button></p>
         <div id="vkmPipeGroups"></div>
       </div>
       <p><button class="btn" onclick="saveChannels()">Сохранить точки</button></p>
@@ -538,7 +538,6 @@ th { background: #333337; color: #ffffff; font-weight: 600; text-transform: uppe
 var allDevices = [];
 var allProfiles = [];
 var editingOriginalKind = null; // set by editDevice(), cleared by resetDeviceForm() — used to warn if the operator changes "Тип прибора" while editing an EXISTING device (root cause of the 2026-08-23 incident: switching kind mid-edit silently repurposed one device's saved row into a different device).
-var channelSafetyByTag = {}; // non-VKM legacy rows keep backend min/max even though that compact table does not expose them.
 var vkmChannelBySlot = {};   // key "pipe:slot" -> saved mapping row
 var vkmSourceTagsByPipe = {}; // pipe -> tags parsed from the newest raw archive row
 var vkmPipeDiscoveryByPipe = {}; // pipe -> last persisted physical discovery result
@@ -2522,21 +2521,17 @@ function renderVKMPipeGroups() {
       '</div>' +
       '<div id="ch_pipe_' + pipe + '_body" style="display:' + (expanded ? 'block' : 'none') + ';padding:8px 10px;">' +
       '<div id="ch_pipe_' + pipe + '_source_note" class="small-note">' + note + '</div>' +
-      '<table><thead><tr><th>Слот</th><th>Параметр прибора</th><th>ID_PP</th><th>Множитель</th><th>Мин.</th><th>Макс.</th></tr></thead><tbody>';
+      '<table><thead><tr><th>Слот</th><th>Параметр прибора</th><th>ID_PP</th><th>Множитель</th></tr></thead><tbody>';
     for (var slot = 1; slot <= 4; slot++) {
       var key = pipe + ':' + slot;
       var row = vkmChannelBySlot[key] || {};
       var tag = row.tag || '';
       var id = row.es_channel_id || '';
       var factor = (row.factor === undefined || row.factor === null) ? '1' : row.factor;
-      var minValue = (row.min_value === undefined || row.min_value === null) ? '' : row.min_value;
-      var maxValue = (row.max_value === undefined || row.max_value === null) ? '' : row.max_value;
       html += '<tr><td>' + slot + '</td>' +
         '<td><select id="ch_p' + pipe + '_s' + slot + '_tag" style="width:190px;">' + vkmTagOptions(pipe, tag) + '</select></td>' +
         '<td><input id="ch_p' + pipe + '_s' + slot + '_id" type="text" value="' + id + '" style="width:90px;"></td>' +
-        '<td><input id="ch_p' + pipe + '_s' + slot + '_factor" type="text" value="' + factor + '" style="width:100px;"></td>' +
-        '<td><input id="ch_p' + pipe + '_s' + slot + '_min" type="text" value="' + minValue + '" style="width:90px;"></td>' +
-        '<td><input id="ch_p' + pipe + '_s' + slot + '_max" type="text" value="' + maxValue + '" style="width:90px;"></td></tr>';
+        '<td><input id="ch_p' + pipe + '_s' + slot + '_factor" type="text" value="' + factor + '" style="width:100px;"></td></tr>';
     }
     html += '</tbody></table></div></div>';
   }
@@ -2676,7 +2671,6 @@ function populateDeviceSelect(selectId, kindFilter) {
 function loadChannels() {
   var deviceId = document.getElementById('ch_device').value;
   var kind = currentChannelsKind();
-  channelSafetyByTag = {};
   vkmChannelBySlot = {};
   vkmSourceTagsByPipe = {};
   vkmPipeDiscoveryByPipe = {};
@@ -2701,7 +2695,6 @@ function loadChannels() {
     var tags = (POINT_TAG_DEFS[kind] || []).map(function(d) { return d.tag; });
     var byTag = {};
     for (var j = 0; j < rows.length; j++) { byTag[rows[j].tag] = rows[j]; }
-    channelSafetyByTag = byTag;
     for (var k = 0; k < tags.length; k++) {
       var t = tags[k];
       var idEl = document.getElementById('ch_' + t + '_id');
@@ -2714,11 +2707,6 @@ function loadChannels() {
   xhr.send();
 }
 
-function nullableFloat(v) {
-  if (v === null || v === undefined || String(v).replace(/^\s+|\s+$/g, '') === '') { return null; }
-  var n = parseFloat(v);
-  return isNaN(n) ? null : n;
-}
 
 function saveChannels(force) {
   var deviceId = document.getElementById('ch_device').value;
@@ -2754,20 +2742,14 @@ function saveChannels(force) {
           showMsg('channelsMsg', false, 'Трубопровод ' + pipe + ', слот ' + slot + ': выберите параметр прибора.');
           return;
         }
-        var minValue = nullableFloat(document.getElementById('ch_p' + pipe + '_s' + slot + '_min').value);
-        var maxValue = nullableFloat(document.getElementById('ch_p' + pipe + '_s' + slot + '_max').value);
-        if (minValue !== null && maxValue !== null && minValue > maxValue) {
-          showMsg('channelsMsg', false, 'Трубопровод ' + pipe + ', слот ' + slot + ': минимум больше максимума.');
-          return;
-        }
         channels.push({
           pipe_no: pipe,
           slot_no: slot,
           tag: tag,
           es_channel_id: chId,
           factor: floatOrOne(document.getElementById('ch_p' + pipe + '_s' + slot + '_factor').value),
-          min_value: minValue,
-          max_value: maxValue
+          min_value: null,
+          max_value: null
         });
         channelIds.push(chId);
       }
@@ -2783,13 +2765,12 @@ function saveChannels(force) {
       var legacyIdVal = document.getElementById('ch_' + t + '_id').value;
       if (legacyIdVal === '') { continue; }
       var legacyChId = intOrZero(legacyIdVal);
-      var safety = channelSafetyByTag[t] || {};
       channels.push({
         tag: t,
         es_channel_id: legacyChId,
         factor: floatOrOne(document.getElementById('ch_' + t + '_factor').value),
-        min_value: (safety.min_value !== undefined ? safety.min_value : null),
-        max_value: (safety.max_value !== undefined ? safety.max_value : null)
+        min_value: null,
+        max_value: null
       });
       channelIds.push(legacyChId);
     }

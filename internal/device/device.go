@@ -894,15 +894,14 @@ func (d *Device) PollArchives(ctx context.Context) {
 		// завершившийся календарный час через TIME-доступ. Это тот же контракт,
 		// который уже используется принудительным переопросом диапазона.
 		if a.Strategy == "mb_func65" {
-			// Scheduled function-65 polling is a bounded catch-up, not a single
-			// "latest hour" read. If the scheduler ran late or the bus was busy,
-			// every missing completed storage hour inside the configured depth is
-			// retried. backfillFunc65Hourly releases the lease between hours.
+			// First do one real read of the newest completed hour so "успешно"
+			// means the meter answered now, not merely that SQLite has no gaps.
+			d.pollFunc65Latest(ctx, a)
 			depth := d.BackfillMaxDepthHours
 			if depth <= 0 || depth > 24 {
 				depth = 24
 			}
-			d.backfillFunc65Hourly(ctx, a, BackfillOptions{MaxDepthHours: depth})
+			d.backfillFunc65Hourly(ctx, a, BackfillOptions{MaxDepthHours: depth, SkipLatest: true})
 			continue
 		}
 

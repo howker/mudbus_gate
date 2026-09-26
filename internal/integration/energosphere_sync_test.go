@@ -489,3 +489,17 @@ func TestCollectVKMReadingsSeparatesMappingsByPipe(t *testing.T) {
 		t.Fatalf("pipe 2 mapping mismatch: %#v", r)
 	}
 }
+
+func TestValidatePointReadingIgnoresLegacyMinMax(t *testing.T) {
+	min := 100.0
+	max := 200.0
+	for _, value := range []float64{50, 250} {
+		err := validatePointReading(pointReading{
+			mapping: PointMapping{MinValue: &min, MaxValue: &max},
+			value:   value,
+		})
+		if err != nil {
+			t.Fatalf("legacy min/max must not block finite value %g: %v", value, err)
+		}
+	}
+}

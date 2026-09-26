@@ -1,10 +1,14 @@
 package device
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"mbgw/internal/archive"
+	"mbgw/internal/health"
 	"mbgw/internal/profile"
+	"mbgw/internal/storage"
 )
 
 func periodEndArchiveForReloadTest() profile.Archive {
@@ -99,5 +103,59 @@ func TestFunc65LatestQueryDoesNotUseIndexZeroAsNewest(t *testing.T) {
 	q := func65LatestQueryAt(d, a, now)
 	if q.From.IsZero() {
 		t.Fatal("regular IVK poll fell back to index access; live device proved index 0 is not the newest record")
+	}
+}
+
+type fakeFunc65Reader struct {
+	calls int
+	read  func(q archive.ArchiveQuery) ([]archive.ArchiveRecord, error)
+}
+
+func (f *fakeFunc65Reader) Strategy() string { return "mb_func65" }
+func (f *fakeFunc65Reader) Read(_ context.Context, _ archive.ArchiveSession, _ archive.Transactor, q archive.ArchiveQuery) ([]archive.ArchiveRecord, error) {
+	f.calls++
+	return f.read(q)
+}
+
+func TestIVKScheduledPollReadsLatestEvenWhenBackfillHasNoGaps(t *testing.T) {
+	old, ok := archive.Get("mb_func65")
+	fake := &fakeFunc65Reader{read: func(q archive.ArchiveQuery) ([]archive.ArchiveRecord, error) {
+		return nil, nil // device answered, newest archive hour not closed yet
+	}}
+	archive.Register(fake)
+	defer func() {
+		if ok {
+			archive.Register(old)
+		}
+	}()
+
+	d := newTestDeviceForVKM(t)
+	a := profile.Archive{
+		ID: "hourly", Strategy: "mb_func65", BufferDepthHours: 24,
+		Params: map[string]interface{}{"archive_type": 0, "timestamp_semantics": "period_end"},
+		RecordLayout: []profile.RecordField{
+			{Offset: 0, Name: "archive_time", Type: "uint32", Epoch: "1970-01-01"},
+			{Offset: 4, Name: "v_plus", Type: "float", Unit: "m3"},
+		},
+	}
+	d.Profile = &profile.Profile{Codec: profile.Codec{WordOrder32: "0123"}, Archives: []profile.Archive{a}}
+	d.BackfillMaxDepthHours = 24
+	now := func65WallClockHour(time.Now())
+	for i := 1; i < 24; i++ {
+		if err := d.Repo.SaveHourlyArchive(context.Background(), storage.HourlyArchiveRecord{
+			DeviceID: d.ID, Param: "v_plus", TsHour: now.Add(-time.Duration(i) * time.Hour), Value: float64(i),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before := health.Get().Devices[d.ID].LastArchiveSuccess
+	d.PollArchives(context.Background())
+	after := health.Get().Devices[d.ID].LastArchiveSuccess
+	if fake.calls != 1 {
+		t.Fatalf("scheduled IVK poll calls=%d, want exactly one mandatory latest read when history has no gaps", fake.calls)
+	}
+	if !after.After(before) {
+		t.Fatalf("empty but valid latest IVK response must confirm live contact: before=%v after=%v", before, after)
 	}
 }

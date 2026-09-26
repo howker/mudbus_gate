@@ -10,6 +10,7 @@ import (
 
 	"mbgw/internal/interval"
 	"mbgw/internal/storage"
+	"mbgw/internal/vkmraw"
 )
 
 // api_archive.go implements the archive-viewer tab's backend: GET
@@ -233,6 +234,10 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 		archiveChannel = vkmArchiveChannel(selectedPipe)
 	}
 
+	if dev.Kind == "vkm360" {
+		return s.loadVKMRawArchiveTable(r, deviceID, selectedPipe, activePipes, from, to, granularity)
+	}
+
 	params := devicesParams[dev.Kind]
 	labels := make([]string, len(params))
 	for i, p := range params {
@@ -332,6 +337,143 @@ func (s *Server) loadArchiveTable(r *http.Request) (archiveResponse, error) {
 	}
 
 	return archiveResponse{DeviceID: deviceID, Pipe: selectedPipe, Pipes: activePipes, Params: params, ParamLabels: labels, Rows: out}, nil
+}
+
+// loadVKMRawArchiveTable builds the VKM archive directly from archive_vkm_raw.
+// This keeps the Archive tab on the same source/parser as Energosphere sync and
+// makes parameters that were never mirrored into archive_hourly (notably gas V)
+// visible immediately for all already-collected history.
+func (s *Server) loadVKMRawArchiveTable(r *http.Request, deviceID string, pipe int, pipes []int, from, to time.Time, granularity string) (archiveResponse, error) {
+	rows, err := s.repo.GetVKMRawStringsRange(r.Context(), deviceID, pipe, from, to)
+	if err != nil {
+		return archiveResponse{}, fmt.Errorf("чтение сырого архива ВКМ: %w", err)
+	}
+
+	type meta struct {
+		label      string
+		fromHeader bool
+	}
+	metas := make(map[string]meta)
+	params := make([]string, 0, 16)
+	seenParam := make(map[string]bool)
+	buckets := make(map[string]map[string]float64)
+	counts := make(map[string]map[string]int)
+	var order []string
+
+	for _, row := range rows {
+		key := formatPeriodLabel(row.TsHour, granularity)
+		if _, ok := buckets[key]; !ok {
+			buckets[key] = make(map[string]float64)
+			order = append(order, key)
+		}
+		fields := vkmraw.Parse(row.RawString)
+		for _, f := range fields {
+			if !seenParam[f.Tag] {
+				seenParam[f.Tag] = true
+				params = append(params, f.Tag)
+			}
+			label := vkmArchiveFieldLabel(f)
+			old, ok := metas[f.Tag]
+			if !ok || (!old.fromHeader && f.Header != "") {
+				metas[f.Tag] = meta{label: label, fromHeader: f.Header != ""}
+			}
+
+			v := f.Value * vkmArchiveDisplayFactor(f.Tag)
+			if granularity == "raw" {
+				buckets[key][f.Tag] = v
+				continue
+			}
+			switch {
+			case vkmArchiveAdditive(f.Tag):
+				buckets[key][f.Tag] += v
+			case vkmArchiveAverage(f.Tag):
+				buckets[key][f.Tag] += v
+				if _, ok := counts[key]; !ok {
+					counts[key] = make(map[string]int)
+				}
+				counts[key][f.Tag]++
+			default:
+				// Unknown device-specific fields are not blindly summed. Keep the
+				// newest value in the bucket; raw mode always shows every period.
+				buckets[key][f.Tag] = v
+			}
+		}
+	}
+
+	sort.Strings(order)
+	unique := order[:0]
+	seenKey := make(map[string]bool, len(order))
+	for _, key := range order {
+		if !seenKey[key] {
+			seenKey[key] = true
+			unique = append(unique, key)
+		}
+	}
+	out := make([]archiveRow, 0, len(unique))
+	for _, key := range unique {
+		values := buckets[key]
+		for tag, count := range counts[key] {
+			if count > 0 {
+				values[tag] /= float64(count)
+			}
+		}
+		out = append(out, archiveRow{Period: key, Values: values})
+	}
+	labels := make([]string, len(params))
+	for i, tag := range params {
+		labels[i] = metas[tag].label
+		if labels[i] == "" {
+			labels[i] = tag
+		}
+	}
+	return archiveResponse{DeviceID: deviceID, Pipe: pipe, Pipes: pipes, Params: params, ParamLabels: labels, Rows: out}, nil
+}
+
+func vkmArchiveDisplayFactor(tag string) float64 {
+	switch tag {
+	case "S":
+		return 1.0 / 1000.0
+	case "ST":
+		return 1.0 / 4.1868e9
+	default:
+		return 1.0
+	}
+}
+
+func vkmArchiveAdditive(tag string) bool {
+	switch tag {
+	case "S", "ST", "V":
+		return true
+	default:
+		return false
+	}
+}
+
+func vkmArchiveAverage(tag string) bool {
+	switch tag {
+	case "T", "Pi", "Pbar", "dP", "H":
+		return true
+	default:
+		return false
+	}
+}
+
+func vkmArchiveFieldLabel(f vkmraw.Field) string {
+	name := f.Header
+	if name == "" {
+		name = f.Tag
+	}
+	unit := f.Unit
+	switch f.Tag {
+	case "S":
+		unit = "т"
+	case "ST":
+		unit = "Гкал"
+	}
+	if unit == "" {
+		return name
+	}
+	return name + ", " + unit
 }
 
 // formatPeriodLabel formats a stored timestamp into this row's bucket

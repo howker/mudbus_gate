@@ -15,7 +15,7 @@ func TestAdminUIVKMPointEditorHasTenPipesFourSlotsAndES5Toggle(t *testing.T) {
 		"slot_no: slot",
 		"active_pipes",
 		"/api/vkm-source-tags?device_id=",
-		"Обновить параметры из архива",
+		"Обновить список параметров",
 		"Пересканировать трубопроводы",
 		"rescanVKMPipes()",
 		"/api/vkm-pipe-discovery",
@@ -23,6 +23,11 @@ func TestAdminUIVKMPointEditorHasTenPipesFourSlotsAndES5Toggle(t *testing.T) {
 	for _, want := range checks {
 		if !strings.Contains(adminUIHTML, want) {
 			t.Fatalf("admin UI missing VKM multipipe marker %q", want)
+		}
+	}
+	for _, forbidden := range []string{"<th>Мин.</th>", "<th>Макс.</th>", "Обновить параметры из архива", "Пустой архивный период не считается отсутствием трубопровода"} {
+		if strings.Contains(adminUIHTML, forbidden) {
+			t.Fatalf("admin UI still contains removed VKM text %q", forbidden)
 		}
 	}
 	if strings.Contains(adminUIHTML, "<details") || strings.Contains(adminUIHTML, "<summary") {

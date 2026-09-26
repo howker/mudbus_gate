@@ -7,12 +7,12 @@ import (
 	"log"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
 	"mbgw/internal/integration"
 	sqliterepo "mbgw/internal/storage/sqlite"
+	"mbgw/internal/vkmraw"
 )
 
 // api_devices.go implements the device-configuration REST API (T14
@@ -349,7 +349,7 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 			out = append(out, vkmChannelJSON{
 				PipeNo: c.PipeNo, SlotNo: c.SlotNo,
 				Tag: c.Tag, ESChannelID: c.ESChannelID, Factor: c.Factor,
-				MinValue: c.MinValue, MaxValue: c.MaxValue,
+				MinValue: nil, MaxValue: nil,
 			})
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -377,12 +377,6 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 			if factor == 0 {
 				factor = 1.0
 			}
-			if c.MinValue != nil && c.MaxValue != nil && *c.MinValue > *c.MaxValue {
-				writeError(w, http.StatusBadRequest,
-					fmt.Sprintf("для точки %s минимальное значение %g больше максимального %g",
-						c.Tag, *c.MinValue, *c.MaxValue))
-				return
-			}
 			if c.ESChannelID != 0 && seenChannelIDs[c.ESChannelID] {
 				writeError(w, http.StatusBadRequest,
 					fmt.Sprintf("ID_PP %d указан более одного раза для прибора %q", c.ESChannelID, body.DeviceID))
@@ -391,7 +385,7 @@ func (s *Server) handleVKMChannels(w http.ResponseWriter, r *http.Request) {
 			rows = append(rows, sqliterepo.VKMChannelRecord{
 				DeviceID: body.DeviceID, PipeNo: c.PipeNo, SlotNo: c.SlotNo,
 				Tag: c.Tag, ESChannelID: c.ESChannelID, Factor: factor,
-				MinValue: c.MinValue, MaxValue: c.MaxValue,
+				MinValue: nil, MaxValue: nil,
 			})
 			if c.ESChannelID != 0 {
 				seenChannelIDs[c.ESChannelID] = true
@@ -502,46 +496,7 @@ func (s *Server) handleVKMSourceTags(w http.ResponseWriter, r *http.Request) {
 }
 
 func extractVKMNumericTags(raw string) []string {
-	seen := make(map[string]bool)
-	out := make([]string, 0, 16)
-	for _, entry := range strings.Split(raw, ";") {
-		eq := strings.Index(entry, "=")
-		if eq <= 0 {
-			continue
-		}
-		tag := strings.TrimSpace(entry[:eq])
-		if tag == "" || tag == "Time" || seen[tag] {
-			continue
-		}
-		rest := strings.TrimSpace(entry[eq+1:])
-		if len(rest) > 0 && (rest[0] == '{' || rest[0] == '<') {
-			closeCh := byte('}')
-			if rest[0] == '<' {
-				closeCh = '>'
-			}
-			if idx := strings.IndexByte(rest, closeCh); idx >= 0 {
-				rest = strings.TrimSpace(rest[idx+1:])
-			}
-		}
-		n := 0
-		for n < len(rest) {
-			c := rest[n]
-			if (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == 'e' || c == 'E' {
-				n++
-				continue
-			}
-			break
-		}
-		if n == 0 {
-			continue
-		}
-		if _, err := strconv.ParseFloat(rest[:n], 64); err != nil {
-			continue
-		}
-		seen[tag] = true
-		out = append(out, tag)
-	}
-	return out
+	return vkmraw.NumericTags(raw)
 }
 
 // esConnectionJSON deliberately OMITS the password on the way OUT (GET) —

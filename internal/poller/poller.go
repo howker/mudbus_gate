@@ -352,11 +352,13 @@ func (p *Poller) dispatch(ctx context.Context, task scheduler.Task) {
 		pollOK := false
 		switch task.Kind {
 		case scheduler.KindCurrent:
-			pollOK = after.LastCurrentSuccess.After(startedAt) &&
-				after.LastCurrentSuccess.After(before.LastCurrentSuccess)
+			// Success markers are captured with time.Now inside the device path.
+			// On Windows an immediate response can receive the exact same wall-clock
+			// timestamp as startedAt, so requiring marker.After(startedAt) produces
+			// a false failure even though the marker advanced from its pre-task value.
+			pollOK = after.LastCurrentSuccess.After(before.LastCurrentSuccess)
 		case scheduler.KindArchive, scheduler.KindManualArchive:
-			pollOK = after.LastArchiveSuccess.After(startedAt) &&
-				after.LastArchiveSuccess.After(before.LastArchiveSuccess)
+			pollOK = after.LastArchiveSuccess.After(before.LastArchiveSuccess)
 		}
 
 		errText := ""

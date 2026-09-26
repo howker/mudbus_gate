@@ -7,7 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"mbgw/internal/archive"
 	"mbgw/internal/device"
+	"mbgw/internal/health"
 	"mbgw/internal/lease"
 	"mbgw/internal/profile"
 	"mbgw/internal/scheduler"
@@ -306,5 +308,66 @@ func TestPoller_BackfillChecksDeviceClock(t *testing.T) {
 
 	if cli.Reads() != 1 {
 		t.Fatalf("startup backfill clock reads=%d, want 1", cli.Reads())
+	}
+}
+
+type pollerNoRecordVKMReader struct{ calls *int32 }
+
+func (r *pollerNoRecordVKMReader) Strategy() string { return "mb_request_poll_string" }
+func (r *pollerNoRecordVKMReader) Read(_ context.Context, _ archive.ArchiveSession, _ archive.Transactor, _ archive.ArchiveQuery) ([]archive.ArchiveRecord, error) {
+	atomic.AddInt32(r.calls, 1)
+	return nil, archive.ErrVKMNoRecords
+}
+
+func TestPollerArchiveStatusSuccessWhenLatestVKMPeriodNotClosed(t *testing.T) {
+	old, ok := archive.Get("mb_request_poll_string")
+	var calls int32
+	archive.Register(&pollerNoRecordVKMReader{calls: &calls})
+	defer func() {
+		if ok {
+			archive.Register(old)
+		}
+	}()
+
+	repo, err := sqliterepo.New(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.InitSchema(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.InitDeviceConfigSchema(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	prof := &profile.Profile{Archives: []profile.Archive{{ID: "main", Strategy: "mb_request_poll_string"}}}
+	dev := device.New("vkm_status_latest_not_closed", prof, &countingClient{}, &session.NoopSession{}, repo, lease.New())
+
+	// Startup backfill already filled every historical period; the newest
+	// boundary is explicitly marked no-record from an earlier attempt.
+	now := time.Now()
+	latestStart := now.Truncate(30 * time.Minute).Add(-30 * time.Minute)
+	latestLabel := latestStart.Add(30 * time.Minute)
+	for i := 1; i < 48; i++ {
+		if err := repo.SaveVKMRawString(context.Background(), dev.ID, 1, latestLabel.Add(-time.Duration(i)*30*time.Minute), "T=1°C;"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.MarkVKMNoRecords(context.Background(), dev.ID, 1, latestLabel, time.Now().Add(6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	sched := scheduler.New(nil)
+	sched.RequestManualPoll(dev.ID, scheduler.KindArchive)
+	p := New(sched, map[string]*device.Device{dev.ID: dev}, time.Second)
+	p.drain(context.Background())
+
+	st := health.Get().Devices[dev.ID]
+	if !st.LastPollKnown || !st.LastPollOK {
+		t.Fatalf("latest VKM no-record response must produce successful live poll status: %+v", st)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("physical reads=%d, want exactly one mandatory latest read", got)
 	}
 }

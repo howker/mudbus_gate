@@ -193,6 +193,16 @@ func (d *Device) backfillFunc65Hourly(ctx context.Context, a profile.Archive, op
 			missingList = append(missingList, h)
 		}
 	}
+	if opts.SkipLatest {
+		filtered := missingList[:0]
+		for _, h := range missingList {
+			if func65WallClockHour(h).Equal(now) {
+				continue
+			}
+			filtered = append(filtered, h)
+		}
+		missingList = filtered
+	}
 	if len(missingList) == 0 {
 		return
 	}
@@ -252,6 +262,59 @@ func (d *Device) backfillFunc65Hourly(ctx context.Context, a profile.Archive, op
 	}
 
 	log.Printf("[%s] восстановление архива %s ИВК-ТЭР завершено: обновлено периодов %d, сохранено показателей %d\n", d.ID, a.ID, periodsSaved, totalSaved)
+}
+
+// pollFunc65Latest performs one real TIME-based read of the newest completed
+// IVK-TЭР storage hour on every scheduled tick. This keeps poll status tied to
+// live device communication even when startup backfill has already filled all
+// gaps in SQLite.
+func (d *Device) pollFunc65Latest(ctx context.Context, a profile.Archive) {
+	reader, ok := archive.Get(a.Strategy)
+	if !ok {
+		log.Printf("[%s] архив %s: неизвестный способ чтения %s\n", d.ID, a.ID, a.Strategy)
+		return
+	}
+	now := time.Now()
+	wantedHour := func65WallClockHour(now)
+	q := func65LatestQueryAt(d, a, now)
+	release, err := d.acquireLeaseWithRetry(ctx, a.ID, 30*time.Second)
+	if err != nil {
+		log.Printf("[%s] архив %s: не удалось получить доступ для чтения последнего часа: %v\n", d.ID, a.ID, err)
+		return
+	}
+	records, readErr := reader.Read(ctx, sessionAdapter{d.Sess}, d.Client, q)
+	release()
+	health.MarkPollProgress(d.ID, time.Now())
+	if readErr != nil {
+		log.Printf("[%s] архив %s: ошибка чтения последнего часа %s: %v\n", d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"), readErr)
+		return
+	}
+	if len(records) == 0 {
+		// A successful protocol response with no row still proves the device is
+		// reachable; the archive may simply not have closed this hour yet.
+		health.MarkArchiveSuccess(d.ID, time.Now())
+		log.Printf("[%s] архив %s: прибор ответил, запись за последний час %s ещё не сформирована\n", d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"))
+		return
+	}
+
+	matched := false
+	for _, rec := range records {
+		if err := validateFunc65Record(rec); err != nil {
+			continue
+		}
+		gotHour := func65WallClockHour(func65StorageHour(a, rec.RecordTS))
+		if !gotHour.Equal(wantedHour) {
+			continue
+		}
+		if persistFunc65Hourly(ctx, d.Repo, d.ID, a, []archive.ArchiveRecord{rec}) > 0 {
+			matched = true
+		}
+	}
+	if matched {
+		health.MarkArchiveSuccess(d.ID, time.Now())
+	} else {
+		log.Printf("[%s] архив %s: прибор ответил, но не вернул ожидаемую запись за %s\n", d.ID, a.ID, wantedHour.Format("02.01.2006 15:04"))
+	}
 }
 
 // func65LatestQueryAt строит запрос для последнего завершившегося часового

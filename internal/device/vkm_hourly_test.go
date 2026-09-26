@@ -9,7 +9,9 @@ import (
 
 	"mbgw/internal/archive"
 	"mbgw/internal/errs"
+	"mbgw/internal/health"
 	"mbgw/internal/lease"
+	"mbgw/internal/profile"
 	"mbgw/internal/storage/sqlite"
 )
 
@@ -362,5 +364,101 @@ func TestMissingVKMPeriodsSkipsConfirmedNoRecordsUntilRetryTime(t *testing.T) {
 	}
 	if len(missing) != 1 || !missing[0].Equal(start) {
 		t.Fatalf("expired no-record marker must permit rare retry, got %v", missing)
+	}
+}
+
+type fakeVKMArchiveReader struct {
+	read func(q archive.ArchiveQuery) ([]archive.ArchiveRecord, error)
+}
+
+func (f *fakeVKMArchiveReader) Strategy() string { return "mb_request_poll_string" }
+func (f *fakeVKMArchiveReader) Read(_ context.Context, _ archive.ArchiveSession, _ archive.Transactor, q archive.ArchiveQuery) ([]archive.ArchiveRecord, error) {
+	return f.read(q)
+}
+
+func withFakeVKMArchiveReader(t *testing.T, f *fakeVKMArchiveReader) {
+	t.Helper()
+	old, ok := archive.Get("mb_request_poll_string")
+	archive.Register(f)
+	t.Cleanup(func() {
+		if ok {
+			archive.Register(old)
+		}
+	})
+}
+
+func TestScheduledVKMLatestBypassesNoRecordSuppressionAndCountsContact(t *testing.T) {
+	d := newTestDeviceForVKM(t)
+	d.Profile = &profile.Profile{Archives: []profile.Archive{{ID: "main", Strategy: "mb_request_poll_string"}}}
+	repo := d.Repo.(*sqlite.Repo)
+	ctx := context.Background()
+	now := time.Now()
+	latestStart := now.Truncate(vkmArchivePeriod).Add(-vkmArchivePeriod)
+	latestLabel := latestStart.Add(vkmArchivePeriod)
+
+	// Fill historical periods so the test isolates the mandatory latest read.
+	for i := 1; i < 48; i++ {
+		label := latestLabel.Add(-time.Duration(i) * vkmArchivePeriod)
+		if err := repo.SaveVKMRawString(ctx, d.ID, 1, label, "T=1°C;"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.MarkVKMNoRecords(ctx, d.ID, 1, latestLabel, time.Now().Add(6*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	calls := 0
+	withFakeVKMArchiveReader(t, &fakeVKMArchiveReader{read: func(q archive.ArchiveQuery) ([]archive.ArchiveRecord, error) {
+		calls++
+		return nil, archive.ErrVKMNoRecords
+	}})
+	before := health.Get().Devices[d.ID].LastArchiveSuccess
+	d.pollVKMHourlyLatest(ctx, d.Profile.Archives[0])
+	after := health.Get().Devices[d.ID].LastArchiveSuccess
+	if calls != 1 {
+		t.Fatalf("mandatory latest read calls=%d, want 1 despite no-record suppression", calls)
+	}
+	if !after.After(before) {
+		t.Fatalf("valid latest no-record response must count as live archive contact: before=%v after=%v", before, after)
+	}
+	suppressed, err := repo.VKMNoRecordsSuppressed(ctx, d.ID, 1, latestLabel, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if suppressed {
+		t.Fatal("latest no-record response must not leave a 6h suppression marker")
+	}
+}
+
+func TestScheduledVKMOnlyVolumeRawRowMarksArchiveSuccess(t *testing.T) {
+	d := newTestDeviceForVKM(t)
+	d.Profile = &profile.Profile{Archives: []profile.Archive{{ID: "main", Strategy: "mb_request_poll_string"}}}
+	repo := d.Repo.(*sqlite.Repo)
+	ctx := context.Background()
+	now := time.Now()
+	latestStart := now.Truncate(vkmArchivePeriod).Add(-vkmArchivePeriod)
+	latestLabel := latestStart.Add(vkmArchivePeriod)
+	for i := 1; i < 48; i++ {
+		if err := repo.SaveVKMRawString(ctx, d.ID, 1, latestLabel.Add(-time.Duration(i)*vkmArchivePeriod), "V=1м³;"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	calls := 0
+	withFakeVKMArchiveReader(t, &fakeVKMArchiveReader{read: func(q archive.ArchiveQuery) ([]archive.ArchiveRecord, error) {
+		calls++
+		return []archive.ArchiveRecord{{Fields: map[string]any{"V": 12.5, "V_unit": "м³"}, Raw: []byte("V={Объём газа }12.5м³;")}}, nil
+	}})
+	before := health.Get().Devices[d.ID].LastArchiveSuccess
+	d.pollVKMHourlyLatest(ctx, d.Profile.Archives[0])
+	after := health.Get().Devices[d.ID].LastArchiveSuccess
+	if calls != 1 {
+		t.Fatalf("calls=%d want 1", calls)
+	}
+	if !after.After(before) {
+		t.Fatalf("V-only raw row did not mark archive success")
+	}
+	raw, found, err := repo.GetVKMRawString(ctx, d.ID, 1, latestLabel)
+	if err != nil || !found || raw == "" {
+		t.Fatalf("raw gas archive not saved: found=%v raw=%q err=%v", found, raw, err)
 	}
 }
